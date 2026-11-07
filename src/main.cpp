@@ -39,6 +39,9 @@
 #include "codegen_stacks.h"
 #include "codegen_nodes.h"
 #include "runtime_inline.h"
+#ifdef GOOSE_LLVM_LIBDIR
+#include "codegen_ir.h"
+#endif
 #include "process.h"
 #include "jit.h"
 #include "progress.h"
@@ -1367,6 +1370,9 @@ int Main(int argc, char **argv) {
     string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile;
     auto dump = false, dumpdocs = false, tokens = false, parseonly = false, specs = false;
     auto nocgen = false;
+#ifdef GOOSE_LLVM_LIBDIR
+    auto emitir = false;
+#endif
     auto roundtrip = false, multitest = false;
     auto nobce = false, bcetest = false, bcelines = false, norfcheck = false;
     auto stacks = false;
@@ -1406,6 +1412,9 @@ int Main(int argc, char **argv) {
             cdefines.push_back(cat("GS_STACK_RESERVE=", size, "ull"));
         }
         else if (arg == "--check") nocgen = true;
+#ifdef GOOSE_LLVM_LIBDIR
+        else if (arg == "--emit-ir") emitir = true;
+#endif
         else if (arg == "--diagnostics" && i + 1 < argc) {
             string how = argv[++i];
             if (how == "json") jsondiag = true;
@@ -1723,6 +1732,32 @@ int Main(int argc, char **argv) {
         for (auto &rf : runtime_files)
             if (string_view(rf.name) == "runtime_ext.h") runtime_ext_text = rf.text;
         auto stackcfg = StackConfigOf(cdefines);
+        // The LLVM-IR backend: a separate path that does not create the
+        // C CodeGen. It walks the same AST + FnSpec list and emits an
+        // llvm::Module that links against libgoose_rt.a.
+#ifdef GOOSE_LLVM_LIBDIR
+        if (emitir) {
+            vector<FnSpec *> irspecs;
+            for (auto sp : ast.fnspecs) irspecs.push_back(sp);
+            CodeGenIR cgir(ast, irspecs, false);
+            cgir.Run();
+            string irtext;
+            {
+                llvm::raw_string_ostream os(irtext);
+                cgir.module().print(os, nullptr);
+                os.flush();
+            }
+            if (!outfile.empty()) {
+                if (!WriteFileMakingDirs(outfile, irtext))
+                    throw CompileError { cat("cannot write IR file: ", outfile) };
+                if (stats)
+                    fprintf(msgs, "wrote %s (%d bytes of LLVM IR)\n",
+                            outfile.c_str(), (int)irtext.size());
+            } else
+                fputs(irtext.c_str(), stdout);
+            return 0;
+        }
+#endif
         CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, shared,
                    stackcfg.maxstacks);
         if (stacks) cg.StackReport(msgs, stackcfg);

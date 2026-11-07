@@ -181,6 +181,49 @@ target_sources(goose PRIVATE src/jit_runtime.c src/jit_runtime.h)
 target_include_directories(goose PRIVATE "${CMAKE_BINARY_DIR}")
 set_property(TARGET goose PROPERTY C_STANDARD 11)
 
+# The LLVM-IR backend: opt-in, parallel to the C backend. When on, builds
+# libgoose_rt.a (the Clang-compiled runtime with external linkage) and
+# links LLVM into the compiler so the IR builder (M2) has llvm::* symbols.
+option(GOOSE_LLVM "Build the LLVM-IR backend (parallel to the C backend)" OFF)
+
+if(GOOSE_LLVM)
+    list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    include(FindGooseLLVM)
+    if(NOT GooseLLVM_FOUND)
+        message(FATAL_ERROR "GOOSE_LLVM=on but LLVM was not found. "
+                            "Install LLVM 15+ (apt install llvm-15-dev) "
+                            "or set GOOSE_LLVM=off.")
+    endif()
+    # The runtime archive (libgoose_rt.a) is the external-linkage object
+    # the emitted IR module links against. It is always built when the
+    # IR backend is enabled, independent of which JIT is active.
+    add_library(goose_rt STATIC src/runtime/runtime.c)
+    set_target_properties(goose_rt PROPERTIES
+        C_STANDARD 11
+        POSITION_INDEPENDENT_CODE ON)
+    target_compile_definitions(goose_rt PRIVATE
+        GS_SEPARATE_RUNTIME=1
+        GS_RUNTIME_OBJECT=1
+        GS_NEED_THREADS=1)
+    target_include_directories(goose_rt PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(goose_rt PRIVATE -w)
+    target_link_libraries(goose_rt PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    if(WIN32)
+        target_link_libraries(goose_rt PRIVATE ws2 msvcrt)
+    endif()
+    # Link LLVM and the runtime archive into the compiler so the IR
+    # builder (src/codegen_ir*.h) has llvm::* symbols at link time.
+    target_include_directories(goose PRIVATE ${LLVM_INCLUDE_DIRS})
+    target_link_libraries(goose PRIVATE
+        ${LLVM_LIBS}
+        goose_rt
+        ${CMAKE_DL_LIBS})
+    # Expose the tool paths to the binary for the test runner.
+    target_compile_definitions(goose PRIVATE
+        GOOSE_LLVM_LIBDIR="${LLVM_LIBDIR}"
+        GOOSE_LLVM_BIN_DIR="${LLVM_BIN_DIR}")
+endif()
+
 # The blessed packages GOOSE_BUILTIN_LIBS names (src/blessed.txt; `all`, or
 # a list of their names), compiled into the compiler (cmake/package.cmake),
 # so that their programs run with nothing else installed. Empty by default:

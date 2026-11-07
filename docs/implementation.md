@@ -17,6 +17,7 @@
 - [6. Code generation: representation](#6-code-generation-representation)
 - [7. The runtime](#7-the-runtime)
 - [8. Testing the analyses](#8-testing-the-analyses)
+- [8a. The LLVM backend](#8a-the-llvm-backend)
 - [9. Writing fast Goose](#9-writing-fast-goose)
 - [10. Where the compiler is more conservative than the specification](#10-where-the-compiler-is-more-conservative-than-the-specification)
 - [11. Audit findings and resolutions](#11-audit-findings-and-resolutions)
@@ -6740,6 +6741,30 @@ passes described above:
   generated C under ASan/UBSan.
 
 ---
+
+## 8a. The LLVM backend
+
+The LLVM-IR backend is selected at build time with `GOOSE_LLVM=on` and
+emits LLVM IR instead of C. It shares the pipeline up to `bce` with the
+C backend; the two diverge only in their output stage. Full design:
+[design/llvm_backend.md](design/llvm_backend.md).
+
+Key properties:
+
+- **External runtime.** The runtime archive (`libgoose_rt.a`) is
+  built with `GS_SEPARATE_RUNTIME=1`, so `GS_API` functions have
+  external linkage. The TLS state (`gs_stks`, `gs_gl`, etc.) stays in
+  the program's TU; the archive exports only the `GS_API` symbols.
+- **No guard-gap in the IR.** The guard-gap (`mmap`/`mprotect`) lives
+  in the C runtime. The IR code calls `gs_reserve_region`; it does
+  not re-implement the memory reservation.
+- **TLS model.** `GeneralDynamicTLSModel` for all platforms
+  (x86_64-linux, x86_64-msys, arm64-mac). No per-platform
+  `InitialExec` in this pass.
+- **c_headers adapters.** Hand-translated to IR declarations
+  (option B). The four external packages (gfx, audio, ui, physics)
+  stay in C; the IR module `declare`s their adapters and the linker
+  resolves them.
 
 ## 9. Writing fast Goose
 
