@@ -720,6 +720,7 @@ Commands:
   fetch      Fetch the packages a program declares.
   format     Rewrite Goose files in the standard layout.
   toolchain  Report the C compiler, cmake and git found, and GOOSE_HOME.
+  llc        Build a native executable from a .ll file emitted by --emit-ir.
   version    Print the compiler's version (or --version).
   lsp        Serve an editor over the Language Server Protocol.
   completion Print a shell's completion script for goose.
@@ -862,6 +863,32 @@ Options:
   --refresh             Set up Visual Studio's environment again rather than
                         take the one kept from last time.
 )";
+#ifdef GOOSE_LLVM_LIBDIR
+    if (topic == "llc") return
+ R"(usage: goose llc file.ll [-o out] [--triple <triple>] [-v]
+
+Builds a native executable from a .ll file emitted by `goose --emit-ir`.
+It assembles the IR to an object with llc for the host target, then links
+it with clang against the runtime archive the compiler was built with
+(libgoose_rt.a), libm and the adapters a package's c_headers names.
+
+Options:
+  -o out                Where the executable goes (default: the .ll's stem,
+                        with .exe appended on Windows).
+  --triple <triple>     The target triple, from GOOSE_LLVM_TRIPLE when unset:
+                        x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc or
+                        arm64-apple-macos.
+  -v                    Print each command the build runs and what it prints.
+
+llc and clang are taken from the LLVM the compiler was built against
+(GOOSE_LLVM=on), or from PATH when the build recorded none.
+
+Exit status:
+  0                     The executable was written.
+  1                     The IR does not assemble, the link fails, or the
+                        compiler has no llc and clang to run.
+)";
+#endif
     if (topic == "version") return
 R"(usage: goose version
        goose --version
@@ -1062,7 +1089,7 @@ CodeGen::StackConfig StackConfigOf(const vector<string> &cdefines) {
 
 // The commands, in the order the help lists them.
 static const char *const VERBS[] = { "run", "build", "check", "fetch", "format", "toolchain",
-                                     "version", "lsp", "completion", "help" };
+                                     "llc", "version", "lsp", "completion", "help" };
 
 // The edit distance between two words, for the command a mistyped one meant.
 static size_t EditDistance(string_view a, string_view b) {
@@ -1295,9 +1322,130 @@ static string ManPage() {
     return s;
 }
 
+// The `goose llc` driver: assembles a .ll file emitted by --emit-ir into a
+// native executable via llc + clang, linking libgoose_rt.a. Only available
+// when the compiler was built with GOOSE_LLVM=on; llc and clang come from
+// the LLVM it was built against (GOOSE_LLVM_BIN_DIR), or from PATH.
+#ifdef GOOSE_LLVM_LIBDIR
+static int RunLlc(const vector<string> &args, const string &exedir) {
+    string infile, outname, triple;
+    auto verbose = false;
+    for (size_t i = 0; i < args.size(); i++) {
+        auto &a = args[i];
+        if (a == "-o" && i + 1 < args.size()) outname = args[++i];
+        else if (a == "--triple" && i + 1 < args.size()) triple = args[++i];
+        else if (a == "-v") verbose = true;
+        else if (!a.empty() && a[0] == '-') {
+            fprintf(stderr, "goose llc: unknown option %s\n", a.c_str());
+            return 1;
+        } else if (infile.empty()) infile = a;
+        else {
+            fprintf(stderr, "goose llc: multiple input files given\n");
+            return 1;
+        }
+    }
+    if (infile.empty()) {
+        fputs(HelpText("llc").c_str(), stdout);
+        return 1;
+    }
+    if (infile.size() < 3 || infile.substr(infile.size() - 3) != ".ll") {
+        fprintf(stderr, "goose llc: input must be a .ll file: %s\n", infile.c_str());
+        return 1;
+    }
+    // Default output: the input's stem with the platform's executable suffix.
+    if (outname.empty()) {
+        auto stem = infile.substr(0, infile.size() - 3);
+#ifdef _WIN32
+        outname = stem + ".exe";
+#else
+        outname = stem;
+#endif
+    }
+    // Target triple: explicit --triple, then GOOSE_LLVM_TRIPLE env, then
+    // the host the compiler was built on.
+    if (triple.empty()) {
+        if (auto env = getenv("GOOSE_LLVM_TRIPLE")) triple = env;
+    }
+    if (triple.empty()) {
+#if defined(__linux__)
+        triple = "x86_64-unknown-linux-gnu";
+#elif defined(_WIN32) || defined(__CYGWIN__)
+        triple = "x86_64-pc-windows-msvc";
+#elif defined(__APPLE__)
+#if defined(__aarch64__)
+        triple = "arm64-apple-macos";
+#else
+        triple = "x86_64-apple-darwin";
+#endif
+#else
+        fprintf(stderr, "goose llc: cannot determine target triple for this host; "
+                        "pass --triple\n");
+        return 1;
+#endif
+    }
+    // Locate llc and clang: the build recorded their directory, otherwise
+    // look them up on PATH.
+    string bindir = GOOSE_LLVM_BIN_DIR;
+    auto tool = [&](const char *name) -> string {
+        if (!bindir.empty()) {
+            auto p = cat(bindir, "/", name);
+#ifdef _WIN32
+            auto pe = p + ".exe";
+            if (FileExists(pe)) return pe;
+#endif
+            if (FileExists(p)) return p;
+        }
+        return FindOnPath(name);
+    };
+    auto llc = tool("llc");
+    auto clang = tool("clang");
+    if (llc.empty()) {
+        fprintf(stderr, "goose llc: cannot find llc%s\n",
+                bindir.empty() ? "" : cat(" in ", bindir).c_str());
+        return 1;
+    }
+    if (clang.empty()) {
+        fprintf(stderr, "goose llc: cannot find clang%s\n",
+                bindir.empty() ? "" : cat(" in ", bindir).c_str());
+        return 1;
+    }
+    // Intermediate assembly beside the output so a failed link leaves it
+    // for inspection.
+    auto asmfile = outname + ".s";
+    auto libdir = string(GOOSE_LLVM_LIBDIR);
+    // Step 1: llc .ll -> .s
+    vector<string> llcargv = { llc, infile, "-o", asmfile,
+                               cat("-mtriple=", triple), "-filetype=asm" };
+    if (verbose) fprintf(stderr, "%s\n", CommandLineText(llcargv).c_str());
+    auto r1 = RunProcess(llcargv, "", verbose);
+    if (r1.code != 0) {
+        fprintf(stderr, "llc failed (%d): %s\n", r1.code, r1.output.c_str());
+        return 1;
+    }
+    // Step 2: clang .s -> exe, linking libgoose_rt.a (in the build dir,
+    // beside the goose executable) and libm.
+    vector<string> clangargv = { clang, asmfile, "-o", outname };
+    if (!exedir.empty()) { clangargv.push_back("-L"); clangargv.push_back(exedir); }
+    if (!libdir.empty()) { clangargv.push_back("-L"); clangargv.push_back(libdir); }
+    clangargv.push_back("-lgoose_rt");
+#ifndef _WIN32
+    clangargv.push_back("-lm");
+    clangargv.push_back("-lpthread");
+#endif
+    if (verbose) fprintf(stderr, "%s\n", CommandLineText(clangargv).c_str());
+    auto r2 = RunProcess(clangargv, "", verbose);
+    if (r2.code != 0) {
+        fprintf(stderr, "clang failed (%d): %s\n", r2.code, r2.output.c_str());
+        return 1;
+    }
+    if (verbose) fprintf(stderr, "wrote %s\n", outname.c_str());
+    return 0;
+}
+#endif
+
 int Main(int argc, char **argv) {
     auto exe = ExePath(argv[0]);
-    // The verb forms, `goose run|build|check|fetch|format|toolchain|version|help ...`.
+    // The verb forms, `goose run|build|check|fetch|format|toolchain|llc|version|help ...`.
     // A first argument that is none of them is read as an option or a file,
     // as it always was, so `goose foo.goose` is `goose run foo.goose`.
     string verb;
@@ -1367,6 +1515,10 @@ int Main(int argc, char **argv) {
     }
     if (verb == "lsp") return RunLsp(exe, vector<string>(argv + firstarg, argv + argc));
     if (verb == "format") return RunFormat(vector<string>(argv + firstarg, argv + argc));
+#ifdef GOOSE_LLVM_LIBDIR
+    if (verb == "llc")
+        return RunLlc(vector<string>(argv + firstarg, argv + argc), DirOf(exe));
+#endif
     string outname, headername, stdlibdir, shaderfile, shadersource, dumpfile;
     auto dump = false, dumpdocs = false, tokens = false, parseonly = false, specs = false;
     auto nocgen = false;
@@ -1755,6 +1907,20 @@ int Main(int argc, char **argv) {
                             outfile.c_str(), (int)irtext.size());
             } else
                 fputs(irtext.c_str(), stdout);
+            // The c_headers adapters an IR program declares (option B): the
+            // .ll alone is not linkable until their C objects are built and
+            // passed to `goose llc`, so say which ones it carries.
+            vector<string> adapters;
+            for (auto &pkg : ast.packages) {
+                if (pkg.cheaders.empty()) continue;
+                adapters.push_back(pkg.name);
+            }
+            if (!adapters.empty()) {
+                string names;
+                for (auto &n : adapters) Append(names, names.empty() ? "" : ", ", n);
+                fprintf(msgs, "note: package adapter(s) %s must be compiled and linked "
+                               "with `goose llc`\n", names.c_str());
+            }
             return 0;
         }
 #endif

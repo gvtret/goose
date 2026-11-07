@@ -197,7 +197,7 @@ if(GOOSE_LLVM)
     # The runtime archive (libgoose_rt.a) is the external-linkage object
     # the emitted IR module links against. It is always built when the
     # IR backend is enabled, independent of which JIT is active.
-    add_library(goose_rt STATIC src/runtime/runtime.c)
+    add_library(goose_rt STATIC src/runtime/runtime.c src/runtime/ir_stub.c)
     set_target_properties(goose_rt PROPERTIES
         C_STANDARD 11
         POSITION_INDEPENDENT_CODE ON)

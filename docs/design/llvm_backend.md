@@ -52,14 +52,14 @@ module reports a clear diagnostic if the system LLVM is older.
 - Root `CMakeLists.txt` — `GOOSE_LLVM` option; when on, builds the
   runtime target and links LLVM.
 
-## M2: type + value emission (in progress)
+## M2: type + value emission (done)
 
 - `src/codegen_ir_types.h` — layout, `StructType`, `DataLayout`,
   alignment (mirrors the C backend's `#pragma pack(1)` convention).
 - `src/codegen_ir_values.h` — `EmitPush`, `EmitAppend`, `EmitLoad`,
   `EmitStore`, `TopW` / bump mechanics, `OpenRzDest` prefix+patch.
 
-## M3: frames, stacks, construction
+## M3: frames, stacks, construction (partially done)
 
 - `src/codegen_ir_frames.h` — `gs_sp` (i64 index into `@gs_stks`),
   `gs_at` (i8* to `gs_loc`), TLS globals.
@@ -67,6 +67,11 @@ module reports a clear diagnostic if the system LLVM is older.
   i64 limit }`), region registry, guard-gap notes.
 - `src/codegen_ir_construct.h` — in-place construction, `OpenRzDest`,
   frame objects.
+- Minimal body-walk (`codegen_ir_main.h`): `IntLit`, `Binary` (+,-,*,/),
+  `Block` and `Call` (print via `gs_print_i64`), enough for
+  `test/codegen/ir_minimal_arith.goose` to pass end-to-end. The full
+  walk (locals, resizable values, in-place construction, calls,
+  `return E from f`, thread thunks) is the remainder of M3.
 
 ## M4: calls, emit, c_headers adapters
 
@@ -77,11 +82,12 @@ module reports a clear diagnostic if the system LLVM is older.
   `declare`s each adapter; the `goose llc` driver compiles the C
   adapter into a separate object and links it.
 
-## M5: `goose llc` driver
+## M5: `goose llc` driver (done)
 
 - Target triple + `DataLayout` selection per platform.
 - Links `libgoose_rt.a` + adapter objects.
 - `test/ir_runner.py` — fixture runner for the IR path.
+- `src/main.cpp` — `goose llc` subcommand (llc -> clang -> exe).
 
 ## M6: test-suite parity
 

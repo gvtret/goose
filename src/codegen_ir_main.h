@@ -85,7 +85,7 @@ struct CodeGenIR {
         auto mk = [&](llvm::GlobalVariable *&slot, llvm::Type *ty,
                       const char *name) {
             slot = new llvm::GlobalVariable(*mod, ty, /*isConstant=*/false,
-                                            llvm::GlobalValue::CommonLinkage,
+                                            llvm::GlobalValue::ExternalLinkage,
                                             nullptr, name,
                                             nullptr, tls);
         };
@@ -122,24 +122,76 @@ struct CodeGenIR {
         dcl("gs_qget", f_gs_qget, I, { P, P, I, I });
     }
 
+    // Runtime extern: gs_print_i64(i64 val) — prints a signed 64-bit integer
+    // followed by a newline. Declared here for the minimal body-walk; the
+    // symbol lives in libgoose_rt.a (or a stub the driver links).
+    llvm::Function *f_gs_print_i64 = nullptr;
+
+    void declare_print_extern() {
+        auto *fty = llvm::FunctionType::get(voidty(), { i64() }, false);
+        f_gs_print_i64 = llvm::Function::Create(fty,
+                                                 llvm::GlobalValue::ExternalLinkage,
+                                                 "gs_print_i64", mod.get());
+    }
+
     // ------------------------------------------------------------------
-    // Emit the program. For now this creates the function shells for
-    // each FnSpec; the full body-walk lands in M3.
+    // Minimal M3 body-walk: IntLit, Binary (+,-,*,/), Call(print), Block.
+    // Returns the i64 value of an expression, or nullptr for statements.
+    // ------------------------------------------------------------------
+    llvm::Value *GenExpr(Node *n, llvm::Function *f) {
+        if (!n) return nullptr;
+        if (auto *il = Is<IntLit>(n))
+            return llvm::ConstantInt::get(i64(), (uint64_t)il->val, true);
+        if (auto *bin = Is<Binary>(n)) {
+            auto *l = GenExpr(bin->left, f);
+            auto *r = GenExpr(bin->right, f);
+            if (!l || !r) return nullptr;
+            switch (bin->op) {
+                case T_PLUS:  return b.CreateAdd(l, r, "add");
+                case T_MINUS: return b.CreateSub(l, r, "sub");
+                case T_MUL:   return b.CreateMul(l, r, "mul");
+                case T_DIV:   return b.CreateSDiv(l, r, "div");
+                default:      return nullptr;
+            }
+        }
+        if (auto *c = Is<Call>(n)) {
+            // Only print(i64) is supported in this minimal walk.
+            if (c->args.size() == 1 && f_gs_print_i64) {
+                auto *arg = GenExpr(c->args[0], f);
+                if (arg) b.CreateCall(f_gs_print_i64, { arg });
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
+
+    void GenStmt(Node *n, llvm::Function *f) {
+        if (!n) return;
+        if (auto *blk = Is<Block>(n)) {
+            for (auto *s : blk->stmts) GenStmt(s, f);
+            if (blk->tail) GenExpr(blk->tail, f);
+            return;
+        }
+        // Expression-as-statement (e.g. print(...)).
+        GenExpr(n, f);
+    }
+
+    // ------------------------------------------------------------------
+    // Emit the program. Creates function shells and walks bodies for
+    // the minimal M3 subset.
     // ------------------------------------------------------------------
     void Run() {
+        declare_print_extern();
         auto i64ty = i64();
-        // Every function takes i64 gs_sp as its first argument.
-        // The C backend's convention (codegen_frames.h:623) is int64_t gs_sp.
         auto *fnty = llvm::FunctionType::get(i64ty, { i64ty }, false);
         for (auto *sp : specs) {
-            // The C name of this specialization (sp->sf->cname or the mangled name).
             auto name = sp->sf->cname.empty() ? sp->sf->name : sp->sf->cname;
-            auto *f = llvm::Function::Create(fnty,
-                                             llvm::GlobalValue::PrivateLinkage,
-                                             name, mod.get());
-            auto *entry = llvm::BasicBlock::Create(ctx, "entry", f);
+            auto *fn = llvm::Function::Create(fnty,
+                                              llvm::GlobalValue::ExternalLinkage,
+                                              name, mod.get());
+            auto *entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             b.SetInsertPoint(entry);
-            // M3: walk sp->body here. For now, return 0.
+            if (sp->body) GenStmt(sp->body, fn);
             b.CreateRet(llvm::ConstantInt::get(i64ty, 0));
         }
     }
