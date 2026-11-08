@@ -77,12 +77,15 @@ module reports a clear diagnostic if the system LLVM is older.
   (+,-,*,/),
   `Block`, `Call` (print via `gs_print_i64`, direct i64 calls),
   `VarDecl`/`Assign`/`IncDec`/`Return` for i64 locals, plus the native
-  `int main()` entry — enough for
-  `test/codegen/ir_minimal_arith.goose` and
-  `test/codegen/ir_minimal_vars.goose` to pass end-to-end. The full
-  walk (data stacks, resizable values, in-place construction, calls,
-  value-carrying if/EarlyBlock expressions, `return E from f`, and
-  thread thunks) is the remainder of M3.
+  `int main(argc, argv)` entry — enough for 9 `ir_minimal_*` fixtures
+  to pass end-to-end. Growable `i64[>..]` values lower on one real
+  data stack per array: a lazy thread-local `gs_stack { top }` slot
+  reserved in `main` through `gs_rt_start` plus `gs_reserve_region`,
+  a `gs_rhdr { base, len }` header, `push`/`a[i]`/`a.len` (the first
+  `ir_minimal_array` fixture). The full walk (resizable values of all
+  shapes, in-place construction, calls, value-carrying if/EarlyBlock
+  expressions, `return E from f`, thread thunks) is the remainder of
+  M3.
 
 ## M4: calls, emit, c_headers adapters
 
