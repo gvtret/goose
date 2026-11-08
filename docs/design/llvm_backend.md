@@ -68,10 +68,14 @@ module reports a clear diagnostic if the system LLVM is older.
 - `src/codegen_ir_construct.h` — in-place construction, `OpenRzDest`,
   frame objects.
 - Minimal body-walk (`codegen_ir_main.h`): `IntLit`, `Binary` (+,-,*,/),
-  `Block` and `Call` (print via `gs_print_i64`), enough for
-  `test/codegen/ir_minimal_arith.goose` to pass end-to-end. The full
-  walk (locals, resizable values, in-place construction, calls,
-  `return E from f`, thread thunks) is the remainder of M3.
+  `Block`, `Call` (print via `gs_print_i64`, direct i64 calls),
+  `VarDecl`/`Assign`/`IncDec`/`Return` for i64 locals, plus the native
+  `int main()` entry — enough for
+  `test/codegen/ir_minimal_arith.goose` and
+  `test/codegen/ir_minimal_vars.goose` to pass end-to-end. The full
+  walk (data stacks, resizable values, in-place construction, calls,
+  value-carrying if/EarlyBlock expressions, `return E from f`, and
+  thread thunks) is the remainder of M3.
 
 ## M4: calls, emit, c_headers adapters
 

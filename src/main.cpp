@@ -1890,7 +1890,8 @@ int Main(int argc, char **argv) {
 #ifdef GOOSE_LLVM_LIBDIR
         if (emitir) {
             vector<FnSpec *> irspecs;
-            for (auto sp : ast.fnspecs) irspecs.push_back(sp);
+            for (auto sp : ast.fnspecs)
+                if (sp->live) irspecs.push_back(sp);
             CodeGenIR cgir(ast, irspecs, false);
             cgir.Run();
             string irtext;
