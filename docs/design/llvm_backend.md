@@ -2,7 +2,7 @@
 
 The LLVM-IR backend emits LLVM IR instead of C. It is selected at build
 time with `GOOSE_LLVM=on` (default `off` - the C backend remains the
-default, see [implementation §8](../implementation.md#8-the-llvm-backend));
+default, see [implementation section 8](../implementation.md#8-the-llvm-backend));
 the two backends share the pipeline up to `bce` and diverge only in
 their output.
 
