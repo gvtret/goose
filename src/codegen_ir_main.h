@@ -265,12 +265,27 @@ struct CodeGenIR {
         if (auto *bl = Is<BoolLit>(n))
             return llvm::ConstantInt::get(i64(), bl->val ? 1 : 0, true);
         if (auto *un = Is<Unary>(n)) {
-            // The unary minus: an i64 negation. A bit-and (&x) address and
-            // the logical not are not yet walked.
+            // The unary minus: an i64 negation. The logical not: an i1 test
+            // widened back to i64 (the minimal walk's uniform value type).
+            // A bit-and (&x) address is not yet walked.
             auto *c = GenExpr(un->child, w);
             if (!c) return nullptr;
             switch (un->op) {
                 case T_MINUS: return b.CreateNeg(c, "neg");
+                case T_NOT: {
+                    // `c` may be i1 (from a comparison) or i64 (from an
+                    // integer expression).  Normalise to i1, invert, then
+                    // widen back to i64 (the walk's uniform integer type).
+                    llvm::Value *cond;
+                    if (c->getType()->isIntegerTy(1)) {
+                        cond = c;
+                    } else {
+                        auto *z = llvm::ConstantInt::get(i64(), 0);
+                        cond = b.CreateICmpNE(c, z, "tobool");
+                    }
+                    auto *inv = b.CreateNot(cond, "not");
+                    return b.CreateZExt(inv, i64(), "notw");
+                }
                 default:      return nullptr;
             }
         }
@@ -359,6 +374,10 @@ struct CodeGenIR {
             // merge (the if-expression's value).
             auto *cond = GenExpr(ifx->cond, w);
             if (!cond) return nullptr;
+            if (!cond->getType()->isIntegerTy(1)) {
+                auto *z = llvm::ConstantInt::get(i64(), 0);
+                cond = b.CreateICmpNE(cond, z, "ifcond");
+            }
             auto *fn = w.fn;
             auto *thenbb = llvm::BasicBlock::Create(ctx, "then", fn);
             auto *elsebb = ifx->elseb ? llvm::BasicBlock::Create(ctx, "else", fn) : nullptr;
