@@ -130,9 +130,13 @@ into index/bound types (checked at the array's live count), direct
 calls of int-signatured functions (void included), range/count loops,
 while, if, break-continue, and lines print through the runtime's
 format hooks one write per line (int values and string literals; the
-rest of print's alphabet lands with its shapes). 31 of the codegen
-output fixtures pass through `--emit-ir`; the rest need the remaining
-M3 shapes (structures, multi-returns, arrays returned and sliced,
-strings as values) and the M4 modules. See
+rest of print's alphabet lands with its shapes). Multi-result calls
+use out-pointers for results 1.. (result 0 is the call's value), and
+signed `/`, `%` follow the runtime (Euclidean `%`, checked zero and
+i64.min / -1), `>>` is arithmetic, `&&`/`||` short-circuit, and a
+callee's return inside an inlined body meets its call's merge in a
+PHI. 32 of the codegen output fixtures pass through `--emit-ir`; the
+rest need the remaining M3 shapes (structures, arrays returned and
+sliced, strings as values) and the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.

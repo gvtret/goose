@@ -57,6 +57,8 @@ struct CodeGenIR {
     llvm::Function *f_gs_reserve_region = nullptr;   // (ptr) -> ptr
     llvm::Function *f_gs_idxfail = nullptr;          // (i64,i64,ptr,i32), noreturn
     llvm::Function *f_gs_asfail_i = nullptr;         // (ptr,i64,ptr,ptr,i32), noreturn
+    llvm::Function *f_gs_divfail = nullptr;          // (ptr,i32), noreturn
+    llvm::Function *f_gs_divovf = nullptr;           // (ptr,i32), noreturn
     llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_out_bytes = nullptr;        // (ptr,i64)
 
@@ -145,6 +147,8 @@ struct CodeGenIR {
         dcl("gs_reserve_region", f_gs_reserve_region, P, { P });
         dcl("gs_idxfail", f_gs_idxfail, V, { I, I, P, I32 });
         dcl("gs_asfail_i", f_gs_asfail_i, V, { P, I, P, P, I32 });
+        dcl("gs_divfail", f_gs_divfail, V, { P, I32 });
+        dcl("gs_divovf", f_gs_divovf, V, { P, I32 });
         dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
         dcl("gs_out_bytes", f_gs_out_bytes, V, { P, I });
     }
@@ -161,16 +165,25 @@ struct CodeGenIR {
         // Parameter slots: VarDef * -> llvm::Argument * (i64 params).
         std::unordered_map<VarDef *, llvm::Value *> params;
         // The SFunction the walk body belongs to (the spec's sf). A Return
+
         // whose target differs from this exits an enclosing InlineBlock, not
         // the function: the value flows out as that block's result.
         SFunction *cursf = nullptr;
+        // The spec being walked, and the index of its first out-pointer
+        // parameter: results 1.. of a multi-return callee arrive there.
+        FnSpec *spec = nullptr;
+        size_t outstart = 0;
         // The walked body Block (only the function's own; nested blocks are
         // not top-level, so their value tails do not become rets).
         Block *body = nullptr;
-        // A value a statement handed up out of its own block (an inlined
-        // callee's return, a break carrying the block's value); the enclosing
-        // block or InlineBlock consumes it.
-        llvm::Value *flowout = nullptr;
+        // The inlined bodies being walked, innermost last. A return whose
+        // target is one of them branches to its merge block with the value.
+        struct InlExit {
+            SFunction *sf = nullptr;
+            llvm::BasicBlock *merge = nullptr;
+            std::vector<std::pair<llvm::Value *, llvm::BasicBlock *>> incoming;
+        };
+        std::vector<InlExit> inl;
         // The enclosing loops of the walk (innermost last); a break or
         // continue without a value targets the innermost one.
         struct Loop {
@@ -317,10 +330,18 @@ struct CodeGenIR {
                 if (is_int_ty(t)) argtys.push_back(i64ty);
                 else supported = false;
             }
+            // Return protocol: ret0 is the call's value, every other
+            // result an out-pointer parameter the callee writes; all
+            // results must be int values for a multi-return shell.
+            bool allretint = true;
+            for (auto *rt : sp->rets)
+                if (!is_int_ty(rt)) allretint = false;
             llvm::Type *retty = voidty();
             if (!sp->rets.empty()) {
-                retty = is_int_ty(sp->rets[0]) ? i64ty : nullptr;
+                retty = is_int_ty(sp->rets[0]) && allretint ? i64ty : nullptr;
                 if (!retty) supported = false;
+                for (size_t i = 1; i < sp->rets.size(); i++)
+                    argtys.push_back(i8ptr());
             }
             auto *fnty = llvm::FunctionType::get(supported ? retty : voidty(),
                                                  supported ? argtys : std::vector<llvm::Type *>(),
@@ -338,6 +359,8 @@ struct CodeGenIR {
             FnWalk w;
             w.fn = fn;
             w.cursf = sp->sf;
+            w.spec = sp;
+            w.outstart = sp->argtypes.size();
             w.body = sp->body;
             w.entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             b.SetInsertPoint(w.entry);
@@ -480,6 +503,14 @@ struct CodeGenIR {
     void emit_fixed_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
         auto *tal = def.type->arr;
         auto count = tal->size;
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        auto *al = init ? Is<ArrayLit>(init) : nullptr;
+        // A T[] local (no capacity, so no pushes) has the count its literal
+        // gives; a T[k] has its declared one.
+        if (tal->akind == A_VAR) {
+            if (!al || al->fillval) return;
+            count = (int64_t)al->elems.size();
+        }
         if (count < 0) return;
         auto *et = int_ll_ty(tal->sub);
         auto *a = count
@@ -492,8 +523,6 @@ struct CodeGenIR {
                            llvm::Align(8));
         }
         w.fixeds[&def] = { a, count, tal->sub };
-        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
-        auto *al = init ? Is<ArrayLit>(init) : nullptr;
         if (init && !al) return;      // Literal construction only here.
         if (!al) return;
         auto elem = [&](int64_t k, llvm::Value *v) {
@@ -617,6 +646,28 @@ struct CodeGenIR {
         }
         if (auto *ac = Is<AsCast>(n)) return GenAsCast(ac, w);
         if (auto *bin = Is<Binary>(n)) {
+            if (bin->op == T_ANDAND || bin->op == T_OROR) {
+                // Short-circuit: the right operand runs only where the left
+                // does not decide, and the result is an i1 merged by a phi.
+                auto isand = bin->op == T_ANDAND;
+                auto *lv = GenExpr(bin->left, w);
+                if (!lv) return nullptr;
+                auto *lhsb = b.GetInsertBlock();
+                auto *rhsbb = llvm::BasicBlock::Create(ctx, "logrhs", w.fn);
+                auto *donebb = llvm::BasicBlock::Create(ctx, "logdone", w.fn);
+                if (isand) b.CreateCondBr(lv, rhsbb, donebb);
+                else b.CreateCondBr(lv, donebb, rhsbb);
+                b.SetInsertPoint(rhsbb);
+                auto *rv = GenExpr(bin->right, w);
+                if (!rv) return nullptr;
+                auto *rend = b.GetInsertBlock();
+                b.CreateBr(donebb);
+                b.SetInsertPoint(donebb);
+                auto *phi = b.CreatePHI(llvm::Type::getInt1Ty(ctx), 2, "logic");
+                phi->addIncoming(llvm::ConstantInt::get(llvm::Type::getInt1Ty(ctx), isand ? 0 : 1), lhsb);
+                phi->addIncoming(rv, rend);
+                return phi;
+            }
             auto *l = GenExpr(bin->left, w);
             auto *r = GenExpr(bin->right, w);
             if (!l || !r) return nullptr;
@@ -624,8 +675,13 @@ struct CodeGenIR {
                 case T_PLUS:  return b.CreateAdd(l, r, "add");
                 case T_MINUS: return b.CreateSub(l, r, "sub");
                 case T_MUL:   return b.CreateMul(l, r, "mul");
-                case T_DIV:   return b.CreateSDiv(l, r, "div");
-                case T_MOD:   return b.CreateSRem(l, r, "mod");
+                case T_DIV:   return GenDivMod(T_DIV, l, r, w);
+                case T_MOD:   return GenDivMod(T_MOD, l, r, w);
+                case T_SHR: {
+                    auto *sh = b.CreateAnd(r, llvm::ConstantInt::get(i64(), 63), "shn");
+                    return is_uint_ty(bin->left->exprtype) ? b.CreateLShr(l, sh, "shr")
+                                                           : b.CreateAShr(l, sh, "shr");
+                }
                 case T_EQ:    return b.CreateICmpEQ(l, r, "eq");
                 case T_NEQ:   return b.CreateICmpNE(l, r, "ne");
                 case T_LT:    return b.CreateICmpSLT(l, r, "lt");
@@ -755,7 +811,7 @@ struct CodeGenIR {
                 }
             }
             // print's line alphabet this slice covers: int values and
-            // string literals, space separated, rendered into the same
+            // string literals, with no separator of its own, rendered into the same
             // byte cursor the C backend builds its whole line in
             // (codegen_builtins.h B_PRINT), then one write. The cursor
             // runs in a dedicated reserved scratch slot; every print
@@ -773,14 +829,8 @@ struct CodeGenIR {
                 auto *cura = b.CreateAlloca(i8ptr(), nullptr, "pcur");
                 b.CreateStore(basev, cura);
                 auto *i8ty = llvm::Type::getInt8Ty(ctx);
-                auto space = strlit_glob(" "), newline = strlit_glob("\n");
+                auto newline = strlit_glob("\n");
                 for (size_t ai = 0; ai < c->args.size(); ++ai) {
-                    if (ai) {
-                        auto *cur = b.CreateLoad(i8ptr(), cura);
-                        b.CreateMemMove(cur, llvm::MaybeAlign(1), space, llvm::MaybeAlign(1), 1);
-                        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur,
-                            llvm::ConstantInt::get(i64(), 1), "pcur+"), cura);
-                    }
                     auto *an = c->args[ai];
                     if (auto *sl = Is<StrLit>(an)) {
                         auto *cur = b.CreateLoad(i8ptr(), cura);
@@ -817,44 +867,16 @@ struct CodeGenIR {
             // A direct call to a Goose function: all i64 args, i64 ret,
             // and the valueless (void) call whose effect the statement
             // walk keeps.
+            // A direct call to a Goose function: all i64 args, ret0 as the
+            // call's value, rets 1.. through out-pointer params the
+            // multi-return callee writes; a value context needs exactly
+            // one result.
             if (c->spec) {
-                auto *retty = voidty();
-                if (c->spec->rets.size() == 1) {
-                    retty = is_int_ty(c->spec->rets[0]) ? i64() : nullptr;
-                } else if (!c->spec->rets.empty()) {
-                    retty = nullptr;
-                }
-                for (auto *t : c->spec->argtypes)
-                    if (!is_int_ty(t)) retty = nullptr;
-                if (!retty) return nullptr;
-                string callee = c->spec->sf->cname.empty()
-                    ? string(c->spec->sf->name) : c->spec->sf->cname;
-                if (name_counts[c->spec->sf->qname] > 1)
-                    callee += cat("_", c->spec->id);
-                auto *cf = mod->getFunction(callee);
-                if (!cf) return nullptr;
-                std::vector<llvm::Value *> args;
-                for (size_t i = 0; i < c->args.size() && i < cf->getFunctionType()->getNumParams(); ++i) {
-                    auto *av = GenExpr(c->args[i], w);
-                    if (!av) return nullptr;
-                    args.push_back(av);
-                }
-                return b.CreateCall(cf, args);
+                return EmitDirectCall(c, w, nullptr);
             }
             return nullptr;
         }
-        if (auto *ib = Is<InlineBlock>(n)) {
-            // An inlined call: walk its body's statements (the parameter
-            // bindings and the callee's body), then its tail value.
-            if (ib->body) {
-                for (auto *s : ib->body->stmts) GenStmt(s, w);
-                if (ib->body->tail) {
-                    auto *tv = GenExpr(ib->body->tail, w);
-                    if (tv) return tv;
-                }
-            }
-            return nullptr;
-        }
+        if (auto *ib = Is<InlineBlock>(n)) return GenInline(ib, w);
         if (auto *eb = Is<EarlyBlock>(n)) {
             // A `block { ... }` expression: walk its body's statements and
             // return the body's tail value (a value-carrying break).
@@ -920,6 +942,103 @@ struct CodeGenIR {
         return nullptr;
     }
 
+    // A check on a division operand: a true condition ends in the runtime's
+    // failure (noreturn), so the walk continues in the pass block.
+    void div_guard(llvm::Value *bad, llvm::Function *fail, FnWalk &w) {
+        auto *failbb = llvm::BasicBlock::Create(ctx, "divfail", w.fn);
+        auto *okbb = llvm::BasicBlock::Create(ctx, "divok", w.fn);
+        b.CreateCondBr(bad, failbb, okbb);
+        b.SetInsertPoint(failbb);
+        b.CreateCall(fail, { llvm::ConstantPointerNull::get(i8ptr()),
+                             llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0) });
+        b.CreateUnreachable();
+        b.SetInsertPoint(okbb);
+    }
+
+    // A signed `/` or `%` as the runtime's gs_div_i64 / gs_mod_i64: a zero
+    // divisor and i64.min / -1 fail; `%` is Euclidean (a negative remainder
+    // takes |divisor| on), where `/` truncates.
+    llvm::Value *GenDivMod(TType op, llvm::Value *l, llvm::Value *r, FnWalk &w) {
+        auto *zero = llvm::ConstantInt::get(i64(), 0);
+        auto *minus1 = llvm::ConstantInt::get(i64(), (uint64_t)-1, true);
+        auto *intmin = llvm::ConstantInt::get(i64(), (uint64_t)1 << 63);
+        div_guard(b.CreateICmpEQ(r, zero, "divzero"), f_gs_divfail, w);
+        div_guard(b.CreateAnd(b.CreateICmpEQ(l, intmin), b.CreateICmpEQ(r, minus1)),
+                  f_gs_divovf, w);
+        if (op == T_DIV) return b.CreateSDiv(l, r, "div");
+        // i64.min % -1 is 0 (every x % -1): divide by 1 there instead.
+        auto *safe = b.CreateSelect(b.CreateICmpEQ(r, minus1), llvm::ConstantInt::get(i64(), 1), r);
+        auto *rem = b.CreateSRem(l, safe, "rem");
+        auto *absr = b.CreateSelect(b.CreateICmpSLT(r, zero),
+                                    b.CreateSub(zero, r), r, "absr");
+        auto *adj = b.CreateAdd(rem, absr, "remadj");
+        return b.CreateSelect(b.CreateICmpSLT(rem, zero), adj, rem, "mod");
+    }
+
+    // A direct call of a Goose function. Results 1.. are out-pointers the
+    // callee writes (`outs[i]`, a pointer per result); result 0 is the value
+    // returned. A multi-result call needs `outs`, a value context does not.
+    llvm::Value *EmitDirectCall(Call *c, FnWalk &w, const std::vector<llvm::Value *> *outs) {
+        auto *sp = c->spec;
+        if (!sp) return nullptr;
+        for (auto *t : sp->argtypes)
+            if (!is_int_ty(t)) return nullptr;
+        for (auto *rt : sp->rets)
+            if (!is_int_ty(rt)) return nullptr;
+        auto nrets = sp->rets.size();
+        if (nrets > 1 && (!outs || outs->size() < nrets)) return nullptr;
+        string callee = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
+        if (name_counts[sp->sf->qname] > 1)
+            callee += cat("_", sp->id);
+        auto *cf = mod->getFunction(callee);
+        if (!cf) return nullptr;
+        auto expect = c->args.size() + (nrets > 1 ? nrets - 1 : 0);
+        if (cf->getFunctionType()->getNumParams() != expect) return nullptr;
+        std::vector<llvm::Value *> args;
+        for (auto *a : c->args) {
+            auto *av = GenExpr(a, w);
+            if (!av) return nullptr;
+            args.push_back(av);
+        }
+        for (size_t i = 1; i < nrets; ++i) args.push_back((*outs)[i]);
+        return b.CreateCall(cf, args);
+    }
+
+    // An inlined call body: its statements, then its tail value. Each return
+    // of the callee (Return above) branches here with its value; the values
+    // meet in a PHI. A fallthrough with no value, or no value at all, gives
+    // no result.
+    llvm::Value *GenInline(InlineBlock *ib, FnWalk &w) {
+        auto *merge = llvm::BasicBlock::Create(ctx, "inlmerge", w.fn);
+        w.inl.push_back({ ib->sf, merge, {} });
+        size_t ei = w.inl.size() - 1;
+        llvm::Value *tv = nullptr;
+        if (ib->body) {
+            for (auto *s : ib->body->stmts) GenStmt(s, w);
+            if (ib->body->tail) tv = GenExpr(ib->body->tail, w);
+        }
+        auto *cur = b.GetInsertBlock();
+        // A block after a return that no edge reaches is dead: it adds no
+        // edge to the merge.
+        bool reach = !cur->getTerminator()
+            && (cur == &w.fn->getEntryBlock() || !cur->hasNPredecessors(0));
+        bool fell = false;
+        if (reach) {
+            if (tv) w.inl[ei].incoming.push_back({ tv, cur });
+            else fell = true;
+            b.CreateBr(merge);
+        }
+        auto incoming = std::move(w.inl[ei].incoming);
+        w.inl.pop_back();
+        b.SetInsertPoint(merge);
+        if (fell || incoming.empty()) return nullptr;
+        for (auto &[v, bb] : incoming)
+            if (!v->getType()->isIntegerTy(64)) return nullptr;
+        auto *phi = b.CreatePHI(i64(), (unsigned)incoming.size(), "inl");
+        for (auto &[v, bb] : incoming) phi->addIncoming(v, bb);
+        return phi;
+    }
+
     void GenStmt(Node *n, FnWalk &w) {
         if (!n) return;
         if (auto *blk = Is<Block>(n)) {
@@ -928,16 +1047,6 @@ struct CodeGenIR {
             // expression, not a ret.
             auto top = blk == w.body;
             for (auto *s : blk->stmts) GenStmt(s, w);
-            // A nested block's flow-out value (an inlined callee's return)
-            // is this block's value.
-            if (w.flowout) {
-                llvm::Value *v = w.flowout;
-                w.flowout = nullptr;
-                if (top && v && w.fn->getReturnType()->isIntegerTy(64) &&
-                    !b.GetInsertBlock()->getTerminator())
-                    b.CreateRet(v);
-                return;
-            }
             if (blk->tail) {
                 // A tail that is an explicit return statement.
                 if (auto *tr = Is<Return>(blk->tail)) {
@@ -963,29 +1072,30 @@ struct CodeGenIR {
             return;
         }
         if (auto *ib = Is<InlineBlock>(n)) {
-            // An inlined call body: walk its inner block, then its tail.
-            // A `return` whose target is the inlined callee (not the walked
-            // function) lands in w.flowout; the value then flows out of this
-            // statement as the call's result.
-            auto *prevout = w.flowout;
-            w.flowout = nullptr;
-            if (ib->body) {
-                for (auto *s : ib->body->stmts) GenStmt(s, w);
-                if (w.flowout) {
-                    w.flowout = prevout;
-                    return;
-                }
-                if (ib->body->tail) {
-                    auto *tv = GenExpr(ib->body->tail, w);
-                    if (tv && w.fn->getReturnType()->isIntegerTy(64) &&
-                        !b.GetInsertBlock()->getTerminator())
-                        b.CreateRet(tv);
-                }
-            }
-            w.flowout = prevout;
+            GenInline(ib, w);
             return;
         }
         if (auto *vd = Is<VarDecl>(n)) {
+            // `let h, m = f(x)`: one multi-result call wired into the locals.
+            // Result 0 is stored from the call's value, the others are the
+            // out-pointers the callee writes.
+            if (vd->defs.size() > 1 && vd->inits.size() == 1 && !vd->isglobal) {
+                auto *c = Is<Call>(vd->inits[0]);
+                if (!c || !c->spec || c->spec->rets.size() != vd->defs.size()) return;
+                std::vector<llvm::Value *> outs(vd->defs.size(), nullptr);
+                std::vector<llvm::AllocaInst *> slots(vd->defs.size(), nullptr);
+                for (size_t i = 0; i < vd->defs.size(); ++i) {
+                    if (!vd->defs[i] || !is_int_ty(vd->defs[i]->type)) return;
+                    slots[i] = b.CreateAlloca(i64(), nullptr, llvm::Twine(vd->defs[i]->name));
+                    outs[i] = slots[i];
+                }
+                auto *v0 = EmitDirectCall(c, w, &outs);
+                if (!v0) return;
+                b.CreateStore(v0, slots[0]);
+                for (size_t i = 0; i < vd->defs.size(); ++i)
+                    w.locals[vd->defs[i]] = slots[i];
+                return;
+            }
             // Growable i64 arrays: a dedicated data stack slot + header.
             // Scalars keep the alloca + store path below. A global growable
             // array is not a local stack slot; later cut.
@@ -998,7 +1108,7 @@ struct CodeGenIR {
                     continue;
                 }
                 if (vddef->type->kind == TY_ARRAY
-                    && vddef->type->arr->akind == A_FIXED
+                    && (vddef->type->arr->akind == A_FIXED || vddef->type->arr->akind == A_VAR)
                     && is_int_ty(vddef->type->arr->sub)) {
                     emit_fixed_decl(vd, i, *vddef, w);
                     continue;
@@ -1042,7 +1152,8 @@ struct CodeGenIR {
                     case T_PLUSEQ:  rhs = b.CreateAdd(cur, rhs, "pluseq"); break;
                     case T_MINUSEQ: rhs = b.CreateSub(cur, rhs, "minuseq"); break;
                     case T_MULEQ:   rhs = b.CreateMul(cur, rhs, "muleq"); break;
-                    case T_DIVEQ:   rhs = b.CreateSDiv(cur, rhs, "diveq"); break;
+                    case T_DIVEQ:   rhs = GenDivMod(T_DIV, cur, rhs, w); break;
+                    case T_MODEQ:   rhs = GenDivMod(T_MOD, cur, rhs, w); break;
                     default: return;
                 }
             }
@@ -1214,9 +1325,8 @@ struct CodeGenIR {
                 b.CreateBr(w.loops.back().donebb);
                 return;
             }
-            // A `break` out of an EarlyBlock: its value (or the block's
-            // fall-through) is the block's result, handed up as the flow-out.
-            w.flowout = brk->val ? GenExpr(brk->val, w) : nullptr;
+            // A `break` out of an EarlyBlock is not modeled in the minimal
+            // walk yet (its value would flow out of the block): left out.
             return;
         }
         if (auto *cont = Is<Continue>(n)) {
@@ -1251,10 +1361,47 @@ struct CodeGenIR {
             // normal function return of this walk, so it emits as usual.
             if (!ret->from.empty()) return;
             if (ret->target && w.cursf && ret->target != w.cursf) {
-                // An inlined callee's return: its value is the call's result,
-                // handed to the enclosing InlineBlock (its GenStmt catches
-                // w.flowout and, at function top level, emits the ret).
-                w.flowout = ret->vals.empty() ? nullptr : GenExpr(ret->vals[0], w);
+                // An inlined callee's return: the value goes to the merge of
+                // that body's InlineBlock, and the code after it is dead.
+                size_t ei = w.inl.size();
+                while (ei > 0 && w.inl[ei - 1].sf != ret->target) --ei;
+                if (ei == 0) return;
+                --ei;
+                llvm::Value *v = nullptr;
+                if (!ret->vals.empty()) {
+                    v = GenExpr(ret->vals[0], w);
+                    if (!v) return;
+                }
+                if (v) w.inl[ei].incoming.push_back({ v, b.GetInsertBlock() });
+                b.CreateBr(w.inl[ei].merge);
+                b.SetInsertPoint(llvm::BasicBlock::Create(ctx, "inlret.dead", w.fn));
+                return;
+            }
+            auto nrets = w.spec ? w.spec->rets.size() : (size_t)0;
+            if (nrets > 1 && ret->vals.size() == 1) {
+                // `return f(x)` forwarding every result: the callee writes
+                // results 1.. straight into this function's out-pointers.
+                auto *c = Is<Call>(ret->vals[0]);
+                if (!c) return;
+                std::vector<llvm::Value *> outs(nrets, nullptr);
+                for (size_t i = 1; i < nrets; ++i)
+                    outs[i] = w.fn->getArg(w.outstart + i - 1);
+                auto *v0 = EmitDirectCall(c, w, &outs);
+                if (v0) b.CreateRet(v0);
+                return;
+            }
+            if (ret->vals.size() > 1) {
+                // `return a, b, c`: all values first in source order, then
+                // results 1.. stored through the out-pointers, result 0 returned.
+                std::vector<llvm::Value *> vals;
+                for (auto *vn : ret->vals) {
+                    auto *v = GenExpr(vn, w);
+                    if (!v) return;
+                    vals.push_back(v);
+                }
+                for (size_t i = 1; i < vals.size(); ++i)
+                    b.CreateStore(vals[i], w.fn->getArg(w.outstart + i - 1));
+                b.CreateRet(vals[0]);
                 return;
             }
             if (ret->vals.empty() && w.fn->getReturnType()->isVoidTy()) {
