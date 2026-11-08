@@ -168,10 +168,13 @@ struct CodeGenIR {
             llvm::BasicBlock *condbb = nullptr;   // The loop's condition block.
             llvm::BasicBlock *donebb = nullptr;    // The loop's exit block.
         };
-        // Growable i64 array locals of this walk: VarDef * -> header.
+        // Growable array locals of this walk: VarDef * -> header. base and
+        // len are local allocas (their alloca'd header); the same record
+        // shape also carries a global's thread-local header (storage
+        // shared across bodies instead of a stack frame's).
         struct RzArr {
-            llvm::AllocaInst *base = nullptr;      // The region base.
-            llvm::AllocaInst *len = nullptr;       // The element count.
+            llvm::Value *base = nullptr;           // The region base.
+            llvm::Value *len = nullptr;            // The element count.
             llvm::GlobalVariable *slot = nullptr;  // The gs_stack { top } owner.
             TypeExpr *etype = nullptr;             // The element type.
         };
@@ -217,6 +220,23 @@ struct CodeGenIR {
         return t && t->kind == TY_INT
             && (t->intstorage == IS_U8 || t->intstorage == IS_U16
                 || t->intstorage == IS_U32 || t->intstorage == IS_U64);
+    }
+
+    // A growable-array global (var a: T[>..] top level): its header is
+    // thread-local globals (base, len) next to the same slot shape, and
+    // gs_globals_init sets them from the reserved region (int main()
+    // reserves before calling it). A global pushed from any body and cast
+    // checks against its count read it.
+    std::unordered_map<VarDef *, FnWalk::RzArr> global_rzs;
+
+    // A growable array's header by name holder: a local of this walk or a
+    // program global. Null where the name is neither.
+    FnWalk::RzArr *rz_head(FnWalk &w, VarDef *d) {
+        auto lit = w.rzarrs.find(d);
+        if (lit != w.rzarrs.end()) return &lit->second;
+        auto git = global_rzs.find(d);
+        if (git != global_rzs.end()) return &git->second;
+        return nullptr;
     }
 
     // The runtime's print(i64) entry. `print` is B_PRINT in builtins.h.
@@ -364,10 +384,44 @@ struct CodeGenIR {
     llvm::Value *GenAsCast(AsCast *ac, FnWalk &w) {
         auto *st = ac->child->exprtype;
         if (!st || st->kind != TY_INT || st->intstorage == IS_U64) return nullptr;
-        if (!ac->totype || !is_int_ty(ac->totype) || ac->totype->intstorage == IS_VARINT
-            || ac->totype->ix) return nullptr;
         auto *c = GenExpr(ac->child, w);
         if (!c) return nullptr;
+        // An index or bound type (`u32 in arr`, `u32 upto arr`): check the
+        // value against the array's live count in every build (the C
+        // backend's IndexTypeCheck, a fail is gs_idxfail), then narrow as
+        // any `as` does. The array the checker named may be a local of
+        // this walk or a program global; anything else is an unwalked cut.
+        if (ac->totype && ac->totype->ix) {
+            if (!is_int_ty(ac->totype) || ac->totype->intstorage == IS_VARINT)
+                return nullptr;
+            auto *arr = rz_head(w, ac->totype->ix->arr);
+            if (!arr) return nullptr;
+            if (!ac->nobc) {
+                auto *lenv = b.CreateLoad(i64(), arr->len);
+                auto *okbb = llvm::BasicBlock::Create(ctx, "ixok", w.fn);
+                auto *failbb = llvm::BasicBlock::Create(ctx, "ixfail", w.fn);
+                auto *inr = ac->totype->ix->upto
+                    ? b.CreateICmpULE(c, lenv, "ixin")
+                    : b.CreateICmpULT(c, lenv, "ixin");
+                b.CreateCondBr(inr, okbb, failbb);
+                b.SetInsertPoint(failbb);
+                b.CreateCall(f_gs_idxfail, {
+                    c, lenv,
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    llvm::ConstantInt::get(
+                        llvm::Type::getInt32Ty(ctx), 0) });
+                b.CreateUnreachable();
+                b.SetInsertPoint(okbb);
+            }
+            auto *et = int_ll_ty(ac->totype);
+            if (et == i64()) return c;
+            auto *narrow = b.CreateTrunc(c, et);
+            return is_uint_ty(ac->totype) ? b.CreateZExt(narrow, i64())
+                                          : b.CreateSExt(narrow, i64());
+        }
+        if (!ac->totype || !is_int_ty(ac->totype)
+            || ac->totype->intstorage == IS_VARINT)
+            return nullptr;
         auto tt = ac->totype->intstorage;
         auto [slo, shi] = IntRange(st->intstorage);
         auto [lo, hi] = IntRange(tt);
@@ -536,9 +590,8 @@ struct CodeGenIR {
             if (dt->member == B_LEN) {
                 auto *obj = Is<Ident>(dt->obj);
                 if (obj && obj->vdef) {
-                    auto rit = w.rzarrs.find(obj->vdef);
-                    if (rit != w.rzarrs.end())
-                        return b.CreateLoad(i64(), rit->second.len,
+                    if (auto *r = rz_head(w, obj->vdef))
+                        return b.CreateLoad(i64(), r->len,
                                             llvm::Twine(obj->vdef->name, ".lenv"));
                 }
             }
@@ -550,12 +603,11 @@ struct CodeGenIR {
             // negative i64 index is caught by the same check.
             auto *obj = Is<Ident>(ix->obj);
             if (obj && obj->vdef) {
-                auto rit = w.rzarrs.find(obj->vdef);
-                if (rit != w.rzarrs.end()) {
+                if (auto *r = rz_head(w, obj->vdef)) {
                     auto *idxv = GenExpr(ix->idx, w);
                     if (!idxv) return nullptr;
-                    auto *basev = b.CreateLoad(i8ptr(), rit->second.base);
-                    auto *lenv = b.CreateLoad(i64(), rit->second.len);
+                    auto *basev = b.CreateLoad(i8ptr(), r->base);
+                    auto *lenv = b.CreateLoad(i64(), r->len);
                     if (!ix->nobc) {
                         // The failside is noreturn (gs_idxfail), so the
                         // downstream emission lives in the pass block.
@@ -571,7 +623,7 @@ struct CodeGenIR {
                         b.CreateUnreachable();
                         b.SetInsertPoint(okbb);
                     }
-                    return rz_load_elem(rit->second, basev, idxv, "rzip");
+                    return rz_load_elem(*r, basev, idxv, "rzip");
                 }
             }
             return nullptr;
@@ -586,18 +638,18 @@ struct CodeGenIR {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
                 if (recv && recv->vdef) {
-                    auto rit = w.rzarrs.find(recv->vdef);
-                    if (rit != w.rzarrs.end()) {
+                    auto *rit = rz_head(w, recv->vdef);
+                    if (rit) {
                         auto *v = GenExpr(c->args[0], w);
                         if (!v) return nullptr;
-                        auto &r = rit->second;
-                        auto *basev = b.CreateLoad(i8ptr(), r.base, "rzbase");
-                        auto *lenv = b.CreateLoad(i64(), r.len, "rzlen");
-                        rz_store_elem(r, basev, lenv, v);
+                        auto *r = rit;
+                        auto *basev = b.CreateLoad(i8ptr(), r->base, "rzbase");
+                        auto *lenv = b.CreateLoad(i64(), r->len, "rzlen");
+                        rz_store_elem(*r, basev, lenv, v);
                         auto *nlen = b.CreateAdd(
                             lenv, llvm::ConstantInt::get(i64(), 1), "rzlen+1");
-                        b.CreateStore(nlen, r.len);
-                        rz_sync_slot(r, basev, nlen);
+                        b.CreateStore(nlen, r->len);
+                        rz_sync_slot(*r, basev, nlen);
                         return nullptr;
                     }
                 }
@@ -1056,6 +1108,32 @@ struct CodeGenIR {
         for (auto *g : ast.globals) {
             for (size_t di = 0; di < g->defs.size(); ++di) {
                 auto *d = g->defs[di];
+                if (is_growable_i64(d->type)) {
+                    // One slot per global in reservation order (globals go
+                    // before body-walked locals), its header thread-local.
+                    std::string gname(d->name);
+                    auto *slot = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        cat("gs_stk", stk_slots.size()), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(slot);
+                    auto *basegv = new llvm::GlobalVariable(
+                        *mod, i8ptr(), false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        gname + ".base", nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    auto *lengv = new llvm::GlobalVariable(
+                        *mod, i64ty, false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantInt::get(i64ty, 0),
+                        gname + ".len", nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    global_rzs[d] = { basegv, lengv, slot, d->type->arr->sub };
+                    continue;
+                }
                 if (!is_int_ty(d->type)) continue;
                 // A string_view's .data() is not null-terminated, so the name
                 // must be copied into a std::string (passing .data() directly
@@ -1072,7 +1150,7 @@ struct CodeGenIR {
                     inits.push_back({ d, g->inits[di] });
             }
         }
-        if (inits.empty()) return;
+        if (inits.empty() && global_rzs.empty()) return;
         // Reuse the extern declaration from declare_entry_externs() and give
         // it a body. A second Function::Create with the same name would be
         // renamed gs_globals_init.1, leaving the extern undefined at link.
@@ -1084,6 +1162,13 @@ struct CodeGenIR {
         for (auto &[d, ninit] : inits) {
             auto *initv = GenExpr(ninit, gw);
             if (initv) b.CreateStore(initv, global_vars[d].gv);
+        }
+        // A growable global's header: base from its reserved region, count
+        // zero. The initializer this slice takes is [] only, whose contents
+        // are nothing to store.
+        for (auto &[d, r] : global_rzs) {
+            b.CreateStore(b.CreateLoad(i8ptr(), r.slot, "gbase"), r.base);
+            b.CreateStore(llvm::ConstantInt::get(i64(), 0), r.len);
         }
         b.CreateRetVoid();
     }
