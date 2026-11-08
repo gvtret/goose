@@ -123,13 +123,16 @@ module reports a clear diagnostic if the system LLVM is older.
 
 The IR backend emits honest programs for the M3 data-stack subset:
 int-walked locals and globals, growable arrays (`T[>..]`) with literal
-and fill initializers, push/index/len with bounds checks, `as` casts
-between int storages (checked at the value's bounds) and into
-index/bound types (checked at the array's live count), direct calls of
-int-signatured functions (void included), range/count loops, while,
-if, break-continue, and the valueless tail a void body may end in. 20
-of the codegen output fixtures pass through `--emit-ir`; the rest need
-the remaining M3 shapes (structures, strings, arrays returned and
-sliced) and the M4 modules. See
+and fill initializers, push/index/len with bounds checks, element
+iteration, fixed arrays (`T[k]`) with literal and fill initializers,
+`as` casts between int storages (checked at the value's bounds) and
+into index/bound types (checked at the array's live count), direct
+calls of int-signatured functions (void included), range/count loops,
+while, if, break-continue, and lines print through the runtime's
+format hooks one write per line (int values and string literals; the
+rest of print's alphabet lands with its shapes). 31 of the codegen
+output fixtures pass through `--emit-ir`; the rest need the remaining
+M3 shapes (structures, multi-returns, arrays returned and sliced,
+strings as values) and the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.
