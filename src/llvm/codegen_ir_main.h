@@ -971,6 +971,54 @@ struct CodeGenIR {
                 b.SetInsertPoint(donebb);
                 return;
             }
+            if (fl->iterkind == IK_ARRAY) {
+                // Element iteration over a growable array: the binder
+                // names the element read per pass, the optional index
+                // binder its position, and the count re-reads each pass
+                // (pushes during iteration stay legal, so grown-into
+                // elements are seen by later passes).
+                auto *obj = Is<Ident>(fl->iter);
+                auto *r = obj && obj->vdef ? rz_head(w, obj->vdef) : nullptr;
+                if (!r) return;
+                auto *fn = w.fn;
+                auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
+                auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
+                auto *donebb = llvm::BasicBlock::Create(ctx, "for_done", fn);
+                w.loops.push_back({condbb, donebb});
+                b.CreateBr(condbb);
+                b.SetInsertPoint(condbb);
+                auto *iv = b.CreatePHI(i64(), 2, "for_i");
+                iv->addIncoming(llvm::ConstantInt::get(i64(), 0),
+                                b.GetInsertBlock()->getSinglePredecessor());
+                auto *lenv = b.CreateLoad(i64(), r->len, "for_len");
+                b.CreateCondBr(b.CreateICmpULT(iv, lenv, "for_test"),
+                               bodybb, donebb);
+                b.SetInsertPoint(bodybb);
+                if (fl->vdef) {
+                    auto *slot = b.CreateAlloca(i64(), nullptr,
+                                                llvm::Twine(fl->vdef->name));
+                    auto *basev = b.CreateLoad(i8ptr(), r->base);
+                    b.CreateStore(rz_load_elem(*r, basev, iv, "for_ip"), slot);
+                    w.locals[fl->vdef] = slot;
+                }
+                if (fl->idxdef) {
+                    auto *slot = b.CreateAlloca(i64(), nullptr,
+                                                llvm::Twine(fl->idxdef->name));
+                    b.CreateStore(iv, slot);
+                    w.locals[fl->idxdef] = slot;
+                }
+                if (fl->body) GenStmt(fl->body, w);
+                auto *body_end = b.GetInsertBlock();
+                if (!body_end->getTerminator()) {
+                    b.SetInsertPoint(body_end);
+                    auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "for_next");
+                    iv->addIncoming(next, body_end);
+                    b.CreateBr(condbb);
+                }
+                w.loops.pop_back();
+                b.SetInsertPoint(donebb);
+                return;
+            }
             return;
         }
         if (auto *brk = Is<Break>(n)) {
