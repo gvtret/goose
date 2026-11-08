@@ -168,9 +168,10 @@ struct CodeGenIR {
         };
         // Growable i64 array locals of this walk: VarDef * -> header.
         struct RzArr {
-            llvm::AllocaInst *base = nullptr;      // The region base (element 0).
+            llvm::AllocaInst *base = nullptr;      // The region base.
             llvm::AllocaInst *len = nullptr;       // The element count.
             llvm::GlobalVariable *slot = nullptr;  // The gs_stack { top } owner.
+            TypeExpr *etype = nullptr;             // The element type.
         };
         std::unordered_map<VarDef *, RzArr> rzarrs;
         std::vector<Loop> loops;
@@ -198,6 +199,22 @@ struct CodeGenIR {
     static bool is_growable_i64(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && t->arr->akind == A_GROW
             && is_int_ty(t->arr->sub);
+    }
+
+    // An int type's LLVM storage width: u8 is i8, and so on.
+    llvm::Type *int_ll_ty(TypeExpr *t) {
+        switch (t->intstorage) {
+            case IS_I8: case IS_U8:   return llvm::Type::getInt8Ty(ctx);
+            case IS_I16: case IS_U16: return llvm::Type::getInt16Ty(ctx);
+            case IS_I32: case IS_U32: return llvm::Type::getInt32Ty(ctx);
+            default:                  return llvm::Type::getInt64Ty(ctx);
+        }
+    }
+
+    static bool is_uint_ty(TypeExpr *t) {
+        return t && t->kind == TY_INT
+            && (t->intstorage == IS_U8 || t->intstorage == IS_U16
+                || t->intstorage == IS_U32 || t->intstorage == IS_U64);
     }
 
     // The runtime's print(i64) entry. `print` is B_PRINT in builtins.h.
@@ -307,7 +324,33 @@ struct CodeGenIR {
     // Body-walk definitions (minimal M3 subset, i64 values).
     // ------------------------------------------------------------------
 
-    // A growable array local (`var a: i64[>..] = []`): its storage is one
+    // The runtime slot's top tracks the next free byte: past the len
+    // elements (GEP by the element type is the byte arithmetic).
+    void rz_sync_slot(FnWalk::RzArr &r, llvm::Value *basev, llvm::Value *lenv) {
+        auto *et = int_ll_ty(r.etype);
+        b.CreateStore(b.CreateInBoundsGEP(et, basev, lenv, "rztop"), r.slot);
+    }
+
+    // An i64-walked value into an element slot, narrowed to the element's
+    // storage (a u8 push's 300 arrives as 44, the int conversion mod 2^8).
+    void rz_store_elem(FnWalk::RzArr &r, llvm::Value *basev, llvm::Value *idx,
+                       llvm::Value *v) {
+        auto *et = int_ll_ty(r.etype);
+        auto *ev = et == i64() ? v : b.CreateTrunc(v, et);
+        b.CreateStore(ev, b.CreateInBoundsGEP(et, basev, idx));
+    }
+
+    // An element read widened back to the walk's i64 values: unsigned
+    // element storage zero-extends, signed sign-extends.
+    llvm::Value *rz_load_elem(FnWalk::RzArr &r, llvm::Value *basev,
+                              llvm::Value *idx, const llvm::Twine &name) {
+        auto *et = int_ll_ty(r.etype);
+        auto *v = b.CreateLoad(et, b.CreateInBoundsGEP(et, basev, idx), name);
+        if (et == i64()) return v;
+        return is_uint_ty(r.etype) ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
+    }
+
+    // A growable array local (`var a: i64[>..] = [...]`): its storage is one
     // dedicated data stack. The slot is a lazy thread-local gs_stack { top
     // } owned by this slice; emit_program_entry reserves each slot's
     // region through gs_reserve_region and stores the base into the slot
@@ -315,12 +358,11 @@ struct CodeGenIR {
     // decl (recursion, a loop body) reuses the region honestly only with
     // the full gs_sp machinery, which lands with the M3 completion.
     void emit_growable_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
-        // This slice takes the empty `[]` initializer or none; a filled
-        // literal or a copied array is a later cut.
-        if (i < vd->inits.size() && vd->inits[i]) {
-            auto *al = Is<ArrayLit>(vd->inits[i]);
-            if (!al || !al->elems.empty()) return;
-        }
+        // This slice reads only literal construction; a copied array or a
+        // call giving its source is a later cut.
+        auto *al = i < vd->inits.size() && vd->inits[i]
+            ? Is<ArrayLit>(vd->inits[i]) : nullptr;
+        if (i < vd->inits.size() && vd->inits[i] && !al) return;
         string sname = cat("gs_stk", stk_slots.size());
         auto *slot = new llvm::GlobalVariable(
             *mod, i8ptr(), /*isConstant=*/false,
@@ -329,13 +371,50 @@ struct CodeGenIR {
             sname, nullptr, llvm::GlobalValue::GeneralDynamicTLSModel);
         stk_slots.push_back(slot);
         // The header: gs_rhdr { base, len }. After main's reservation the
-        // slot reads the region base; an empty array sits at the base with
-        // no elements.
+        // slot reads the region base.
         auto *basea = b.CreateAlloca(i8ptr(), nullptr, llvm::Twine(def.name, ".base"));
         auto *lena = b.CreateAlloca(i64(), nullptr, llvm::Twine(def.name, ".len"));
-        b.CreateStore(b.CreateLoad(i8ptr(), slot, llvm::Twine(def.name, ".top")), basea);
+        auto *basev = b.CreateLoad(i8ptr(), slot, llvm::Twine(def.name, ".top"));
+        b.CreateStore(basev, basea);
         b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
-        w.rzarrs[&def] = { basea, lena, slot };
+        auto &r = w.rzarrs[&def];
+        r = { basea, lena, slot, def.type->arr->sub };
+        // The literal's elements land in sequence; the fill form freezes
+        // its value once (the C backend's FreezeFill contract,
+        // codegen_construct.h:955) and repeats it in a loop.
+        if (al && !al->elems.empty()) {
+            for (size_t k = 0; k < al->elems.size(); ++k) {
+                auto *ev = GenExpr(al->elems[k], w);
+                if (!ev) return;
+                rz_store_elem(r, basev, llvm::ConstantInt::get(i64(), k), ev);
+            }
+            auto *n = llvm::ConstantInt::get(i64(), al->elems.size());
+            b.CreateStore(n, lena);
+            rz_sync_slot(r, basev, n);
+        } else if (al && al->fillval) {
+            auto *fv = GenExpr(al->fillval, w);
+            auto *n = al->fillcount ? GenExpr(al->fillcount, w) : nullptr;
+            if (!fv || !n) return;
+            auto *prebb = b.GetInsertBlock();
+            auto *condbb = llvm::BasicBlock::Create(ctx, "fillcond", w.fn);
+            auto *bodybb = llvm::BasicBlock::Create(ctx, "fillbody", w.fn);
+            auto *donebb = llvm::BasicBlock::Create(ctx, "filldone", w.fn);
+            b.CreateBr(condbb);
+            b.SetInsertPoint(condbb);
+            auto *fi = b.CreatePHI(i64(), 2, "fi");
+            fi->addIncoming(llvm::ConstantInt::get(i64(), 0), prebb);
+            b.CreateCondBr(b.CreateICmpULT(fi, n, "fillmore"), bodybb, donebb);
+            b.SetInsertPoint(bodybb);
+            rz_store_elem(r, basev, fi, fv);
+            auto *next = b.CreateAdd(fi, llvm::ConstantInt::get(i64(), 1), "fi+1");
+            fi->addIncoming(next, bodybb);
+            b.CreateBr(condbb);
+            b.SetInsertPoint(donebb);
+            b.CreateStore(n, lena);
+            rz_sync_slot(r, basev, n);
+        }
+        // An empty literal (`[]`, or `[..cap]`'s hint, whose capacity the
+        // monotonic region model takes as given): len stays 0.
     }
     llvm::Value *GenExpr(Node *n, FnWalk &w) {
         if (!n) return nullptr;
@@ -444,8 +523,7 @@ struct CodeGenIR {
                         b.CreateUnreachable();
                         b.SetInsertPoint(okbb);
                     }
-                    auto *dst = b.CreateInBoundsGEP(i64(), basev, idxv);
-                    return b.CreateLoad(i64(), dst);
+                    return rz_load_elem(rit->second, basev, idxv, "rzip");
                 }
             }
             return nullptr;
@@ -464,16 +542,14 @@ struct CodeGenIR {
                     if (rit != w.rzarrs.end()) {
                         auto *v = GenExpr(c->args[0], w);
                         if (!v) return nullptr;
-                        auto *basev = b.CreateLoad(
-                            i8ptr(), rit->second.base, "rzbase");
-                        auto *lenv = b.CreateLoad(
-                            i64(), rit->second.len, "rzlen");
-                        b.CreateStore(v, b.CreateInBoundsGEP(i64(), basev, lenv));
+                        auto &r = rit->second;
+                        auto *basev = b.CreateLoad(i8ptr(), r.base, "rzbase");
+                        auto *lenv = b.CreateLoad(i64(), r.len, "rzlen");
+                        rz_store_elem(r, basev, lenv, v);
                         auto *nlen = b.CreateAdd(
                             lenv, llvm::ConstantInt::get(i64(), 1), "rzlen+1");
-                        b.CreateStore(nlen, rit->second.len);
-                        b.CreateStore(b.CreateInBoundsGEP(i64(), basev, nlen, "rztop"),
-                                      rit->second.slot);
+                        b.CreateStore(nlen, r.len);
+                        rz_sync_slot(r, basev, nlen);
                         return nullptr;
                     }
                 }
