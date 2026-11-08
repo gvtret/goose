@@ -148,6 +148,13 @@ struct CodeGenIR {
         // callee's return, a break carrying the block's value); the enclosing
         // block or InlineBlock consumes it.
         llvm::Value *flowout = nullptr;
+        // The enclosing loops of the walk (innermost last); a break or
+        // continue without a value targets the innermost one.
+        struct Loop {
+            llvm::BasicBlock *condbb = nullptr;   // The loop's condition block.
+            llvm::BasicBlock *donebb = nullptr;    // The loop's exit block.
+        };
+        std::vector<Loop> loops;
     };
 
     // Number of live specializations per qualified Goose function name. The
@@ -547,10 +554,14 @@ struct CodeGenIR {
             auto *condbb = llvm::BasicBlock::Create(ctx, "while_cond", fn);
             auto *bodybb = llvm::BasicBlock::Create(ctx, "while_body", fn);
             auto *donebb = llvm::BasicBlock::Create(ctx, "while_done", fn);
+            w.loops.push_back({condbb, donebb});
             b.CreateBr(condbb);
             b.SetInsertPoint(condbb);
             auto *cond = GenExpr(wh->cond, w);
-            if (!cond) return;
+            if (!cond) {
+                w.loops.pop_back();
+                return;
+            }
             if (!cond->getType()->isIntegerTy(1)) {
                 auto *z = llvm::ConstantInt::get(i64(), 0);
                 cond = b.CreateICmpNE(cond, z, "while_test");
@@ -559,6 +570,7 @@ struct CodeGenIR {
             b.SetInsertPoint(bodybb);
             if (wh->body) GenStmt(wh->body, w);
             if (!b.GetInsertBlock()->getTerminator()) b.CreateBr(condbb);
+            w.loops.pop_back();
             b.SetInsertPoint(donebb);
             return;
         }
@@ -578,6 +590,7 @@ struct CodeGenIR {
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
                 auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
                 auto *donebb = llvm::BasicBlock::Create(ctx, "for_done", fn);
+                w.loops.push_back({condbb, donebb});
                 b.CreateBr(condbb);
                 b.SetInsertPoint(condbb);
                 auto *iv = b.CreatePHI(i64(), 2, "for_i");
@@ -598,15 +611,30 @@ struct CodeGenIR {
                     iv->addIncoming(next, body_end);
                     b.CreateBr(condbb);
                 }
+                w.loops.pop_back();
                 b.SetInsertPoint(donebb);
                 return;
             }
             return;
         }
         if (auto *brk = Is<Break>(n)) {
+            if (!w.loops.empty()) {
+                // A valueless `break` out of the innermost loop. A valued
+                // break belongs to a `loop` expression (LoopExpr), which is
+                // M3 work: its value would flow out of the loop, so the
+                // minimal walk leaves it to the verification pass.
+                if (brk->val) return;
+                b.CreateBr(w.loops.back().donebb);
+                return;
+            }
             // A `break` out of an EarlyBlock: its value (or the block's
             // fall-through) is the block's result, handed up as the flow-out.
             w.flowout = brk->val ? GenExpr(brk->val, w) : nullptr;
+            return;
+        }
+        if (auto *cont = Is<Continue>(n)) {
+            if (w.loops.empty()) return;
+            b.CreateBr(w.loops.back().condbb);
             return;
         }
         if (auto *inc = Is<IncDec>(n)) {
