@@ -197,7 +197,7 @@ if(GOOSE_LLVM)
     # The runtime archive (libgoose_rt.a) is the external-linkage object
     # the emitted IR module links against. It is always built when the
     # IR backend is enabled, independent of which JIT is active.
-    add_library(goose_rt STATIC src/runtime/runtime.c src/runtime/ir_stub.c)
+    add_library(goose_rt STATIC src/runtime/runtime.c src/llvm/ir_stub.c)
     set_target_properties(goose_rt PROPERTIES
         C_STANDARD 11
         POSITION_INDEPENDENT_CODE ON)
@@ -212,8 +212,12 @@ if(GOOSE_LLVM)
         target_link_libraries(goose_rt PRIVATE ws2 msvcrt)
     endif()
     # Link LLVM and the runtime archive into the compiler so the IR
-    # builder (src/codegen_ir*.h) has llvm::* symbols at link time.
-    target_include_directories(goose PRIVATE ${LLVM_INCLUDE_DIRS})
+    # builder (src/llvm/codegen_ir*.h) has llvm::* symbols at link time.
+    # The builder's quoted includes of includes.h/ast.h/builtins.h resolve
+    # from src/ (its own directory has only the codegen_ir headers).
+    target_include_directories(goose PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        ${LLVM_INCLUDE_DIRS})
     target_link_libraries(goose PRIVATE
         ${LLVM_LIBS}
         goose_rt

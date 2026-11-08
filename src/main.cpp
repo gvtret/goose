@@ -40,7 +40,7 @@
 #include "codegen_nodes.h"
 #include "runtime_inline.h"
 #ifdef GOOSE_LLVM_LIBDIR
-#include "codegen_ir.h"
+#include "llvm/codegen_ir.h"
 #endif
 #include "process.h"
 #include "jit.h"

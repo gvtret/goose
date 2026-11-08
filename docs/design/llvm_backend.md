@@ -52,22 +52,29 @@ module reports a clear diagnostic if the system LLVM is older.
 - Root `CMakeLists.txt` — `GOOSE_LLVM` option; when on, builds the
   runtime target and links LLVM.
 
-## M2: type + value emission (done)
+## M2: type + value emission (skeleton)
 
-- `src/codegen_ir_types.h` — layout, `StructType`, `DataLayout`,
-  alignment (mirrors the C backend's `#pragma pack(1)` convention).
-- `src/codegen_ir_values.h` — `EmitPush`, `EmitAppend`, `EmitLoad`,
-  `EmitStore`, `TopW` / bump mechanics, `OpenRzDest` prefix+patch.
+- `src/llvm/codegen_ir_frames.h` — layout helpers (`IrStackLayout`,
+  `IrLocLayout`, `ir_fn_type`, `ir_sp_idx`); alignment mirrors the C
+  backend's `#pragma pack(1)` convention. The planned
+  `codegen_ir_types.h` was folded into this header.
+- `src/llvm/codegen_ir_values.h` — `ir_load_stack`, `ir_bump`,
+  `ir_stack_load`/`ir_stack_store`. Built against the runtime's real
+  one-field `gs_stack`; see "Task 3 foundation findings" in
+  `docs/superpowers/plans/2026-11-07-llvm-ir-codegen.md`.
 
 ## M3: frames, stacks, construction (partially done)
 
-- `src/codegen_ir_frames.h` — `gs_sp` (i64 index into `@gs_stks`),
+- `src/llvm/codegen_ir_frames.h` — `gs_sp` (i64 index into `@gs_stks`),
   `gs_at` (i8* to `gs_loc`), TLS globals.
-- `src/codegen_ir_stacks.h` — data stack layout (`{ i8* base, i64 top,
-  i64 limit }`), region registry, guard-gap notes.
-- `src/codegen_ir_construct.h` — in-place construction, `OpenRzDest`,
+- `src/llvm/codegen_ir_stacks.h` — stack-block constexprs. The data
+  stack is the runtime's one-field `gs_stack = { top }`; region bases
+  live in the runtime's `gs_regions[]` registry (the `{ base, top,
+  limit }` layout named here earlier was fictitious).
+- `src/llvm/codegen_ir_construct.h` — in-place construction, `OpenRzDest`,
   frame objects.
-- Minimal body-walk (`codegen_ir_main.h`): `IntLit`, `Binary` (+,-,*,/),
+- Minimal body-walk (`src/llvm/codegen_ir_main.h`): `IntLit`, `Binary`
+  (+,-,*,/),
   `Block`, `Call` (print via `gs_print_i64`, direct i64 calls),
   `VarDecl`/`Assign`/`IncDec`/`Return` for i64 locals, plus the native
   `int main()` entry — enough for
@@ -79,8 +86,8 @@ module reports a clear diagnostic if the system LLVM is older.
 
 ## M4: calls, emit, c_headers adapters
 
-- `src/codegen_ir_calls.h` — extern calls, thread spawn, queue ops.
-- `src/codegen_ir_emit.h` — module layout, export table, `dlbind`.
+- `src/llvm/codegen_ir_calls.h` — extern calls, thread spawn, queue ops.
+- `src/llvm/codegen_ir_emit.h` — module layout, export table, `dlbind`.
 - **c_headers adapters** (partner decision: option B — hand-translated
   IR declarations, not Clang-compiled objects). The IR module
   `declare`s each adapter; the `goose llc` driver compiles the C
