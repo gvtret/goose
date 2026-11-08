@@ -542,6 +542,67 @@ struct CodeGenIR {
             }
             return;
         }
+        if (auto *wh = Is<While>(n)) {
+            auto *fn = w.fn;
+            auto *condbb = llvm::BasicBlock::Create(ctx, "while_cond", fn);
+            auto *bodybb = llvm::BasicBlock::Create(ctx, "while_body", fn);
+            auto *donebb = llvm::BasicBlock::Create(ctx, "while_done", fn);
+            b.CreateBr(condbb);
+            b.SetInsertPoint(condbb);
+            auto *cond = GenExpr(wh->cond, w);
+            if (!cond) return;
+            if (!cond->getType()->isIntegerTy(1)) {
+                auto *z = llvm::ConstantInt::get(i64(), 0);
+                cond = b.CreateICmpNE(cond, z, "while_test");
+            }
+            b.CreateCondBr(cond, bodybb, donebb);
+            b.SetInsertPoint(bodybb);
+            if (wh->body) GenStmt(wh->body, w);
+            if (!b.GetInsertBlock()->getTerminator()) b.CreateBr(condbb);
+            b.SetInsertPoint(donebb);
+            return;
+        }
+        if (auto *fl = Is<ForLoop>(n)) {
+            // First loop subset: `for i in count` and `for i in lo..hi`.
+            // The counter is i64 in the minimal walk; array/slice iteration,
+            // narrow counter types, and index binders remain M3 work.
+            if (fl->iterkind == IK_COUNT || fl->iterkind == IK_RANGE) {
+                llvm::Value *lo = llvm::ConstantInt::get(i64(), 0);
+                llvm::Value *hi = GenExpr(fl->iter, w);
+                if (auto *r = Is<RangeExpr>(fl->iter)) {
+                    lo = GenExpr(r->lo, w);
+                    hi = GenExpr(r->hi, w);
+                }
+                if (!lo || !hi) return;
+                auto *fn = w.fn;
+                auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
+                auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
+                auto *donebb = llvm::BasicBlock::Create(ctx, "for_done", fn);
+                b.CreateBr(condbb);
+                b.SetInsertPoint(condbb);
+                auto *iv = b.CreatePHI(i64(), 2, "for_i");
+                iv->addIncoming(lo, b.GetInsertBlock()->getSinglePredecessor());
+                auto *cond = b.CreateICmpSLT(iv, hi, "for_test");
+                b.CreateCondBr(cond, bodybb, donebb);
+                b.SetInsertPoint(bodybb);
+                if (fl->vdef) {
+                    auto *slot = b.CreateAlloca(i64(), nullptr, llvm::Twine(fl->vdef->name));
+                    b.CreateStore(iv, slot);
+                    w.locals[fl->vdef] = slot;
+                }
+                if (fl->body) GenStmt(fl->body, w);
+                auto *body_end = b.GetInsertBlock();
+                if (!body_end->getTerminator()) {
+                    b.SetInsertPoint(body_end);
+                    auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "for_next");
+                    iv->addIncoming(next, body_end);
+                    b.CreateBr(condbb);
+                }
+                b.SetInsertPoint(donebb);
+                return;
+            }
+            return;
+        }
         if (auto *brk = Is<Break>(n)) {
             // A `break` out of an EarlyBlock: its value (or the block's
             // fall-through) is the block's result, handed up as the flow-out.
