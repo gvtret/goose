@@ -160,6 +160,13 @@ struct CodeGenIR {
     // Number of live specializations per qualified Goose function name. The
     // C backend suffixes every overloaded or multiply-specialized name.
     std::unordered_map<string_view, int> name_counts;
+    // Global i64 variables: thread-local LLVM global values, initialized
+    // by a gs_globals_init function at program start (M3 scope).
+    struct GlobalVar {
+        llvm::GlobalVariable *gv = nullptr;
+        VarDef *vdef = nullptr;
+    };
+    std::unordered_map<VarDef *, GlobalVar> global_vars;
 
     // The i64 types a walk accepts: i8..i64/u8..u64 all as i64, for now.
     static bool is_int_ty(TypeExpr *t) {
@@ -192,6 +199,9 @@ struct CodeGenIR {
         declare_print_extern();
         auto i64ty = i64();
 
+        // Pass 0: create the global i64 variables as thread-local LLVM
+        // global values, and their gs_globals_init initializer (M3 scope).
+        emit_globals();
         // Pass 1: create every function's shell so a later body walk can
         // resolve a call to an earlier-emitted function (getFunction).
         name_counts.clear();
@@ -326,6 +336,9 @@ struct CodeGenIR {
             if (id->vdef) {
                 auto pit = w.params.find(id->vdef);
                 if (pit != w.params.end()) return pit->second;
+                auto git = global_vars.find(id->vdef);
+                if (git != global_vars.end())
+                    return b.CreateLoad(i64(), git->second.gv, llvm::Twine(id->vdef->name));
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
@@ -501,6 +514,12 @@ struct CodeGenIR {
                     auto *initv = GenExpr(vd->inits[i], w);
                     if (initv) b.CreateStore(initv, alloca);
                 }
+                if (vd->isglobal) {
+                    // A global `var`: its storage is the TLS global value in
+                    // global_vars (resolved by the load/store paths ahead of
+                    // the local map); register nothing in w.locals here.
+                    continue;
+                }
                 w.locals[vddef] = alloca;
             }
             return;
@@ -513,17 +532,22 @@ struct CodeGenIR {
             if (!rhs) return;
             llvm::Value *cur = nullptr;
             if (as->op != T_ASSIGN) {
-                auto pit = w.params.find(lv->vdef);
-                if (pit != w.params.end()) {
-                    // A parameter is not an lvalue here: rebind into a local.
-                    auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
-                    b.CreateStore(pit->second, alloca);
-                    w.locals[lv->vdef] = alloca;
-                    cur = pit->second;
+                auto gvit = global_vars.find(lv->vdef);
+                if (gvit != global_vars.end()) {
+                    cur = b.CreateLoad(i64(), gvit->second.gv, llvm::Twine(lv->vdef->name));
                 } else {
-                    auto lit = w.locals.find(lv->vdef);
-                    if (lit == w.locals.end()) return;
-                    cur = b.CreateLoad(i64(), lit->second, llvm::Twine(lv->vdef->name));
+                    auto pit = w.params.find(lv->vdef);
+                    if (pit != w.params.end()) {
+                        // A parameter is not an lvalue here: rebind into a local.
+                        auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
+                        b.CreateStore(pit->second, alloca);
+                        w.locals[lv->vdef] = alloca;
+                        cur = pit->second;
+                    } else {
+                        auto lit = w.locals.find(lv->vdef);
+                        if (lit == w.locals.end()) return;
+                        cur = b.CreateLoad(i64(), lit->second, llvm::Twine(lv->vdef->name));
+                    }
                 }
                 switch (as->op) {
                     case T_PLUSEQ:  rhs = b.CreateAdd(cur, rhs, "pluseq"); break;
@@ -535,7 +559,10 @@ struct CodeGenIR {
             }
             auto pit2 = w.params.find(lv->vdef);
             auto lit2 = w.locals.find(lv->vdef);
-            if (pit2 != w.params.end()) {
+            auto gv2 = global_vars.find(lv->vdef);
+            if (gv2 != global_vars.end()) {
+                b.CreateStore(rhs, gv2->second.gv);
+            } else if (pit2 != w.params.end()) {
                 // Plain assign to a parameter: store into a shadow alloca.
                 if (lit2 == w.locals.end()) {
                     auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
@@ -711,8 +738,57 @@ struct CodeGenIR {
                                             "main", mod.get());
         auto *mentry = llvm::BasicBlock::Create(ctx, "entry", mfn2);
         b.SetInsertPoint(mentry);
+        // Initialize the globals before the Goos main runs. Only call
+        // gs_globals_init when emit_globals() gave it a body; a bare extern
+        // declaration would be an undefined reference at link time.
+        if (f_gs_globals_init && !f_gs_globals_init->empty())
+            b.CreateCall(f_gs_globals_init, {});
         if (mfn) b.CreateCall(mfn, {});
         b.CreateRet(llvm::ConstantInt::get(i32ty, 0));
+    }
+
+    // Create the global i64 variables as thread-local LLVM global values and
+    // emit a `gs_globals_init` function that stores their initializers into
+    // them (called from `int main()` before `goose_main`). Initializers are
+    // evaluated in the program-level scope, where no locals or parameters
+    // are in flight; a literal or expression that the minimal walk cannot
+    // emit simply leaves the global zero.
+    void emit_globals() {
+        auto i64ty = i64();
+        vector<pair<VarDef *, Node *>> inits;
+        for (auto *g : ast.globals) {
+            for (size_t di = 0; di < g->defs.size(); ++di) {
+                auto *d = g->defs[di];
+                if (!is_int_ty(d->type)) continue;
+                // A string_view's .data() is not null-terminated, so the name
+                // must be copied into a std::string (passing .data() directly
+                // makes LLVM read to the end of the source buffer).
+                std::string gname(d->name);
+                auto *gv = new llvm::GlobalVariable(
+                    *mod, i64ty, false,
+                    llvm::GlobalValue::InternalLinkage,
+                    llvm::ConstantInt::get(i64ty, 0),
+                    gname, nullptr,
+                    llvm::GlobalValue::GeneralDynamicTLSModel);
+                global_vars[d] = { gv, d };
+                if (di < g->inits.size() && g->inits[di])
+                    inits.push_back({ d, g->inits[di] });
+            }
+        }
+        if (inits.empty()) return;
+        // Reuse the extern declaration from declare_entry_externs() and give
+        // it a body. A second Function::Create with the same name would be
+        // renamed gs_globals_init.1, leaving the extern undefined at link.
+        auto *gfn = f_gs_globals_init;
+        auto *gbb = llvm::BasicBlock::Create(ctx, "entry", gfn);
+        b.SetInsertPoint(gbb);
+        FnWalk gw;
+        gw.fn = gfn;
+        for (auto &[d, ninit] : inits) {
+            auto *initv = GenExpr(ninit, gw);
+            if (initv) b.CreateStore(initv, global_vars[d].gv);
+        }
+        b.CreateRetVoid();
     }
 
     llvm::Function *f_gs_rt_init = nullptr;
