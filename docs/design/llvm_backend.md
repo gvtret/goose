@@ -121,5 +121,15 @@ module reports a clear diagnostic if the system LLVM is older.
 
 ## Status
 
-See `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
+The IR backend emits honest programs for the M3 data-stack subset:
+int-walked locals and globals, growable arrays (`T[>..]`) with literal
+and fill initializers, push/index/len with bounds checks, `as` casts
+between int storages (checked at the value's bounds) and into
+index/bound types (checked at the array's live count), direct calls of
+int-signatured functions (void included), range/count loops, while,
+if, break-continue, and the valueless tail a void body may end in. 20
+of the codegen output fixtures pass through `--emit-ir`; the rest need
+the remaining M3 shapes (structures, strings, arrays returned and
+sliced) and the M4 modules. See
+`docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.
