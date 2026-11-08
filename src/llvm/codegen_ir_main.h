@@ -49,13 +49,20 @@ struct CodeGenIR {
     llvm::GlobalVariable *gs_regions = nullptr;
     llvm::GlobalVariable *gs_regions_cap = nullptr;
 
-    // Runtime externs (from libgoose_rt.a). Declared, not defined.
-    llvm::Function *f_gs_abort = nullptr;
-    llvm::Function *f_gs_reserve_region = nullptr;
-    llvm::Function *f_gs_regions_init = nullptr;
-    llvm::Function *f_gs_thread_spawn = nullptr;
-    llvm::Function *f_gs_qput = nullptr;
-    llvm::Function *f_gs_qget = nullptr;
+    // Runtime externs (from libgoose_rt.a). Declared, not defined. Only
+    // symbols the archive really exports (GS_API in runtime.h); the
+    // fictitious gs_regions_init/gs_rt_init/thread-queue stubs are gone
+    // (Task 3 foundation findings, M2-M6 plan).
+    llvm::Function *f_gs_rt_start = nullptr;         // (i32,ptr,i64,i64,i64,i64,i64)
+    llvm::Function *f_gs_reserve_region = nullptr;   // (ptr) -> ptr
+    llvm::Function *f_gs_idxfail = nullptr;          // (i64,i64,ptr,i32), noreturn
+
+    // A growable i64 array local (T[>..]): one dedicated data-stack slot
+    // (a lazy thread-local gs_stack { top }) plus the gs_rhdr { base, len }
+    // allocas the body walk updates. The slot's region is reserved once in
+    // int main() through gs_reserve_region (emit_program_entry); runtime.h
+    // 900-930 is the contract.
+    std::vector<llvm::GlobalVariable *> stk_slots;
 
     CodeGenIR(Ast &a, vector<FnSpec *> &specs, bool stack_assert)
         : ast(a), ctx(),
@@ -71,8 +78,9 @@ struct CodeGenIR {
     llvm::Module &module() { return *mod; }
 
     // Convenience type getters (LLVM 20 API: pointers are PointerType::get,
-    // no getInt8PtrTy; no AtomicityManager).
-    llvm::Type *i8ptr()  { return llvm::PointerType::get(ctx, 0); }
+    // no getInt8PtrTy; no AtomicityManager). i8ptr() is a PointerType so
+    // ConstantPointerNull::get takes it directly.
+    llvm::PointerType *i8ptr() { return llvm::PointerType::get(ctx, 0); }
     llvm::Type *i64()    { return llvm::Type::getInt64Ty(ctx); }
     llvm::Type *voidty() { return llvm::Type::getVoidTy(ctx); }
     llvm::Type *i1()     { return llvm::Type::getInt1Ty(ctx); }
@@ -115,15 +123,19 @@ struct CodeGenIR {
                                           name, mod.get());
         };
 
+        // Exact signatures (runtime.h:922-929): gs_rt_start(argc, argv,
+        // reserve, gap, budget, mainregions, workerregions) starts the
+        // runtime on the main thread; gs_reserve_region(gs_stack *)
+        // reserves one region and returns its base without touching
+        // stack->top (the caller stores it); gs_idxfail(i, n, file, line)
+        // is the bounds-check abort and does not return.
         auto I = i64();
         auto P = i8ptr();
         auto V = voidty();
-        dcl("gs_abort", f_gs_abort, V, { I });
-        dcl("gs_reserve_region", f_gs_reserve_region, P, { I, I });
-        dcl("gs_regions_init", f_gs_regions_init, V, { I });
-        dcl("gs_thread_spawn", f_gs_thread_spawn, I, { P, P, I });
-        dcl("gs_qput", f_gs_qput, I, { P, P, I, I });
-        dcl("gs_qget", f_gs_qget, I, { P, P, I, I });
+        auto I32 = llvm::Type::getInt32Ty(ctx);
+        dcl("gs_rt_start", f_gs_rt_start, V, { I32, P, I, I, I, I, I });
+        dcl("gs_reserve_region", f_gs_reserve_region, P, { P });
+        dcl("gs_idxfail", f_gs_idxfail, V, { I, I, P, I32 });
     }
 
     // ------------------------------------------------------------------
@@ -154,6 +166,13 @@ struct CodeGenIR {
             llvm::BasicBlock *condbb = nullptr;   // The loop's condition block.
             llvm::BasicBlock *donebb = nullptr;    // The loop's exit block.
         };
+        // Growable i64 array locals of this walk: VarDef * -> header.
+        struct RzArr {
+            llvm::AllocaInst *base = nullptr;      // The region base (element 0).
+            llvm::AllocaInst *len = nullptr;       // The element count.
+            llvm::GlobalVariable *slot = nullptr;  // The gs_stack { top } owner.
+        };
+        std::unordered_map<VarDef *, RzArr> rzarrs;
         std::vector<Loop> loops;
     };
 
@@ -171,6 +190,14 @@ struct CodeGenIR {
     // The i64 types a walk accepts: i8..i64/u8..u64 all as i64, for now.
     static bool is_int_ty(TypeExpr *t) {
         return t && t->kind == TY_INT && t->intstorage != IS_VARINT;
+    }
+
+    // A growable array of an int-walkable element: the data-stack slice's
+    // subject. A_GROWSHRINK stays out for now: shrinking from the front
+    // moves gs_rhdr.base, which this slice does not lower.
+    static bool is_growable_i64(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && t->arr->akind == A_GROW
+            && is_int_ty(t->arr->sub);
     }
 
     // The runtime's print(i64) entry. `print` is B_PRINT in builtins.h.
@@ -279,6 +306,37 @@ struct CodeGenIR {
     // ------------------------------------------------------------------
     // Body-walk definitions (minimal M3 subset, i64 values).
     // ------------------------------------------------------------------
+
+    // A growable array local (`var a: i64[>..] = []`): its storage is one
+    // dedicated data stack. The slot is a lazy thread-local gs_stack { top
+    // } owned by this slice; emit_program_entry reserves each slot's
+    // region through gs_reserve_region and stores the base into the slot
+    // before goose_main runs. One activation per slot: reentering the
+    // decl (recursion, a loop body) reuses the region honestly only with
+    // the full gs_sp machinery, which lands with the M3 completion.
+    void emit_growable_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
+        // This slice takes the empty `[]` initializer or none; a filled
+        // literal or a copied array is a later cut.
+        if (i < vd->inits.size() && vd->inits[i]) {
+            auto *al = Is<ArrayLit>(vd->inits[i]);
+            if (!al || !al->elems.empty()) return;
+        }
+        string sname = cat("gs_stk", stk_slots.size());
+        auto *slot = new llvm::GlobalVariable(
+            *mod, i8ptr(), /*isConstant=*/false,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantPointerNull::get(i8ptr()),
+            sname, nullptr, llvm::GlobalValue::GeneralDynamicTLSModel);
+        stk_slots.push_back(slot);
+        // The header: gs_rhdr { base, len }. After main's reservation the
+        // slot reads the region base; an empty array sits at the base with
+        // no elements.
+        auto *basea = b.CreateAlloca(i8ptr(), nullptr, llvm::Twine(def.name, ".base"));
+        auto *lena = b.CreateAlloca(i64(), nullptr, llvm::Twine(def.name, ".len"));
+        b.CreateStore(b.CreateLoad(i8ptr(), slot, llvm::Twine(def.name, ".top")), basea);
+        b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
+        w.rzarrs[&def] = { basea, lena, slot };
+    }
     llvm::Value *GenExpr(Node *n, FnWalk &w) {
         if (!n) return nullptr;
         if (auto *il = Is<IntLit>(n))
@@ -345,7 +403,81 @@ struct CodeGenIR {
             }
             return nullptr;
         }
+        if (auto *dt = Is<Dot>(n)) {
+            // A member expression: this slice lowers `.len` (member is a
+            // BuiltinKind, ast.h) on a growable i64 array local.
+            if (dt->member == B_LEN) {
+                auto *obj = Is<Ident>(dt->obj);
+                if (obj && obj->vdef) {
+                    auto rit = w.rzarrs.find(obj->vdef);
+                    if (rit != w.rzarrs.end())
+                        return b.CreateLoad(i64(), rit->second.len,
+                                            llvm::Twine(obj->vdef->name, ".lenv"));
+                }
+            }
+            return nullptr;
+        }
+        if (auto *ix = Is<Index>(n)) {
+            // An element read a[i] on a growable i64 array local: bounds
+            // check, then load base[i]. The comparison is unsigned, so a
+            // negative i64 index is caught by the same check.
+            auto *obj = Is<Ident>(ix->obj);
+            if (obj && obj->vdef) {
+                auto rit = w.rzarrs.find(obj->vdef);
+                if (rit != w.rzarrs.end()) {
+                    auto *idxv = GenExpr(ix->idx, w);
+                    if (!idxv) return nullptr;
+                    auto *basev = b.CreateLoad(i8ptr(), rit->second.base);
+                    auto *lenv = b.CreateLoad(i64(), rit->second.len);
+                    if (!ix->nobc) {
+                        // The failside is noreturn (gs_idxfail), so the
+                        // downstream emission lives in the pass block.
+                        auto *okbb = llvm::BasicBlock::Create(ctx, "idxok", w.fn);
+                        auto *failbb = llvm::BasicBlock::Create(ctx, "idxfail", w.fn);
+                        b.CreateCondBr(b.CreateICmpULT(idxv, lenv, "ixok"), okbb, failbb);
+                        b.SetInsertPoint(failbb);
+                        b.CreateCall(f_gs_idxfail, {
+                            idxv, lenv,
+                            llvm::ConstantPointerNull::get(i8ptr()),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(ctx), 0) });
+                        b.CreateUnreachable();
+                        b.SetInsertPoint(okbb);
+                    }
+                    auto *dst = b.CreateInBoundsGEP(i64(), basev, idxv);
+                    return b.CreateLoad(i64(), dst);
+                }
+            }
+            return nullptr;
+        }
         if (auto *c = Is<Call>(n)) {
+            // push (memberof a.f spelling: the receiver is the callee's
+            // Dot obj, args holds only the value) on a growable i64 array
+            // local: store the element at base+len, bump len, and keep the
+            // runtime slot's top at the next free byte (the contract of
+            // the runtime's section 1.2).
+            if (c->builtin == B_PUSH && c->args.size() == 1) {
+                auto *rd = Is<Dot>(c->callee);
+                auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+                if (recv && recv->vdef) {
+                    auto rit = w.rzarrs.find(recv->vdef);
+                    if (rit != w.rzarrs.end()) {
+                        auto *v = GenExpr(c->args[0], w);
+                        if (!v) return nullptr;
+                        auto *basev = b.CreateLoad(
+                            i8ptr(), rit->second.base, "rzbase");
+                        auto *lenv = b.CreateLoad(
+                            i64(), rit->second.len, "rzlen");
+                        b.CreateStore(v, b.CreateInBoundsGEP(i64(), basev, lenv));
+                        auto *nlen = b.CreateAdd(
+                            lenv, llvm::ConstantInt::get(i64(), 1), "rzlen+1");
+                        b.CreateStore(nlen, rit->second.len);
+                        b.CreateStore(b.CreateInBoundsGEP(i64(), basev, nlen, "rztop"),
+                                      rit->second.slot);
+                        return nullptr;
+                    }
+                }
+            }
             // print(i64) via the libgoose_rt.a stub.
             if (c->builtin == B_PRINT && c->args.size() == 1) {
                 auto *arg = GenExpr(c->args[0], w);
@@ -505,20 +637,22 @@ struct CodeGenIR {
             return;
         }
         if (auto *vd = Is<VarDecl>(n)) {
-            // An i64 let/var with an initializer: an alloca + store.
+            // Growable i64 arrays: a dedicated data stack slot + header.
+            // Scalars keep the alloca + store path below. A global growable
+            // array is not a local stack slot; later cut.
             for (size_t i = 0; i < vd->defs.size(); ++i) {
                 auto *vddef = vd->defs[i];
-                if (!vddef || !is_int_ty(vddef->type)) continue;
+                if (!vddef) continue;
+                if (vd->isglobal) continue;
+                if (is_growable_i64(vddef->type)) {
+                    emit_growable_decl(vd, i, *vddef, w);
+                    continue;
+                }
+                if (!is_int_ty(vddef->type)) continue;
                 auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(vddef->name));
                 if (i < vd->inits.size() && vd->inits[i]) {
                     auto *initv = GenExpr(vd->inits[i], w);
                     if (initv) b.CreateStore(initv, alloca);
-                }
-                if (vd->isglobal) {
-                    // A global `var`: its storage is the TLS global value in
-                    // global_vars (resolved by the load/store paths ahead of
-                    // the local map); register nothing in w.locals here.
-                    continue;
                 }
                 w.locals[vddef] = alloca;
             }
@@ -725,19 +859,39 @@ struct CodeGenIR {
         if (!mainsf) return;
         auto *mainspec = mainsf->specs.empty() ? nullptr : mainsf->specs[0];
         if (!mainspec) return;
-        auto i64ty = i64();
         auto *i32ty = llvm::Type::getInt32Ty(ctx);
 
-        // C entry: int main() -> the Goose main (renamed `goose_main` to
-        // avoid the link collision with the C runtime's own symbol). The
-        // full runtime init (gs_rt_init, gs_gl) stays in the driver's C
-        // object for now; it lands with the data-stack walk (M3 completion).
+        // C entry: int main(argc, argv) -> the Goose main (renamed
+        // `goose_main` to avoid the link collision with the C runtime's
+        // own symbol). The signature is uniform across IR programs.
         auto *mfn = mod->getFunction("goose_main");
-        auto *mfnty = llvm::FunctionType::get(i32ty, {}, false);
+        auto *mfnty = llvm::FunctionType::get(i32ty, { i32ty, i8ptr() }, false);
         auto *mfn2 = llvm::Function::Create(mfnty, llvm::GlobalValue::ExternalLinkage,
                                             "main", mod.get());
         auto *mentry = llvm::BasicBlock::Create(ctx, "entry", mfn2);
         b.SetInsertPoint(mentry);
+        auto *argc = mfn2->getArg(0);
+        auto *argv = mfn2->getArg(1);
+        // Data stacks: start the runtime, then reserve one region per
+        // growable-array slot. gs_reserve_region returns the base without
+        // touching stack->top (runtime_impl.h:642), so this entry stores
+        // it, the same contract gs_stack_init keeps for its caller. One
+        // region per slot is where the runtime's gs_regions registry
+        // counts in; the counts come from the runtime's own constants.
+        if (!stk_slots.empty()) {
+            b.CreateCall(f_gs_rt_start, {
+                argc, argv,
+                llvm::ConstantInt::get(i64(), 2048ull << 20),   // GS_STACK_RESERVE
+                llvm::ConstantInt::get(i64(), 1ull << 20),      // GS_STACK_GAP
+                llvm::ConstantInt::get(i64(), 32ull << 40),     // GS_STACK_BUDGET
+                llvm::ConstantInt::get(
+                    i64(), (uint64_t)stk_slots.size(), /*issigned=*/true),
+                llvm::ConstantInt::get(i64(), 0) });            // workerregions
+            for (auto *slot : stk_slots) {
+                auto *top = b.CreateCall(f_gs_reserve_region, { slot });
+                b.CreateStore(top, slot);
+            }
+        }
         // Initialize the globals before the Goos main runs. Only call
         // gs_globals_init when emit_globals() gave it a body; a bare extern
         // declaration would be an undefined reference at link time.
