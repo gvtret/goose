@@ -56,6 +56,7 @@ struct CodeGenIR {
     llvm::Function *f_gs_rt_start = nullptr;         // (i32,ptr,i64,i64,i64,i64,i64)
     llvm::Function *f_gs_reserve_region = nullptr;   // (ptr) -> ptr
     llvm::Function *f_gs_idxfail = nullptr;          // (i64,i64,ptr,i32), noreturn
+    llvm::Function *f_gs_asfail_i = nullptr;         // (ptr,i64,ptr,ptr,i32), noreturn
 
     // A growable i64 array local (T[>..]): one dedicated data-stack slot
     // (a lazy thread-local gs_stack { top }) plus the gs_rhdr { base, len }
@@ -136,6 +137,7 @@ struct CodeGenIR {
         dcl("gs_rt_start", f_gs_rt_start, V, { I32, P, I, I, I, I, I });
         dcl("gs_reserve_region", f_gs_reserve_region, P, { P });
         dcl("gs_idxfail", f_gs_idxfail, V, { I, I, P, I32 });
+        dcl("gs_asfail_i", f_gs_asfail_i, V, { P, I, P, P, I32 });
     }
 
     // ------------------------------------------------------------------
@@ -350,6 +352,51 @@ struct CodeGenIR {
         return is_uint_ty(r.etype) ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
     }
 
+    // An int-to-int `as` cast: when the source's range can exceed the
+    // target's, the value is range-checked (the GS_RANGE semantics of
+    // runtime_inline.h:961) and a failure is a call to the exported
+    // noreturn gs_asfail_i (the same runtime action the C backend's
+    // range macro takes). An `as!` skips the check. The walk keeps its
+    // uniform i64 value: truncated to the target storage, then widened
+    // back, so the value is the low bits that storage holds. Index
+    // (`u32 in arr`) and bound targets, and u64 sources, land with the
+    // bound-type slice and are left unwalked for now.
+    llvm::Value *GenAsCast(AsCast *ac, FnWalk &w) {
+        auto *st = ac->child->exprtype;
+        if (!st || st->kind != TY_INT || st->intstorage == IS_U64) return nullptr;
+        if (!ac->totype || !is_int_ty(ac->totype) || ac->totype->intstorage == IS_VARINT
+            || ac->totype->ix) return nullptr;
+        auto *c = GenExpr(ac->child, w);
+        if (!c) return nullptr;
+        auto tt = ac->totype->intstorage;
+        auto [slo, shi] = IntRange(st->intstorage);
+        auto [lo, hi] = IntRange(tt);
+        if (!ac->unchecked && (slo < lo || shi > hi)) {
+            auto *one32 = llvm::ConstantInt::get(
+                llvm::Type::getInt32Ty(ctx), 0);
+            auto *nullptrv = llvm::ConstantPointerNull::get(i8ptr());
+            auto *okbb = llvm::BasicBlock::Create(ctx, "asok", w.fn);
+            auto *failbb = llvm::BasicBlock::Create(ctx, "asfail", w.fn);
+            auto *lobr = b.CreateICmpSGE(c, llvm::ConstantInt::get(i64(), (uint64_t)lo));
+            auto *hibr = b.CreateICmpSLE(c, llvm::ConstantInt::get(i64(), (uint64_t)hi));
+            auto *inr = b.CreateAnd(lobr, hibr, "inrange");
+            b.CreateCondBr(inr, okbb, failbb);
+            b.SetInsertPoint(failbb);
+            b.CreateCall(f_gs_asfail_i, {
+                b.CreateGlobalStringPtr("out of range"),
+                c,
+                b.CreateGlobalStringPtr(IntStorageName(tt)),
+                nullptrv, one32 });
+            b.CreateUnreachable();
+            b.SetInsertPoint(okbb);
+        }
+        auto *et = int_ll_ty(ac->totype);
+        if (et == i64()) return c;
+        auto *narrow = b.CreateTrunc(c, et);
+        return is_uint_ty(ac->totype) ? b.CreateZExt(narrow, i64())
+                                      : b.CreateSExt(narrow, i64());
+    }
+
     // A growable array local (`var a: i64[>..] = [...]`): its storage is one
     // dedicated data stack. The slot is a lazy thread-local gs_stack { top
     // } owned by this slice; emit_program_entry reserves each slot's
@@ -450,6 +497,7 @@ struct CodeGenIR {
                 default:      return nullptr;
             }
         }
+        if (auto *ac = Is<AsCast>(n)) return GenAsCast(ac, w);
         if (auto *bin = Is<Binary>(n)) {
             auto *l = GenExpr(bin->left, w);
             auto *r = GenExpr(bin->right, w);
@@ -560,8 +608,19 @@ struct CodeGenIR {
                 if (arg) b.CreateCall(f_gs_print_i64, { arg });
                 return nullptr;
             }
-            // A direct call to a Goose function: all i64 args, i64 ret.
-            if (c->spec && c->spec->rets.size() == 1 && is_int_ty(c->spec->rets[0])) {
+            // A direct call to a Goose function: all i64 args, i64 ret,
+            // and the valueless (void) call whose effect the statement
+            // walk keeps.
+            if (c->spec) {
+                auto *retty = voidty();
+                if (c->spec->rets.size() == 1) {
+                    retty = is_int_ty(c->spec->rets[0]) ? i64() : nullptr;
+                } else if (!c->spec->rets.empty()) {
+                    retty = nullptr;
+                }
+                for (auto *t : c->spec->argtypes)
+                    if (!is_int_ty(t)) retty = nullptr;
+                if (!retty) return nullptr;
                 string callee = c->spec->sf->cname.empty()
                     ? string(c->spec->sf->name) : c->spec->sf->cname;
                 if (name_counts[c->spec->sf->qname] > 1)
@@ -677,6 +736,14 @@ struct CodeGenIR {
                 // A tail that is an explicit return statement.
                 if (auto *tr = Is<Return>(blk->tail)) {
                     GenStmt(tr, w);
+                    return;
+                }
+                // The parser parked a void function's ending here as the
+                // value form (a nested block's ending mark); the checker
+                // proved it produces on no path, so it stays a statement
+                // (typecheck_calls.h: a void function may end in one).
+                if (top && w.fn->getReturnType()->isVoidTy()) {
+                    GenStmt(blk->tail, w);
                     return;
                 }
                 // A value-producing tail of the top-level body: the implicit
