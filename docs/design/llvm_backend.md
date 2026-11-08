@@ -138,10 +138,14 @@ callee's return inside an inlined body meets its call's merge in a
 PHI. Index assignments (plain and compound) store into fixed and
 growable int arrays with the same checks as reads. A construct the walk
 does not emit is refused with its kind and line (`--emit-ir` fails, no
-module is written) instead of being dropped: seven fixtures that passed
-only because their unemitted statements did not show in the output now
-refuse. 26 of the codegen output fixtures pass through `--emit-ir`; the
-rest need the remaining M3 shapes (structures, slices, arrays returned
-and element-wise operations, strings as values) and the M4 modules. See
+module is written) instead of being dropped. Flat int-field structs
+(no padding, fixed size) are local values: a literal builds them, and
+field reads, plain and compound field stores work on them. Fixtures
+that passed only because their unemitted statements or locals did not
+show in the output now refuse (13 so far). 21 of the codegen output
+fixtures pass through `--emit-ir`; the rest need the remaining M3 shapes
+(struct parameters, returns and copies, nested aggregates, slices,
+arrays returned and element-wise operations, strings as values) and the
+M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.

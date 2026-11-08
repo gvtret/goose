@@ -217,6 +217,12 @@ struct CodeGenIR {
             TypeExpr *etype = nullptr;             // The element type.
         };
         std::unordered_map<VarDef *, FixedArr> fixeds;
+        // Flat int-field struct locals: their storage and the struct's layout.
+        struct StructLoc {
+            llvm::AllocaInst *base = nullptr;
+            StructInst *inst = nullptr;
+        };
+        std::unordered_map<VarDef *, StructLoc> structs;
         std::vector<Loop> loops;
     };
 
@@ -242,6 +248,19 @@ struct CodeGenIR {
     static bool is_growable_i64(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && t->arr->akind == A_GROW
             && is_int_ty(t->arr->sub);
+    }
+
+    // A struct whose storage is plain: fixed size, flat, no padding, and
+    // every field an int. Its fields are in declaration order, so a field
+    // index is its position in st->fields.
+    static bool is_flat_int_struct(TypeExpr *t) {
+        if (!t || t->kind != TY_STRUCT || !t->struc || !t->struc->inst) return false;
+        auto *in = t->struc->inst;
+        if (in->sclass != SC_FIXED || !in->flat || in->failed || !in->st) return false;
+        if (in->st->fields.empty() || in->ftypes.size() != in->st->fields.size()) return false;
+        for (size_t i = 0; i < in->st->fields.size(); ++i)
+            if (in->st->fields[i].ispad || !is_int_ty(in->ftypes[i])) return false;
+        return true;
     }
 
     // An int type's LLVM storage width: u8 is i8, and so on.
@@ -625,7 +644,7 @@ struct CodeGenIR {
         // A push is a statement whose walk yields no value.
         auto *pc = Is<Call>(n);
         auto valueless = pc && pc->builtin == B_PUSH;
-        if (!v && n && n->exprtype && is_int_ty(n->exprtype) && !valueless)
+        if (!v && n && n->exprtype && n->exprtype->kind != TY_VOID && !valueless)
             Unsup(cat("an expression of kind ", (int)n->nkind, " at line ", (long long)n->line.line));
         return v;
     }
@@ -724,6 +743,20 @@ struct CodeGenIR {
             return nullptr;
         }
         if (auto *dt = Is<Dot>(n)) {
+            // A field of a flat int struct local.
+            if (dt->IsField()) {
+                auto *obj = Is<Ident>(dt->obj);
+                auto sit = obj && obj->vdef ? w.structs.find(obj->vdef) : w.structs.end();
+                if (sit == w.structs.end() || dt->fieldidx < 0) return nullptr;
+                auto &sl = sit->second;
+                auto f = (unsigned)dt->fieldidx;
+                auto *et = int_ll_ty(sl.inst->ftypes[f]);
+                auto *p = b.CreateStructGEP(sl.base->getAllocatedType(), sl.base, f);
+                auto *v = b.CreateLoad(et, p, llvm::Twine(obj->vdef->name, ".f"));
+                if (et == i64()) return v;
+                return is_uint_ty(sl.inst->ftypes[f]) ? b.CreateZExt(v, i64())
+                                                      : b.CreateSExt(v, i64());
+            }
             // A member expression: this slice lowers `.len` (member is a
             // BuiltinKind, ast.h) on a growable i64 array local.
             if (dt->member == B_LEN) {
@@ -995,6 +1028,73 @@ struct CodeGenIR {
         return b.CreateSelect(b.CreateICmpSLT(rem, zero), adj, rem, "mod");
     }
 
+    llvm::StructType *struct_ll_ty(StructInst *in) {
+        std::vector<llvm::Type *> elems;
+        for (auto *ft : in->ftypes) elems.push_back(int_ll_ty(ft));
+        return llvm::StructType::get(ctx, elems);
+    }
+
+    // The field a literal's init names: by name, or by position for a
+    // positional init. -1 when the struct has no such field.
+    static int field_of_init(StructInst *in, const FieldInit &fi, size_t pos) {
+        if (fi.name.empty())
+            return pos < in->st->fields.size() ? (int)pos : -1;
+        for (size_t i = 0; i < in->st->fields.size(); ++i)
+            if (in->st->fields[i].name == fi.name) return (int)i;
+        return -1;
+    }
+
+    // `var p = T { ... }` for a flat int struct: every field given once, in
+    // the literal's order, into the struct's alloca. A literal that leaves a
+    // field to a default is refused for now.
+    void emit_struct_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
+        auto *in = def.type->struc->inst;
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        auto *sl = init ? Is<StructLit>(init) : nullptr;
+        if (!sl || sl->defaultall || sl->implicit || sl->inits.size() != in->st->fields.size())
+            return Unsup(cat("a struct value of type ", def.type->struc->st->name,
+                             " the walk does not build at line ", (long long)vd->line.line));
+        std::vector<int> at;
+        for (size_t k = 0; k < sl->inits.size(); ++k) {
+            int f = field_of_init(in, sl->inits[k], k);
+            if (f < 0 || std::find(at.begin(), at.end(), f) != at.end() || !sl->inits[k].val)
+                return Unsup("a struct literal the walk does not build");
+            at.push_back(f);
+        }
+        auto *slot = b.CreateAlloca(struct_ll_ty(in), nullptr, llvm::Twine(def.name));
+        for (size_t k = 0; k < sl->inits.size(); ++k) {
+            auto *v = GenExpr(sl->inits[k].val, w);
+            if (!v) return;
+            auto f = (unsigned)at[k];
+            auto *et = int_ll_ty(in->ftypes[f]);
+            auto *p = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
+            b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et), p);
+        }
+        w.structs[&def] = { slot, in };
+    }
+
+    // `p.f = v` or `p.f op= v` on a flat int struct local.
+    void GenFieldStore(Assign *as, Dot *dt, FnWalk &w) {
+        auto *obj = Is<Ident>(dt->obj);
+        auto sit = obj && obj->vdef ? w.structs.find(obj->vdef) : w.structs.end();
+        if (sit == w.structs.end() || dt->fieldidx < 0 || !dt->IsField())
+            return Unsup("a field store into a value the walk does not hold");
+        auto *rhs = GenExpr(as->rhs, w);
+        if (!rhs) return;
+        auto &sl = sit->second;
+        auto f = (unsigned)dt->fieldidx;
+        auto *et = int_ll_ty(sl.inst->ftypes[f]);
+        auto *p = b.CreateStructGEP(sl.base->getAllocatedType(), sl.base, f);
+        if (as->op != T_ASSIGN) {
+            auto *cur = b.CreateLoad(et, p, "fcur");
+            auto *cur64 = is_uint_ty(sl.inst->ftypes[f]) ? b.CreateZExt(cur, i64())
+                                                         : b.CreateSExt(cur, i64());
+            rhs = ArithEq(as->op, cur64, rhs, w);
+            if (!rhs) return Unsup("a compound field assignment of this operator");
+        }
+        b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
+    }
+
     // The value a compound assignment stores: `cur op rhs`, null for an
     // operator the walk does not model.
     llvm::Value *ArithEq(TType op, llvm::Value *cur, llvm::Value *rhs, FnWalk &w) {
@@ -1200,7 +1300,13 @@ struct CodeGenIR {
                     emit_fixed_decl(vd, i, *vddef, w);
                     continue;
                 }
-                if (!is_int_ty(vddef->type)) continue;
+                if (is_flat_int_struct(vddef->type)) {
+                    emit_struct_decl(vd, i, *vddef, w);
+                    continue;
+                }
+                if (!is_int_ty(vddef->type))
+                    return Unsup(cat("a local of a type the walk does not hold at line ",
+                                     (long long)vd->line.line));
                 auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(vddef->name));
                 if (i < vd->inits.size() && vd->inits[i]) {
                     auto *initv = GenExpr(vd->inits[i], w);
@@ -1213,6 +1319,10 @@ struct CodeGenIR {
         if (auto *as = Is<Assign>(n)) {
             if (auto *ix = Is<Index>(as->lval)) {
                 GenIndexStore(as, ix, w);
+                return;
+            }
+            if (auto *fd = Is<Dot>(as->lval)) {
+                GenFieldStore(as, fd, w);
                 return;
             }
             // i64 assignment to a local.
