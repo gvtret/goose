@@ -38,6 +38,14 @@ struct CodeGenIR {
     // The FnSpec specializations to emit (same list CodeGen receives).
     vector<FnSpec *> specs;
 
+    // The first construct the walk could not emit, so the driver refuses the
+    // program instead of emitting one that silently lacks it.
+    string unsupported;
+    void Unsup(const string &what) {
+        if (unsupported.empty()) unsupported = what;
+    }
+    const string &Unsupported() const { return unsupported; }
+
     // Whether to insert --stack-assert checks at bump sites.
     bool stack_assert = false;
 
@@ -610,7 +618,18 @@ struct CodeGenIR {
         // An empty literal (`[]`, or `[..cap]`'s hint, whose capacity the
         // monotonic region model takes as given): len stays 0.
     }
+    // An integer-valued expression the walk leaves without a value is a
+    // construct it does not emit yet.
     llvm::Value *GenExpr(Node *n, FnWalk &w) {
+        auto *v = GenExprRaw(n, w);
+        // A push is a statement whose walk yields no value.
+        auto *pc = Is<Call>(n);
+        auto valueless = pc && pc->builtin == B_PUSH;
+        if (!v && n && n->exprtype && is_int_ty(n->exprtype) && !valueless)
+            Unsup(cat("an expression of kind ", (int)n->nkind, " at line ", (long long)n->line.line));
+        return v;
+    }
+    llvm::Value *GenExprRaw(Node *n, FnWalk &w) {
         if (!n) return nullptr;
         if (auto *il = Is<IntLit>(n))
             return llvm::ConstantInt::get(i64(), (uint64_t)il->val, true);
@@ -841,7 +860,8 @@ struct CodeGenIR {
                             "pcur+"), cura);
                         continue;
                     }
-                    if (!an->exprtype || !is_int_ty(an->exprtype)) return nullptr;
+                    if (!an->exprtype || !is_int_ty(an->exprtype))
+                        return Unsup("a print of a value that is not an int or a string literal"), nullptr;
                     auto *x = GenExpr(an, w);
                     if (!x) return nullptr;
                     auto *cur = b.CreateLoad(i8ptr(), cura);
@@ -973,6 +993,73 @@ struct CodeGenIR {
                                     b.CreateSub(zero, r), r, "absr");
         auto *adj = b.CreateAdd(rem, absr, "remadj");
         return b.CreateSelect(b.CreateICmpSLT(rem, zero), adj, rem, "mod");
+    }
+
+    // The value a compound assignment stores: `cur op rhs`, null for an
+    // operator the walk does not model.
+    llvm::Value *ArithEq(TType op, llvm::Value *cur, llvm::Value *rhs, FnWalk &w) {
+        switch (op) {
+            case T_PLUSEQ:  return b.CreateAdd(cur, rhs, "pluseq");
+            case T_MINUSEQ: return b.CreateSub(cur, rhs, "minuseq");
+            case T_MULEQ:   return b.CreateMul(cur, rhs, "muleq");
+            case T_DIVEQ:   return GenDivMod(T_DIV, cur, rhs, w);
+            case T_MODEQ:   return GenDivMod(T_MOD, cur, rhs, w);
+            default:        return nullptr;
+        }
+    }
+
+    // `a[i] = v` or `a[i] op= v` on a growable or fixed int array local (or a
+    // growable global): the index is checked against the live count (fixed
+    // arrays against their constant one), then the element is stored at its
+    // native width.
+    void GenIndexStore(Assign *as, Index *ix, FnWalk &w) {
+        auto *obj = Is<Ident>(ix->obj);
+        if (!obj || !obj->vdef) return Unsup("an index assignment into a non-variable");
+        auto fit = w.fixeds.find(obj->vdef);
+        auto *r = fit == w.fixeds.end() ? rz_head(w, obj->vdef) : nullptr;
+        if (fit == w.fixeds.end() && !r)
+            return Unsup("an index assignment into an array the walk does not hold");
+        auto *idx = GenExpr(ix->idx, w);
+        if (!idx) return;
+        auto *rhs = GenExpr(as->rhs, w);
+        if (!rhs) return;
+        auto check = [&](llvm::Value *limit) {
+            if (ix->nobc) return;
+            auto *okbb = llvm::BasicBlock::Create(ctx, "stok", w.fn);
+            auto *failbb = llvm::BasicBlock::Create(ctx, "stfail", w.fn);
+            b.CreateCondBr(b.CreateICmpULT(idx, limit, "stin"), okbb, failbb);
+            b.SetInsertPoint(failbb);
+            b.CreateCall(f_gs_idxfail, { idx, limit, llvm::ConstantPointerNull::get(i8ptr()),
+                                         llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0) });
+            b.CreateUnreachable();
+            b.SetInsertPoint(okbb);
+        };
+        if (fit != w.fixeds.end()) {
+            auto &fx = fit->second;
+            auto *et = int_ll_ty(fx.etype);
+            check(llvm::ConstantInt::get(i64(), (uint64_t)fx.count));
+            if (!fx.base) return;
+            auto *p = b.CreateInBoundsGEP(fx.base->getAllocatedType(), fx.base,
+                                          { llvm::ConstantInt::get(i64(), 0), idx }, "stp");
+            if (as->op != T_ASSIGN) {
+                auto *cur = b.CreateLoad(et, p, "stcur");
+                auto *cur64 = is_uint_ty(fx.etype) ? b.CreateZExt(cur, i64())
+                                                   : b.CreateSExt(cur, i64());
+                rhs = ArithEq(as->op, cur64, rhs, w);
+                if (!rhs) return Unsup("a compound index assignment of this operator");
+            }
+            b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
+            return;
+        }
+        auto *basev = b.CreateLoad(i8ptr(), r->base, "stbase");
+        auto *lenv = b.CreateLoad(i64(), r->len, "stlen");
+        check(lenv);
+        if (as->op != T_ASSIGN) {
+            auto *cur = rz_load_elem(*r, basev, idx, "stcur");
+            rhs = ArithEq(as->op, cur, rhs, w);
+            if (!rhs) return Unsup("a compound index assignment of this operator");
+        }
+        rz_store_elem(*r, basev, idx, rhs);
     }
 
     // A direct call of a Goose function. Results 1.. are out-pointers the
@@ -1124,9 +1211,13 @@ struct CodeGenIR {
             return;
         }
         if (auto *as = Is<Assign>(n)) {
+            if (auto *ix = Is<Index>(as->lval)) {
+                GenIndexStore(as, ix, w);
+                return;
+            }
             // i64 assignment to a local.
             auto *lv = Is<Ident>(as->lval);
-            if (!lv || !lv->vdef) return;
+            if (!lv || !lv->vdef) return Unsup("an assignment to a place the walk does not model");
             auto *rhs = GenExpr(as->rhs, w);
             if (!rhs) return;
             llvm::Value *cur = nullptr;
@@ -1148,14 +1239,8 @@ struct CodeGenIR {
                         cur = b.CreateLoad(i64(), lit->second, llvm::Twine(lv->vdef->name));
                     }
                 }
-                switch (as->op) {
-                    case T_PLUSEQ:  rhs = b.CreateAdd(cur, rhs, "pluseq"); break;
-                    case T_MINUSEQ: rhs = b.CreateSub(cur, rhs, "minuseq"); break;
-                    case T_MULEQ:   rhs = b.CreateMul(cur, rhs, "muleq"); break;
-                    case T_DIVEQ:   rhs = GenDivMod(T_DIV, cur, rhs, w); break;
-                    case T_MODEQ:   rhs = GenDivMod(T_MOD, cur, rhs, w); break;
-                    default: return;
-                }
+                rhs = ArithEq(as->op, cur, rhs, w);
+                if (!rhs) return Unsup("a compound assignment of this operator");
             }
             auto pit2 = w.params.find(lv->vdef);
             auto lit2 = w.locals.find(lv->vdef);
@@ -1173,6 +1258,8 @@ struct CodeGenIR {
                 b.CreateStore(rhs, lit2->second);
             } else if (lit2 != w.locals.end()) {
                 b.CreateStore(rhs, lit2->second);
+            } else {
+                Unsup("an assignment to a variable the walk does not hold");
             }
             return;
         }
@@ -1419,7 +1506,13 @@ struct CodeGenIR {
                 b.CreateRet(llvm::ConstantInt::get(i64(), 0));
             return;
         }
-        // Expression-as-statement (e.g. print(...)).
+        // Expression-as-statement (e.g. print(...)). A statement that is not
+        // an expression (a defer, say) has no emission here.
+        // Declarations of nested functions and types emit nothing here.
+        auto decl = n->nkind == NK_FnDecl || n->nkind == NK_StructDecl
+                 || n->nkind == NK_EnumDecl || n->nkind == NK_AliasDecl;
+        if (!n->exprtype && !Is<Call>(n) && !decl) return Unsup(cat("a statement of kind ", (int)n->nkind,
+                                                             " at line ", (long long)n->line.line));
         GenExpr(n, w);
     }
 

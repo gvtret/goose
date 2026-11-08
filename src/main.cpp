@@ -1894,6 +1894,8 @@ int Main(int argc, char **argv) {
                 if (sp->live) irspecs.push_back(sp);
             CodeGenIR cgir(ast, irspecs, false);
             cgir.Run();
+            if (!cgir.Unsupported().empty())
+                throw CompileError { cat("the LLVM backend does not emit yet: ", cgir.Unsupported()) };
             string irtext;
             {
                 llvm::raw_string_ostream os(irtext);

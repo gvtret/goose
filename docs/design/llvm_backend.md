@@ -135,8 +135,13 @@ use out-pointers for results 1.. (result 0 is the call's value), and
 signed `/`, `%` follow the runtime (Euclidean `%`, checked zero and
 i64.min / -1), `>>` is arithmetic, `&&`/`||` short-circuit, and a
 callee's return inside an inlined body meets its call's merge in a
-PHI. 32 of the codegen output fixtures pass through `--emit-ir`; the
-rest need the remaining M3 shapes (structures, arrays returned and
-sliced, strings as values) and the M4 modules. See
+PHI. Index assignments (plain and compound) store into fixed and
+growable int arrays with the same checks as reads. A construct the walk
+does not emit is refused with its kind and line (`--emit-ir` fails, no
+module is written) instead of being dropped: seven fixtures that passed
+only because their unemitted statements did not show in the output now
+refuse. 26 of the codegen output fixtures pass through `--emit-ir`; the
+rest need the remaining M3 shapes (structures, slices, arrays returned
+and element-wise operations, strings as values) and the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.
