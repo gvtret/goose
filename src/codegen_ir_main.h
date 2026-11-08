@@ -150,6 +150,10 @@ struct CodeGenIR {
         llvm::Value *flowout = nullptr;
     };
 
+    // Number of live specializations per qualified Goose function name. The
+    // C backend suffixes every overloaded or multiply-specialized name.
+    std::unordered_map<string_view, int> name_counts;
+
     // The i64 types a walk accepts: i8..i64/u8..u64 all as i64, for now.
     static bool is_int_ty(TypeExpr *t) {
         return t && t->kind == TY_INT && t->intstorage != IS_VARINT;
@@ -183,6 +187,8 @@ struct CodeGenIR {
 
         // Pass 1: create every function's shell so a later body walk can
         // resolve a call to an earlier-emitted function (getFunction).
+        name_counts.clear();
+        for (auto *sp : specs) ++name_counts[sp->sf->qname];
         struct Shell {
             FnSpec *sp;
             llvm::Function *fn;
@@ -197,7 +203,8 @@ struct CodeGenIR {
         vector<Shell> shells;
         for (auto *sp : specs) {
             string name = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
-            auto suffix = sp->sf->specs.size() > 1 ? cat("_s", sp->id) : string();
+            auto suffix = name_counts[sp->sf->qname] > 1
+                ? cat("_", sp->id) : string();
             auto mainsf = ast.MainFunction();
             if (mainsf && sp->sf == mainsf) name = "goose_main";
             std::vector<llvm::Type *> argtys;
@@ -329,7 +336,8 @@ struct CodeGenIR {
             if (c->spec && c->spec->rets.size() == 1 && is_int_ty(c->spec->rets[0])) {
                 string callee = c->spec->sf->cname.empty()
                     ? string(c->spec->sf->name) : c->spec->sf->cname;
-                if (c->spec->sf->specs.size() > 1) callee += cat("_s", c->spec->id);
+                if (name_counts[c->spec->sf->qname] > 1)
+                    callee += cat("_", c->spec->id);
                 auto *cf = mod->getFunction(callee);
                 if (!cf) return nullptr;
                 std::vector<llvm::Value *> args;
