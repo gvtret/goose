@@ -57,6 +57,13 @@ struct CodeGenIR {
     llvm::Function *f_gs_reserve_region = nullptr;   // (ptr) -> ptr
     llvm::Function *f_gs_idxfail = nullptr;          // (i64,i64,ptr,i32), noreturn
     llvm::Function *f_gs_asfail_i = nullptr;         // (ptr,i64,ptr,ptr,i32), noreturn
+    llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
+    llvm::Function *f_gs_out_bytes = nullptr;        // (ptr,i64)
+
+    // The print line's scratch slot: one dedicated data-stack region the
+    // line cursor runs over, reset per print (emit_program_entry reserves
+    // it like every other slot).
+    llvm::GlobalVariable *gs_pstk = nullptr;
 
     // A growable i64 array local (T[>..]): one dedicated data-stack slot
     // (a lazy thread-local gs_stack { top }) plus the gs_rhdr { base, len }
@@ -138,6 +145,8 @@ struct CodeGenIR {
         dcl("gs_reserve_region", f_gs_reserve_region, P, { P });
         dcl("gs_idxfail", f_gs_idxfail, V, { I, I, P, I32 });
         dcl("gs_asfail_i", f_gs_asfail_i, V, { P, I, P, P, I32 });
+        dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
+        dcl("gs_out_bytes", f_gs_out_bytes, V, { P, I });
     }
 
     // ------------------------------------------------------------------
@@ -179,6 +188,14 @@ struct CodeGenIR {
             TypeExpr *etype = nullptr;             // The element type.
         };
         std::unordered_map<VarDef *, RzArr> rzarrs;
+        // Fixed arrays (T[k]) of int elements walked in this body: the
+        // element storage lands in one alloca of [count x elemty].
+        struct FixedArr {
+            llvm::AllocaInst *base = nullptr;      // The storage.
+            int64_t count = -1;                    // Its element count.
+            TypeExpr *etype = nullptr;             // The element type.
+        };
+        std::unordered_map<VarDef *, FixedArr> fixeds;
         std::vector<Loop> loops;
     };
 
@@ -229,6 +246,22 @@ struct CodeGenIR {
     // checks against its count read it.
     std::unordered_map<VarDef *, FnWalk::RzArr> global_rzs;
 
+    // A string literal's constant bytes: one internal constant global per
+    // distinct literal, no terminator (the length travels beside it).
+    std::unordered_map<std::string, llvm::GlobalVariable *> strlits;
+    llvm::GlobalVariable *strlit_glob(const std::string &val) {
+        auto it = strlits.find(val);
+        if (it != strlits.end()) return it->second;
+        llvm::SmallVector<uint8_t, 32> bytes(val.begin(), val.end());
+        auto *arr = llvm::ConstantDataArray::get(ctx, bytes);
+        auto *gv = new llvm::GlobalVariable(
+            *mod, arr->getType(), /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, arr,
+            cat("gs_str", strlits.size()));
+        strlits.emplace(val, gv);
+        return gv;
+    }
+
     // A growable array's header by name holder: a local of this walk or a
     // program global. Null where the name is neither.
     FnWalk::RzArr *rz_head(FnWalk &w, VarDef *d) {
@@ -237,17 +270,6 @@ struct CodeGenIR {
         auto git = global_rzs.find(d);
         if (git != global_rzs.end()) return &git->second;
         return nullptr;
-    }
-
-    // The runtime's print(i64) entry. `print` is B_PRINT in builtins.h.
-    // The minimal walk calls gs_print_i64 (a libgoose_rt.a stub) instead of
-    // the full gs_out_bytes rendering path, which M3 replaces with EmitFormatInto.
-    llvm::Function *f_gs_print_i64 = nullptr;
-    void declare_print_extern() {
-        auto *fty = llvm::FunctionType::get(voidty(), { i64() }, false);
-        f_gs_print_i64 = llvm::Function::Create(fty,
-                                                 llvm::GlobalValue::ExternalLinkage,
-                                                 "gs_print_i64", mod.get());
     }
 
     // ------------------------------------------------------------------
@@ -262,7 +284,6 @@ struct CodeGenIR {
     // the minimal M3 subset.
     // ------------------------------------------------------------------
     void Run() {
-        declare_print_extern();
         auto i64ty = i64();
 
         // Pass 0: create the global i64 variables as thread-local LLVM
@@ -451,6 +472,49 @@ struct CodeGenIR {
                                       : b.CreateSExt(narrow, i64());
     }
 
+    // A fixed array local (let a: i64[k] / inferred from [..; k]): the
+    // value is an alloca of [k x elemty], zero-filled first (the C
+    // zeroes its literal temps), then the literal's construction: per
+    // element stores, or the fill's value evaluated once (the
+    // FreezeFill contract) and stored to every index unrolled.
+    void emit_fixed_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
+        auto *tal = def.type->arr;
+        auto count = tal->size;
+        if (count < 0) return;
+        auto *et = int_ll_ty(tal->sub);
+        auto *a = count
+            ? b.CreateAlloca(llvm::ArrayType::get(et, (uint64_t)count),
+                             nullptr, llvm::Twine(def.name))
+            : nullptr;
+        if (a && et->getScalarSizeInBits() % 8 == 0) {
+            b.CreateMemSet(a, (llvm::Value *)b.getInt8(0),
+                           (uint64_t)count * (et->getScalarSizeInBits() / 8),
+                           llvm::Align(8));
+        }
+        w.fixeds[&def] = { a, count, tal->sub };
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        auto *al = init ? Is<ArrayLit>(init) : nullptr;
+        if (init && !al) return;      // Literal construction only here.
+        if (!al) return;
+        auto elem = [&](int64_t k, llvm::Value *v) {
+            auto *ev = et == i64() ? v : b.CreateTrunc(v, et);
+            b.CreateStore(ev, b.CreateInBoundsGEP(a->getAllocatedType(), a,
+                { llvm::ConstantInt::get(i64(), 0),
+                  llvm::ConstantInt::get(i64(), k) }, "fkp"));
+        };
+        if (al->fillval) {
+            auto *v = GenExpr(al->fillval, w);
+            if (!v) return;
+            for (int64_t k = 0; k < count; k++) elem(k, v);
+        } else if (count) {
+            for (size_t k = 0; k < (size_t)count && k < al->elems.size(); k++) {
+                auto *v = GenExpr(al->elems[k], w);
+                if (!v) return;
+                elem((int64_t)k, v);
+            }
+        }
+    }
+
     // A growable array local (`var a: i64[>..] = [...]`): its storage is one
     // dedicated data stack. The slot is a lazy thread-local gs_stack { top
     // } owned by this slice; emit_program_entry reserves each slot's
@@ -590,6 +654,10 @@ struct CodeGenIR {
             if (dt->member == B_LEN) {
                 auto *obj = Is<Ident>(dt->obj);
                 if (obj && obj->vdef) {
+                    if (auto fit = w.fixeds.find(obj->vdef);
+                        fit != w.fixeds.end())
+                        return llvm::ConstantInt::get(i64(),
+                                                      (uint64_t)fit->second.count);
                     if (auto *r = rz_head(w, obj->vdef))
                         return b.CreateLoad(i64(), r->len,
                                             llvm::Twine(obj->vdef->name, ".lenv"));
@@ -598,11 +666,43 @@ struct CodeGenIR {
             return nullptr;
         }
         if (auto *ix = Is<Index>(n)) {
-            // An element read a[i] on a growable i64 array local: bounds
-            // check, then load base[i]. The comparison is unsigned, so a
-            // negative i64 index is caught by the same check.
+            // An element read a[i]: bounds check (fixed arrays check
+            // against their constant count), then load base[i]. The
+            // comparison is unsigned, so a negative i64 index is caught
+            // by the same check.
             auto *obj = Is<Ident>(ix->obj);
             if (obj && obj->vdef) {
+                if (auto fit = w.fixeds.find(obj->vdef); fit != w.fixeds.end()) {
+                    auto *idxv = GenExpr(ix->idx, w);
+                    if (!idxv) return nullptr;
+                    if (!ix->nobc) {
+                        auto *okbb = llvm::BasicBlock::Create(ctx, "fxok", w.fn);
+                        auto *failbb = llvm::BasicBlock::Create(ctx, "fxfail", w.fn);
+                        b.CreateCondBr(b.CreateICmpULT(idxv,
+                            llvm::ConstantInt::get(i64(), (uint64_t)fit->second.count),
+                            "fxok"), okbb, failbb);
+                        b.SetInsertPoint(failbb);
+                        std::vector<llvm::Value *> faila = {
+                            idxv,
+                            llvm::ConstantInt::get(i64(), fit->second.count),
+                            llvm::ConstantPointerNull::get(i8ptr()),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(ctx), 0) };
+                        b.CreateCall(f_gs_idxfail, faila);
+                        b.CreateUnreachable();
+                        b.SetInsertPoint(okbb);
+                    }
+                    auto *et = int_ll_ty(fit->second.etype);
+                    auto *base = fit->second.base;
+                    auto *p = fit->second.count
+                        ? b.CreateInBoundsGEP(base->getAllocatedType(), base,
+                            { llvm::ConstantInt::get(i64(), 0), idxv }, "fxip")
+                        : nullptr;
+                    auto *v = b.CreateLoad(et, p, "fxval");
+                    if (et == i64()) return v;
+                    return is_uint_ty(fit->second.etype)
+                        ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
+                }
                 if (auto *r = rz_head(w, obj->vdef)) {
                     auto *idxv = GenExpr(ix->idx, w);
                     if (!idxv) return nullptr;
@@ -654,10 +754,64 @@ struct CodeGenIR {
                     }
                 }
             }
-            // print(i64) via the libgoose_rt.a stub.
-            if (c->builtin == B_PRINT && c->args.size() == 1) {
-                auto *arg = GenExpr(c->args[0], w);
-                if (arg) b.CreateCall(f_gs_print_i64, { arg });
+            // print's line alphabet this slice covers: int values and
+            // string literals, space separated, rendered into the same
+            // byte cursor the C backend builds its whole line in
+            // (codegen_builtins.h B_PRINT), then one write. The cursor
+            // runs in a dedicated reserved scratch slot; every print
+            // starts it at the base again and resets it after.
+            if (c->builtin == B_PRINT) {
+                if (!gs_pstk) {
+                    gs_pstk = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()), "gs_pstk",
+                        nullptr, llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(gs_pstk);
+                }
+                auto *basev = b.CreateLoad(i8ptr(), gs_pstk, "pline");
+                auto *cura = b.CreateAlloca(i8ptr(), nullptr, "pcur");
+                b.CreateStore(basev, cura);
+                auto *i8ty = llvm::Type::getInt8Ty(ctx);
+                auto space = strlit_glob(" "), newline = strlit_glob("\n");
+                for (size_t ai = 0; ai < c->args.size(); ++ai) {
+                    if (ai) {
+                        auto *cur = b.CreateLoad(i8ptr(), cura);
+                        b.CreateMemMove(cur, llvm::MaybeAlign(1), space, llvm::MaybeAlign(1), 1);
+                        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur,
+                            llvm::ConstantInt::get(i64(), 1), "pcur+"), cura);
+                    }
+                    auto *an = c->args[ai];
+                    if (auto *sl = Is<StrLit>(an)) {
+                        auto *cur = b.CreateLoad(i8ptr(), cura);
+                        b.CreateMemMove(cur, llvm::MaybeAlign(1), strlit_glob(sl->val),
+                            llvm::MaybeAlign(1), (uint64_t)sl->val.size());
+                        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur,
+                            llvm::ConstantInt::get(i64(), sl->val.size()),
+                            "pcur+"), cura);
+                        continue;
+                    }
+                    if (!an->exprtype || !is_int_ty(an->exprtype)) return nullptr;
+                    auto *x = GenExpr(an, w);
+                    if (!x) return nullptr;
+                    auto *cur = b.CreateLoad(i8ptr(), cura);
+                    auto *n =
+                        b.CreateCall(f_gs_fmt_i64, { cur, x });
+                    b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
+                                  cura);
+                }
+                auto *cur = b.CreateLoad(i8ptr(), cura);
+                b.CreateMemMove(cur, llvm::MaybeAlign(1), newline, llvm::MaybeAlign(1), 1);
+                auto *endv = b.CreateInBoundsGEP(i8ty, cur,
+                    llvm::ConstantInt::get(i64(), 1), "pcur+");
+                // The length: byte positions of the same region, so the
+                // ptrtoint difference is the count. One write, then the
+                // cursor resets to the base.
+                b.CreateCall(f_gs_out_bytes, { basev,
+                    b.CreateSub(
+                        b.CreatePtrToInt(endv, i64()),
+                        b.CreatePtrToInt(basev, i64()), "pbytes") });
+                b.CreateStore(basev, gs_pstk);
                 return nullptr;
             }
             // A direct call to a Goose function: all i64 args, i64 ret,
@@ -843,6 +997,12 @@ struct CodeGenIR {
                     emit_growable_decl(vd, i, *vddef, w);
                     continue;
                 }
+                if (vddef->type->kind == TY_ARRAY
+                    && vddef->type->arr->akind == A_FIXED
+                    && is_int_ty(vddef->type->arr->sub)) {
+                    emit_fixed_decl(vd, i, *vddef, w);
+                    continue;
+                }
                 if (!is_int_ty(vddef->type)) continue;
                 auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(vddef->name));
                 if (i < vd->inits.size() && vd->inits[i]) {
@@ -972,14 +1132,25 @@ struct CodeGenIR {
                 return;
             }
             if (fl->iterkind == IK_ARRAY) {
-                // Element iteration over a growable array: the binder
+                // Element iteration over an int-element array: the binder
                 // names the element read per pass, the optional index
                 // binder its position, and the count re-reads each pass
-                // (pushes during iteration stay legal, so grown-into
-                // elements are seen by later passes).
+                // for a growable (pushes during iteration stay legal, so
+                // grown-into elements are seen by later passes); a fixed
+                // array's count is the construction constant.
                 auto *obj = Is<Ident>(fl->iter);
-                auto *r = obj && obj->vdef ? rz_head(w, obj->vdef) : nullptr;
-                if (!r) return;
+                FnWalk::RzArr *gr = nullptr;
+                FnWalk::FixedArr *fa = nullptr;
+                if (obj && obj->vdef) {
+                    gr = rz_head(w, obj->vdef);
+                    if (!gr) {
+                        auto fit = w.fixeds.find(obj->vdef);
+                        if (fit != w.fixeds.end()) fa = &fit->second;
+                    }
+                }
+                if (!gr && !fa) return;
+                llvm::Type *et = gr ? int_ll_ty(gr->etype)
+                                    : int_ll_ty(fa->etype);
                 auto *fn = w.fn;
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
                 auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
@@ -990,15 +1161,27 @@ struct CodeGenIR {
                 auto *iv = b.CreatePHI(i64(), 2, "for_i");
                 iv->addIncoming(llvm::ConstantInt::get(i64(), 0),
                                 b.GetInsertBlock()->getSinglePredecessor());
-                auto *lenv = b.CreateLoad(i64(), r->len, "for_len");
+                llvm::Value *lenv = gr
+                    ? (llvm::Value *)b.CreateLoad(i64(), gr->len, "for_len")
+                    : llvm::ConstantInt::get(i64(), (uint64_t)fa->count);
                 b.CreateCondBr(b.CreateICmpULT(iv, lenv, "for_test"),
                                bodybb, donebb);
                 b.SetInsertPoint(bodybb);
                 if (fl->vdef) {
                     auto *slot = b.CreateAlloca(i64(), nullptr,
                                                 llvm::Twine(fl->vdef->name));
-                    auto *basev = b.CreateLoad(i8ptr(), r->base);
-                    b.CreateStore(rz_load_elem(*r, basev, iv, "for_ip"), slot);
+                    llvm::Value *ev = fa
+                        ? b.CreateLoad(et,
+                            b.CreateInBoundsGEP(fa->base->getAllocatedType(),
+                                fa->base,
+                                { llvm::ConstantInt::get(i64(), 0), iv },
+                                "for_ip"), "for_ev")
+                        : rz_load_elem(*gr,
+                            b.CreateLoad(i8ptr(), gr->base), iv, "for_ip");
+                    b.CreateStore(et == i64() ? ev
+                        : is_uint_ty((fa ? fa->etype : gr->etype))
+                            ? b.CreateZExt(ev, i64())
+                            : b.CreateSExt(ev, i64()), slot);
                     w.locals[fl->vdef] = slot;
                 }
                 if (fl->idxdef) {
