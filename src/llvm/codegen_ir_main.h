@@ -1093,7 +1093,9 @@ struct CodeGenIR {
                     if (!an->exprtype || !is_int_ty(an->exprtype))
                         return Unsup("a print of a value that is not an int or a string literal"), nullptr;
                     auto *x = GenExpr(an, w);
-                    if (!x) return nullptr;
+                    if (!x)
+                        return Unsup(cat("a print argument at line ",
+                                         (long long)an->line.line)), nullptr;
                     auto *cur = b.CreateLoad(i8ptr(), cura);
                     auto *n =
                         b.CreateCall(f_gs_fmt_i64, { cur, x });
@@ -1120,6 +1122,9 @@ struct CodeGenIR {
             // call's value, rets 1.. through out-pointer params the
             // multi-return callee writes; a value context needs exactly
             // one result.
+            if (!c->dispatch.empty())
+                return Unsup(cat("a variant dispatch call at line ",
+                                 (long long)c->line.line)), nullptr;
             if (c->spec) {
                 return EmitDirectCall(c, w, nullptr);
             }
@@ -1328,11 +1333,14 @@ struct CodeGenIR {
             }
             if (auto fit = w.fixeds.find(obj->vdef); fit != w.fixeds.end()) {
                 auto &fx = fit->second;
-                auto *ty = fx.base->getAllocatedType();
-                out.data = b.CreateInBoundsGEP(
-                    ty, fx.base,
-                    { llvm::ConstantInt::get(i64(), 0), llvm::ConstantInt::get(i64(), 0) },
-                    "svd");
+                // A zero-count array has no alloca: its view is a null
+                // pointer and length 0.
+                out.data = fx.base
+                    ? b.CreateInBoundsGEP(
+                        fx.base->getAllocatedType(), fx.base,
+                        { llvm::ConstantInt::get(i64(), 0),
+                          llvm::ConstantInt::get(i64(), 0) }, "svd")
+                    : (llvm::Value *)llvm::ConstantPointerNull::get(i8ptr());
                 out.len = llvm::ConstantInt::get(i64(), (uint64_t)fx.count);
                 out.etype = fx.etype;
                 return true;
@@ -2021,12 +2029,16 @@ struct CodeGenIR {
                 if (fl->vdef) {
                     auto *slot = b.CreateAlloca(i64(), nullptr,
                                                 llvm::Twine(fl->vdef->name));
+                    // A zero-count array has no alloca: its body never runs,
+                    // and the binder's value is a typed zero.
                     llvm::Value *ev = fa
-                        ? b.CreateLoad(et,
-                            b.CreateInBoundsGEP(fa->base->getAllocatedType(),
-                                fa->base,
-                                { llvm::ConstantInt::get(i64(), 0), iv },
-                                "for_ip"), "for_ev")
+                        ? (fa->base
+                            ? b.CreateLoad(et,
+                                b.CreateInBoundsGEP(fa->base->getAllocatedType(),
+                                    fa->base,
+                                    { llvm::ConstantInt::get(i64(), 0), iv },
+                                    "for_ip"), "for_ev")
+                            : (llvm::Value *)llvm::Constant::getNullValue(et))
                         : gr ? rz_load_elem(*gr,
                             b.CreateLoad(i8ptr(), gr->base), iv, "for_ip")
                              : b.CreateLoad(et,
