@@ -69,6 +69,7 @@ struct CodeGenIR {
     llvm::Function *f_gs_divovf = nullptr;           // (ptr,i32), noreturn
     llvm::Function *f_gs_abort = nullptr;            // (i32,ptr,i32), noreturn
     llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
+    llvm::Function *f_gs_fmt_bool = nullptr;         // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_out_bytes = nullptr;        // (ptr,i64)
 
     // The print line's scratch slot: one dedicated data-stack region the
@@ -160,6 +161,7 @@ struct CodeGenIR {
         dcl("gs_divovf", f_gs_divovf, V, { P, I32 });
         dcl("gs_abort", f_gs_abort, V, { I32, P, I32 });
         dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
+        dcl("gs_fmt_bool", f_gs_fmt_bool, I, { P, I });
         dcl("gs_out_bytes", f_gs_out_bytes, V, { P, I });
     }
 
@@ -251,6 +253,15 @@ struct CodeGenIR {
     // The i64 types a walk accepts: i8..i64/u8..u64 all as i64, for now.
     static bool is_int_ty(TypeExpr *t) {
         return t && t->kind == TY_INT && t->intstorage != IS_VARINT;
+    }
+
+    // A bool is walked in an i64 slot like the ints (0/1); comparisons
+    // produce i1, so a value stored or passed as a scalar widens.
+    static bool is_bool_ty(TypeExpr *t) { return t && t->kind == TY_BOOL; }
+
+    llvm::Value *as_i64(llvm::Value *v) {
+        if (v && v->getType()->isIntegerTy(1)) return b.CreateZExt(v, i64(), "widen");
+        return v;
     }
 
     // A growable array of an int-walkable element: the data-stack slice's
@@ -410,7 +421,7 @@ struct CodeGenIR {
             std::vector<llvm::Type *> argtys;
             bool supported = true;
             for (auto *t : sp->argtypes) {
-                if (is_int_ty(t)) argtys.push_back(i64ty);
+                if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
                 else supported = false;
             }
@@ -419,12 +430,13 @@ struct CodeGenIR {
             // slice result comes back as the { data, len } it is.
             bool allretint = true;
             for (auto *rt : sp->rets)
-                if (!is_int_ty(rt)) allretint = false;
+                if (!is_int_ty(rt) && !is_bool_ty(rt)) allretint = false;
             llvm::Type *retty = voidty();
             if (!sp->rets.empty()) {
                 if (sp->rets.size() == 1 && is_slice_of_int(sp->rets[0]))
                     retty = slice_ll_ty();
-                else if (is_int_ty(sp->rets[0]) && allretint)
+                else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
+                         && allretint)
                     retty = i64ty;
                 else
                     retty = nullptr;
@@ -462,7 +474,7 @@ struct CodeGenIR {
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(i), slot);
                     w.slices[sp->params[i]] = { slot, pt->sub };
-                } else if (!pt || is_int_ty(pt)) {
+                } else if (!pt || is_int_ty(pt) || is_bool_ty(pt)) {
                     w.params[sp->params[i]] = fn->getArg(i);
                 }
             }
@@ -1090,15 +1102,18 @@ struct CodeGenIR {
                             return nullptr;
                         continue;
                     }
-                    if (!an->exprtype || !is_int_ty(an->exprtype))
-                        return Unsup("a print of a value that is not an int or a string literal"), nullptr;
+                    if (!an->exprtype
+                        || (!is_int_ty(an->exprtype)
+                            && !is_bool_ty(an->exprtype)))
+                        return Unsup("a print of a value that is not an int, a bool or a string literal"), nullptr;
                     auto *x = GenExpr(an, w);
                     if (!x)
                         return Unsup(cat("a print argument at line ",
                                          (long long)an->line.line)), nullptr;
                     auto *cur = b.CreateLoad(i8ptr(), cura);
-                    auto *n =
-                        b.CreateCall(f_gs_fmt_i64, { cur, x });
+                    auto *n = b.CreateCall(
+                        is_bool_ty(an->exprtype) ? f_gs_fmt_bool : f_gs_fmt_i64,
+                        { cur, as_i64(x) });
                     b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
                                   cura);
                 }
@@ -1663,7 +1678,7 @@ struct CodeGenIR {
             }
             auto *av = GenExpr(a, w);
             if (!av) return nullptr;
-            args.push_back(av);
+            args.push_back(as_i64(av));
         }
         for (size_t i = 1; i < nrets; ++i) args.push_back((*outs)[i]);
         return b.CreateCall(cf, args);
@@ -1812,13 +1827,13 @@ struct CodeGenIR {
                     emit_slice_decl(vd, i, *vddef, w);
                     continue;
                 }
-                if (!is_int_ty(vddef->type))
+                if (!is_int_ty(vddef->type) && !is_bool_ty(vddef->type))
                     return Unsup(cat("a local of ", type_label(vddef->type),
                                      " at line ", (long long)vd->line.line));
                 auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(vddef->name));
                 if (i < vd->inits.size() && vd->inits[i]) {
                     auto *initv = GenExpr(vd->inits[i], w);
-                    if (initv) b.CreateStore(initv, alloca);
+                    if (initv) b.CreateStore(as_i64(initv), alloca);
                 }
                 w.locals[vddef] = alloca;
             }
@@ -1849,7 +1864,7 @@ struct CodeGenIR {
                 b.CreateStore(hdr, sit->second.base);
                 return;
             }
-            auto *rhs = GenExpr(as->rhs, w);
+            auto *rhs = as_i64(GenExpr(as->rhs, w));
             if (!rhs) return;
             llvm::Value *cur = nullptr;
             if (as->op != T_ASSIGN) {
@@ -2197,7 +2212,7 @@ struct CodeGenIR {
                     return;
                 }
                 auto *v = GenExpr(ret->vals[0], w);
-                if (v) b.CreateRet(v);
+                if (v) b.CreateRet(as_i64(v));
                 return;
             }
             // A value-returning function's bare `return;` defaults to zero

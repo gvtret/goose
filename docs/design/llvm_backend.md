@@ -122,14 +122,14 @@ module reports a clear diagnostic if the system LLVM is older.
 ## Status
 
 The IR backend emits honest programs for the M3 data-stack subset:
-int-walked locals and globals, growable arrays (`T[>..]`) with literal
+int- and bool-walked locals and globals, growable arrays (`T[>..]`) with literal
 and fill initializers, push/index/len with bounds checks, element
 iteration, fixed arrays (`T[k]`) with literal and fill initializers,
 `as` casts between int storages (checked at the value's bounds) and
 into index/bound types (checked at the array's live count), direct
 calls of int-signatured functions (void included), range/count loops,
 while, if, break-continue, and lines print through the runtime's
-format hooks one write per line (int values and string literals; the
+format hooks one write per line (int and bool values and string literals; the
 rest of print's alphabet lands with its shapes). Multi-result calls
 use out-pointers for results 1.. (result 0 is the call's value), and
 signed `/`, `%` follow the runtime (Euclidean `%`, checked zero and
@@ -160,7 +160,7 @@ slice result returns the struct itself; a multi-result signature with a
 slice still refuses. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse (13 so far). 28 of the codegen output fixtures
+in the output now refuse (13 so far). 29 of the codegen output fixtures
 pass through `--emit-ir`; the rest need the remaining M3 shapes (struct
 fields of slices, struct parameters and copies, nested aggregates, arrays
 returned and element-wise operations) and the M4 modules. See
