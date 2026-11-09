@@ -1817,11 +1817,15 @@ struct CodeGenIR {
             // The counter is i64 in the minimal walk; array/slice iteration,
             // narrow counter types, and index binders remain M3 work.
             if (fl->iterkind == IK_COUNT || fl->iterkind == IK_RANGE) {
+                // A range is two bounds, not a value: the header is not a
+                // RangeExpr expression the walk evaluates.
                 llvm::Value *lo = llvm::ConstantInt::get(i64(), 0);
-                llvm::Value *hi = GenExpr(fl->iter, w);
+                llvm::Value *hi = nullptr;
                 if (auto *r = Is<RangeExpr>(fl->iter)) {
                     lo = GenExpr(r->lo, w);
                     hi = GenExpr(r->hi, w);
+                } else {
+                    hi = GenExpr(fl->iter, w);
                 }
                 if (!lo || !hi) return;
                 auto *fn = w.fn;
