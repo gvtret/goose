@@ -423,6 +423,7 @@ struct CodeGenIR {
             for (auto *t : sp->argtypes) {
                 if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
+                else if (is_flat_int_struct(t)) argtys.push_back(struct_ty(t));
                 else supported = false;
             }
             // Return protocol: ret0 is the call's value, every other
@@ -430,11 +431,14 @@ struct CodeGenIR {
             // slice result comes back as the { data, len } it is.
             bool allretint = true;
             for (auto *rt : sp->rets)
-                if (!is_int_ty(rt) && !is_bool_ty(rt)) allretint = false;
+                if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_flat_int_struct(rt))
+                    allretint = false;
             llvm::Type *retty = voidty();
             if (!sp->rets.empty()) {
                 if (sp->rets.size() == 1 && is_slice_of_int(sp->rets[0]))
                     retty = slice_ll_ty();
+                else if (sp->rets.size() == 1 && is_flat_int_struct(sp->rets[0]))
+                    retty = struct_ty(sp->rets[0]);
                 else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
                          && allretint)
                     retty = i64ty;
@@ -474,6 +478,11 @@ struct CodeGenIR {
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(i), slot);
                     w.slices[sp->params[i]] = { slot, pt->sub };
+                } else if (is_flat_int_struct(pt)) {
+                    auto *slot = b.CreateAlloca(struct_ty(pt), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(i), slot);
+                    w.structs[sp->params[i]] = { slot, pt->struc->inst };
                 } else if (!pt || is_int_ty(pt) || is_bool_ty(pt)) {
                     w.params[sp->params[i]] = fn->getArg(i);
                 }
@@ -491,6 +500,9 @@ struct CodeGenIR {
                     if (fn->getReturnType()->isVoidTy()) b.CreateRetVoid();
                     else if (fn->getReturnType() == slice_ll_ty())
                         b.CreateRet(llvm::Constant::getNullValue(slice_ll_ty()));
+                    else if (fn->getReturnType()->isStructTy())
+                        b.CreateRet(llvm::Constant::getNullValue(
+                            fn->getReturnType()));
                     else b.CreateRet(llvm::ConstantInt::get(i64ty, 0));
                 }
             }
@@ -889,6 +901,13 @@ struct CodeGenIR {
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
+                // A flat int struct local as a value.
+                auto stit = w.structs.find(id->vdef);
+                if (stit != w.structs.end()) {
+                    auto *inst = stit->second.inst;
+                    return b.CreateLoad(struct_ll_ty(inst), stit->second.base,
+                                        "stv");
+                }
                 // A slice local as a value: the { data, len } it holds.
                 auto sit = w.slices.find(id->vdef);
                 if (sit != w.slices.end()) {
@@ -1218,6 +1237,13 @@ struct CodeGenIR {
             default:
                 break;
         }
+        // A flat int struct where a value is wanted (an argument, an if
+        // arm): the value the literal, local or call builds.
+        if (n->exprtype && is_flat_int_struct(n->exprtype)) {
+            llvm::Value *sv = nullptr;
+            StructInst *si = nullptr;
+            if (struct_value(n, w, sv, si)) return sv;
+        }
         // A slice where a value is wanted (an if arm, a block's tail): the
         // { data, len } the view names.
         if (n->exprtype && is_slice_of_int(n->exprtype)) {
@@ -1298,6 +1324,15 @@ struct CodeGenIR {
     // one of the array locals the walk holds, or a range over another such
     // view. False when the walk does not hold the subject.
     bool slice_value(Node *n, FnWalk &w, SliceVal &out) {
+        if (auto *bk = Is<Block>(n)) {
+            if (!n->exprtype || !is_slice_of_int(n->exprtype)) return false;
+            auto *v = GenExpr(n, w);
+            if (!v || v->getType() != slice_ll_ty()) return false;
+            out.data = b.CreateExtractValue(v, 0, "svd");
+            out.len = b.CreateExtractValue(v, 1, "svn");
+            out.etype = n->exprtype->sub;
+            return true;
+        }
         // An inlined call whose result is a slice: the body's PHI is the
         // { data, len } it built.
         if (auto *ib = Is<InlineBlock>(n)) {
@@ -1487,6 +1522,75 @@ struct CodeGenIR {
         return llvm::StructType::get(ctx, elems);
     }
 
+    llvm::StructType *struct_ty(TypeExpr *t) {
+        return struct_ll_ty(t->struc->inst);
+    }
+
+    // A flat int struct's value: a local's alloca, a literal built in a
+    // temporary, a call whose one result is the struct, or an inlined
+    // body's PHI. False when the walk does not hold the value.
+    bool struct_value(Node *n, FnWalk &w, llvm::Value *&out, StructInst *&inst) {
+        if (auto *bk = Is<Block>(n)) {
+            if (!n->exprtype || !is_flat_int_struct(n->exprtype)) return false;
+            auto *v = GenExpr(n, w);
+            if (!v) return false;
+            out = v;
+            inst = n->exprtype->struc->inst;
+            return true;
+        }
+        if (auto *id = Is<Ident>(n)) {
+            auto sit = id->vdef ? w.structs.find(id->vdef) : w.structs.end();
+            if (sit == w.structs.end()) return false;
+            inst = sit->second.inst;
+            out = b.CreateLoad(struct_ll_ty(inst), sit->second.base, "stv");
+            return true;
+        }
+        if (auto *sl = Is<StructLit>(n)) {
+            if (!sl->exprtype || !is_flat_int_struct(sl->exprtype)) return false;
+            inst = sl->exprtype->struc->inst;
+            if (sl->defaultall || sl->implicit
+                || sl->inits.size() != inst->st->fields.size())
+                return false;
+            std::vector<int> at;
+            for (size_t k = 0; k < sl->inits.size(); ++k) {
+                int f = field_of_init(inst, sl->inits[k], k);
+                if (f < 0 || std::find(at.begin(), at.end(), f) != at.end()
+                    || !sl->inits[k].val) return false;
+                at.push_back(f);
+            }
+            auto *slot = b.CreateAlloca(struct_ll_ty(inst), nullptr, "sttmp");
+            for (size_t k = 0; k < sl->inits.size(); ++k) {
+                auto *v = GenExpr(sl->inits[k].val, w);
+                if (!v) return false;
+                auto f = (unsigned)at[k];
+                auto *et = int_ll_ty(inst->ftypes[f]);
+                b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et),
+                              b.CreateStructGEP(struct_ll_ty(inst), slot, f));
+            }
+            out = b.CreateLoad(struct_ll_ty(inst), slot, "stv");
+            return true;
+        }
+        if (auto *c = Is<Call>(n)) {
+            if (!c->spec || c->spec->rets.size() != 1
+                || !is_flat_int_struct(c->spec->rets[0])) return false;
+            auto *v = EmitDirectCall(c, w, nullptr);
+            if (!v) return false;
+            out = v;
+            inst = c->spec->rets[0]->struc->inst;
+            return true;
+        }
+        if (auto *ib = Is<InlineBlock>(n)) {
+            if (!ib->spec || ib->spec->rets.size() != 1
+                || !is_flat_int_struct(ib->spec->rets[0])) return false;
+            auto *v = GenInline(ib, w);
+            if (!v || v->getType() != struct_ty(ib->spec->rets[0])) return false;
+            out = v;
+            inst = ib->spec->rets[0]->struc->inst;
+            return true;
+        }
+        return false;
+    }
+
     // The field a literal's init names: by name, or by position for a
     // positional init. -1 when the struct has no such field.
     static int field_of_init(StructInst *in, const FieldInit &fi, size_t pos) {
@@ -1504,7 +1608,23 @@ struct CodeGenIR {
         auto *in = def.type->struc->inst;
         auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
         auto *sl = init ? Is<StructLit>(init) : nullptr;
-        if (!sl || sl->defaultall || sl->implicit || sl->inits.size() != in->st->fields.size())
+        if (!sl) {
+            // A copy of another struct value: a local, a call's result or an
+            // inlined body's.
+            auto *slot = b.CreateAlloca(struct_ll_ty(in), nullptr,
+                                        llvm::Twine(def.name));
+            llvm::Value *sv = nullptr;
+            StructInst *si = nullptr;
+            if (!init || !struct_value(init, w, sv, si) || si != in)
+                return Unsup(cat("a struct value of type ",
+                                 def.type->struc->st->name,
+                                 " the walk does not build at line ",
+                                 (long long)vd->line.line));
+            b.CreateStore(sv, slot);
+            w.structs[&def] = { slot, in };
+            return;
+        }
+        if (sl->defaultall || sl->implicit || sl->inits.size() != in->st->fields.size())
             return Unsup(cat("a struct value of type ", def.type->struc->st->name,
                              " the walk does not build at line ", (long long)vd->line.line));
         std::vector<int> at;
@@ -1652,9 +1772,11 @@ struct CodeGenIR {
         auto *sp = c->spec;
         if (!sp) return nullptr;
         for (auto *t : sp->argtypes)
-            if (!is_int_ty(t) && !is_slice_of_int(t)) return nullptr;
+            if (!is_int_ty(t) && !is_bool_ty(t) && !is_slice_of_int(t)
+                && !is_flat_int_struct(t)) return nullptr;
         for (auto *rt : sp->rets)
-            if (!is_int_ty(rt) && !is_slice_of_int(rt)) return nullptr;
+            if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
+                && !is_flat_int_struct(rt)) return nullptr;
         auto nrets = sp->rets.size();
         if (nrets > 1 && (!outs || outs->size() < nrets)) return nullptr;
         string callee = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
@@ -1674,6 +1796,14 @@ struct CodeGenIR {
                 auto *hdr = b.CreateInsertValue(
                     llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
                 args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
+                continue;
+            }
+            if (is_flat_int_struct(pt)) {
+                llvm::Value *sv = nullptr;
+                StructInst *si = nullptr;
+                if (!struct_value(a, w, sv, si) || si != pt->struc->inst)
+                    return nullptr;
+                args.push_back(sv);
                 continue;
             }
             auto *av = GenExpr(a, w);
@@ -1701,6 +1831,8 @@ struct CodeGenIR {
         size_t ei = w.inl.size() - 1;
         bool sret = ib->spec && ib->spec->rets.size() == 1
                  && is_slice_of_int(ib->spec->rets[0]);
+        bool stret = ib->spec && ib->spec->rets.size() == 1
+                  && is_flat_int_struct(ib->spec->rets[0]);
         llvm::Value *tv = nullptr;
         if (ib->body) {
             for (auto *s : ib->body->stmts) GenStmt(s, w);
@@ -1712,6 +1844,10 @@ struct CodeGenIR {
                 if (sret) {
                     SliceVal sv;
                     if (slice_value(tn, w, sv)) tv = slice_struct(sv.data, sv.len);
+                } else if (stret) {
+                    StructInst *si = nullptr;
+                    llvm::Value *sv = nullptr;
+                    if (struct_value(tn, w, sv, si)) tv = sv;
                 } else if (valueless || Is<Return>(tn)) {
                     GenStmt(tn, w);
                 } else {
@@ -1851,6 +1987,17 @@ struct CodeGenIR {
             // i64 assignment to a local.
             auto *lv = Is<Ident>(as->lval);
             if (!lv || !lv->vdef) return Unsup("an assignment to a place the walk does not model");
+            // Copying a flat int struct local: the whole value.
+            if (auto stit = w.structs.find(lv->vdef); stit != w.structs.end()) {
+                if (as->op != T_ASSIGN)
+                    return Unsup("a compound assignment to a struct");
+                llvm::Value *sv = nullptr;
+                StructInst *si = nullptr;
+                if (!struct_value(as->rhs, w, sv, si))
+                    return Unsup("a struct value the walk does not build");
+                b.CreateStore(sv, stit->second.base);
+                return;
+            }
             // Re-pointing a slice local: the whole { data, len } view.
             if (auto sit = w.slices.find(lv->vdef); sit != w.slices.end()) {
                 if (as->op != T_ASSIGN)
@@ -2155,12 +2302,17 @@ struct CodeGenIR {
                 auto *ispec = w.inl[ei].spec;
                 bool sret = ispec && ispec->rets.size() == 1
                          && is_slice_of_int(ispec->rets[0]);
+                bool stret = ispec && ispec->rets.size() == 1
+                          && is_flat_int_struct(ispec->rets[0]);
                 llvm::Value *v = nullptr;
                 if (!ret->vals.empty()) {
                     if (sret) {
                         SliceVal sv;
                         if (!slice_value(ret->vals[0], w, sv)) return;
                         v = slice_struct(sv.data, sv.len);
+                    } else if (stret) {
+                        StructInst *si = nullptr;
+                        if (!struct_value(ret->vals[0], w, v, si)) return;
                     } else {
                         v = GenExpr(ret->vals[0], w);
                         if (!v) return;
@@ -2211,6 +2363,13 @@ struct CodeGenIR {
                     b.CreateRet(b.CreateInsertValue(hdr, sv.len, 1));
                     return;
                 }
+                if (w.fn->getReturnType()->isStructTy()) {
+                    llvm::Value *sv = nullptr;
+                    StructInst *si = nullptr;
+                    if (!struct_value(ret->vals[0], w, sv, si)) return;
+                    b.CreateRet(sv);
+                    return;
+                }
                 auto *v = GenExpr(ret->vals[0], w);
                 if (v) b.CreateRet(as_i64(v));
                 return;
@@ -2221,6 +2380,9 @@ struct CodeGenIR {
                 b.CreateRet(llvm::ConstantInt::get(i64(), 0));
             else if (w.fn->getReturnType() == slice_ll_ty())
                 b.CreateRet(llvm::Constant::getNullValue(slice_ll_ty()));
+            else if (w.fn->getReturnType()->isStructTy())
+                b.CreateRet(llvm::Constant::getNullValue(
+                    w.fn->getReturnType()));
             return;
         }
         // Expression-as-statement (e.g. print(...)). A statement that is not

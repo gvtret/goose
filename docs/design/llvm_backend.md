@@ -146,8 +146,11 @@ is refused with its kind and line (`--emit-ir` fails, no module is
 written) instead of being dropped; a builtin other than `push`, `assert`
 and `print`, and `loop`, `match` or `defer`, count as such constructs.
 Flat int-field structs
-(no padding, fixed size) are local values: a literal builds them, and
-field reads, plain and compound field stores work on them. A slice
+(no padding, fixed size) are values: a literal builds them, field reads,
+plain and compound field stores work on them, a copy moves the whole
+value between locals, and one crosses a call by value (a struct-shaped
+LLVM parameter, a single struct result, the callee's own copy in an
+alloca). A slice
 (`T[:]` of int) is a `{ data, len }` view: a local is built from a
 range over a fixed, growable or slice subject (`a[lo..hi]`, open and
 `^k` bounds), its `.len`, element reads and writes, `for x in s`,
@@ -160,7 +163,7 @@ slice result returns the struct itself; a multi-result signature with a
 slice still refuses. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 29 of the codegen output fixtures pass through
+in the output now refuse. 30 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are `append`/`pop`, references,
 limited arrays, struct parameters and copies, struct fields of slices or
 references, arrays returned by calls, and rendering of floats and structs,
