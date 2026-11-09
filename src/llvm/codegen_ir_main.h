@@ -67,6 +67,7 @@ struct CodeGenIR {
     llvm::Function *f_gs_asfail_i = nullptr;         // (ptr,i64,ptr,ptr,i32), noreturn
     llvm::Function *f_gs_divfail = nullptr;          // (ptr,i32), noreturn
     llvm::Function *f_gs_divovf = nullptr;           // (ptr,i32), noreturn
+    llvm::Function *f_gs_abort = nullptr;            // (i32,ptr,i32), noreturn
     llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_out_bytes = nullptr;        // (ptr,i64)
 
@@ -157,6 +158,7 @@ struct CodeGenIR {
         dcl("gs_asfail_i", f_gs_asfail_i, V, { P, I, P, P, I32 });
         dcl("gs_divfail", f_gs_divfail, V, { P, I32 });
         dcl("gs_divovf", f_gs_divovf, V, { P, I32 });
+        dcl("gs_abort", f_gs_abort, V, { I32, P, I32 });
         dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
         dcl("gs_out_bytes", f_gs_out_bytes, V, { P, I });
     }
@@ -223,6 +225,12 @@ struct CodeGenIR {
             StructInst *inst = nullptr;
         };
         std::unordered_map<VarDef *, StructLoc> structs;
+        // Slice locals (T[:] of int): a { data, len } alloca and its element.
+        struct SliceLoc {
+            llvm::AllocaInst *base = nullptr;
+            TypeExpr *etype = nullptr;
+        };
+        std::unordered_map<VarDef *, SliceLoc> slices;
         std::vector<Loop> loops;
     };
 
@@ -250,6 +258,37 @@ struct CodeGenIR {
             && is_int_ty(t->arr->sub);
     }
 
+    // A type's name for a refusal message.
+    static string type_label(TypeExpr *t) {
+        if (!t) return "an unknown type";
+        switch (t->kind) {
+            case TY_INT:   return "an int";
+            case TY_FLT:   return "a float";
+            case TY_BOOL:  return "a bool";
+            case TY_VOID:  return "void";
+            case TY_STRUCT:
+                return t->struc && t->struc->st
+                    ? cat("struct ", t->struc->st->name) : string("a struct");
+            case TY_ENUM:
+                return t->enu && t->enu->en
+                    ? cat("enum ", t->enu->en->name) : string("an enum");
+            case TY_VARIANT: return "a variant";
+            case TY_ARRAY: {
+                if (!t->arr) return "an array";
+                const char *k = t->arr->akind == A_FIXED ? "a fixed array"
+                              : t->arr->akind == A_VAR ? "a length-stored array"
+                              : t->arr->akind == A_LIMITED ? "a limited array"
+                              : t->arr->akind == A_GROWSHRINK ? "a grow-shrink array"
+                              : "a growable array";
+                return cat(k, " of ", type_label(t->arr->sub));
+            }
+            case TY_SLICE:  return cat("a slice of ", type_label(t->sub));
+            case TY_REF:    return cat("a reference to ", type_label(t->ref ? t->ref->sub : nullptr));
+            case TY_FN:     return "a function value";
+            default:        return "a type";
+        }
+    }
+
     // A struct whose storage is plain: fixed size, flat, no padding, and
     // every field an int. Its fields are in declaration order, so a field
     // index is its position in st->fields.
@@ -263,7 +302,21 @@ struct CodeGenIR {
         return true;
     }
 
-    // An int type's LLVM storage width: u8 is i8, and so on.
+    // A slice the walk holds: a view of int elements, { data, len }.
+    struct SliceVal {
+        llvm::Value *data = nullptr;
+        llvm::Value *len = nullptr;
+        TypeExpr *etype = nullptr;
+    };
+
+    static bool is_slice_of_int(TypeExpr *t) {
+        return t && t->kind == TY_SLICE && is_int_ty(t->sub);
+    }
+
+    llvm::StructType *slice_ll_ty() {
+        return llvm::StructType::get(ctx, { i8ptr(), i64() });
+    }
+
     llvm::Type *int_ll_ty(TypeExpr *t) {
         switch (t->intstorage) {
             case IS_I8: case IS_U8:   return llvm::Type::getInt8Ty(ctx);
@@ -770,6 +823,8 @@ struct CodeGenIR {
                         return b.CreateLoad(i64(), r->len,
                                             llvm::Twine(obj->vdef->name, ".lenv"));
                 }
+                SliceVal sv;
+                if (slice_value(dt->obj, w, sv)) return sv.len;
             }
             return nullptr;
         }
@@ -834,6 +889,33 @@ struct CodeGenIR {
                     return rz_load_elem(*r, basev, idxv, "rzip");
                 }
             }
+            // A view: a slice local, a range, or a range of one. The subject
+            // is read out even when it is not a plain variable (a[1..4][0]).
+            SliceVal sv;
+            if (slice_value(ix->obj, w, sv)) {
+                auto *idxv = GenExpr(ix->idx, w);
+                if (!idxv) return nullptr;
+                if (!ix->nobc) {
+                    auto *okbb = llvm::BasicBlock::Create(ctx, "slixok", w.fn);
+                    auto *failbb = llvm::BasicBlock::Create(ctx, "slixfail", w.fn);
+                    b.CreateCondBr(b.CreateICmpULT(idxv, sv.len, "slixin"),
+                                   okbb, failbb);
+                    b.SetInsertPoint(failbb);
+                    b.CreateCall(f_gs_idxfail, {
+                        idxv, sv.len,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(ctx), 0) });
+                    b.CreateUnreachable();
+                    b.SetInsertPoint(okbb);
+                }
+                auto *et = int_ll_ty(sv.etype);
+                auto *v = b.CreateLoad(
+                    et, b.CreateInBoundsGEP(et, sv.data, idxv, "slip"), "slval");
+                if (et == i64()) return v;
+                return is_uint_ty(sv.etype) ? b.CreateZExt(v, i64())
+                                            : b.CreateSExt(v, i64());
+            }
             return nullptr;
         }
         if (auto *c = Is<Call>(n)) {
@@ -881,16 +963,17 @@ struct CodeGenIR {
                 auto *cura = b.CreateAlloca(i8ptr(), nullptr, "pcur");
                 b.CreateStore(basev, cura);
                 auto *i8ty = llvm::Type::getInt8Ty(ctx);
-                auto newline = strlit_glob("\n");
                 for (size_t ai = 0; ai < c->args.size(); ++ai) {
                     auto *an = c->args[ai];
                     if (auto *sl = Is<StrLit>(an)) {
-                        auto *cur = b.CreateLoad(i8ptr(), cura);
-                        b.CreateMemMove(cur, llvm::MaybeAlign(1), strlit_glob(sl->val),
-                            llvm::MaybeAlign(1), (uint64_t)sl->val.size());
-                        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur,
-                            llvm::ConstantInt::get(i64(), sl->val.size()),
-                            "pcur+"), cura);
+                        emit_print_bytes(cura, sl->val);
+                        continue;
+                    }
+                    if (an->exprtype
+                        && (an->exprtype->kind == TY_ARRAY
+                            || an->exprtype->kind == TY_SLICE)) {
+                        if (!emit_print_view(an, an->exprtype, cura, w))
+                            return nullptr;
                         continue;
                     }
                     if (!an->exprtype || !is_int_ty(an->exprtype))
@@ -903,10 +986,9 @@ struct CodeGenIR {
                     b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
                                   cura);
                 }
+                emit_print_bytes(cura, "\n");
                 auto *cur = b.CreateLoad(i8ptr(), cura);
-                b.CreateMemMove(cur, llvm::MaybeAlign(1), newline, llvm::MaybeAlign(1), 1);
-                auto *endv = b.CreateInBoundsGEP(i8ty, cur,
-                    llvm::ConstantInt::get(i64(), 1), "pcur+");
+                auto *endv = cur;
                 // The length: byte positions of the same region, so the
                 // ptrtoint difference is the count. One write, then the
                 // cursor resets to the base.
@@ -1028,6 +1110,189 @@ struct CodeGenIR {
         return b.CreateSelect(b.CreateICmpSLT(rem, zero), adj, rem, "mod");
     }
 
+    // Appends source bytes at the print cursor with one store per byte. Not
+    // memcpy from a private global: llc's static relocation model would put
+    // that global's absolute address in the object, which a PIE link rejects.
+    void emit_print_bytes(llvm::Value *cura, string_view bytes) {
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        auto *cur = b.CreateLoad(i8ptr(), cura);
+        for (size_t i = 0; i < bytes.size(); ++i)
+            b.CreateStore(llvm::ConstantInt::get(i8ty, (uint8_t)bytes[i]),
+                          b.CreateInBoundsGEP(i8ty, cur,
+                              llvm::ConstantInt::get(i64(), (uint64_t)i)));
+        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur,
+            llvm::ConstantInt::get(i64(), (uint64_t)bytes.size())), cura);
+    }
+
+    // The slice's bounds check: `lo < 0 || hi < lo || hi > len` aborts as a
+    // slice failure (GS_E_SLICE), exactly as the C backend's GenSlice does.
+    void slice_check(llvm::Value *lo, llvm::Value *hi, llvm::Value *lenv,
+                     FnWalk &w) {
+        auto *zero = llvm::ConstantInt::get(i64(), 0);
+        auto *bad = b.CreateOr(b.CreateOr(b.CreateICmpSLT(lo, zero, "slneg"),
+                                          b.CreateICmpSLT(hi, lo, "slrev"),
+                                          "slrev0"),
+                               b.CreateICmpSGT(hi, lenv, "slover"), "slbad");
+        auto *okbb = llvm::BasicBlock::Create(ctx, "slok", w.fn);
+        auto *badbb = llvm::BasicBlock::Create(ctx, "slabort", w.fn);
+        b.CreateCondBr(bad, badbb, okbb);
+        b.SetInsertPoint(badbb);
+        b.CreateCall(f_gs_abort,
+                     { llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 1),
+                       llvm::ConstantPointerNull::get(i8ptr()),
+                       llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0) });
+        b.CreateUnreachable();
+        b.SetInsertPoint(okbb);
+    }
+
+    // The view an array-family expression names: a slice local, a range over
+    // one of the array locals the walk holds, or a range over another such
+    // view. False when the walk does not hold the subject.
+    bool slice_value(Node *n, FnWalk &w, SliceVal &out) {
+        if (auto *obj = Is<Ident>(n)) {
+            if (!obj->vdef) return false;
+            if (auto sit = w.slices.find(obj->vdef); sit != w.slices.end()) {
+                auto &sl = sit->second;
+                auto *hdr = b.CreateLoad(slice_ll_ty(), sl.base, "slv");
+                out.data = b.CreateExtractValue(hdr, 0, "svd");
+                out.len = b.CreateExtractValue(hdr, 1, "svn");
+                out.etype = sl.etype;
+                return true;
+            }
+            if (auto fit = w.fixeds.find(obj->vdef); fit != w.fixeds.end()) {
+                auto &fx = fit->second;
+                auto *ty = fx.base->getAllocatedType();
+                out.data = b.CreateInBoundsGEP(
+                    ty, fx.base,
+                    { llvm::ConstantInt::get(i64(), 0), llvm::ConstantInt::get(i64(), 0) },
+                    "svd");
+                out.len = llvm::ConstantInt::get(i64(), (uint64_t)fx.count);
+                out.etype = fx.etype;
+                return true;
+            }
+            if (auto *r = rz_head(w, obj->vdef)) {
+                out.data = b.CreateLoad(i8ptr(), r->base, "svd");
+                out.len = b.CreateLoad(i64(), r->len, "svn");
+                out.etype = r->etype;
+                return true;
+            }
+            return false;
+        }
+        auto *se = Is<SliceExpr>(n);
+        if (!se) return false;
+        SliceVal base;
+        if (!slice_value(se->obj, w, base)) return false;
+        if (!is_int_ty(base.etype)) return false;
+        auto *lenv = base.len;
+        auto bound = [&](Node *bn, bool fromend, llvm::Value *dflt) -> llvm::Value * {
+            if (!bn) return dflt;
+            auto *x = GenExpr(bn, w);
+            if (!x) return nullptr;
+            return fromend ? b.CreateSub(lenv, x, "slend") : x;
+        };
+        auto *lo = bound(se->lo, se->lo_from_end, llvm::ConstantInt::get(i64(), 0));
+        auto *hi = bound(se->hi, se->hi_from_end, lenv);
+        if (!lo || !hi) return false;
+        if (!se->nobc) slice_check(lo, hi, lenv, w);
+        out.data = b.CreateInBoundsGEP(int_ll_ty(base.etype), base.data, lo, "svd");
+        out.len = b.CreateSub(hi, lo, "svn");
+        out.etype = base.etype;
+        return true;
+    }
+
+    // `var s: T[:] = <view>`: the view lands in a { data, len } alloca.
+    void emit_slice_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        SliceVal sv;
+        if (!init || !slice_value(init, w, sv) || !sv.etype)
+            return Unsup(cat("a slice value of ", type_label(def.type),
+                             " the walk does not build at line ",
+                             (long long)vd->line.line));
+        auto *slot = b.CreateAlloca(slice_ll_ty(), nullptr, llvm::Twine(def.name));
+        auto *hdr = b.CreateInsertValue(llvm::UndefValue::get(slice_ll_ty()),
+                                        sv.data, 0);
+        hdr = b.CreateInsertValue(hdr, sv.len, 1);
+        b.CreateStore(hdr, slot);
+        w.slices[&def] = { slot, sv.etype };
+    }
+
+    // Appends an int array or slice's text form at the print cursor: raw
+    // bytes for u8 elements, `[a, b, c]` otherwise (codegen_render.h).
+    bool emit_print_view(Node *an, TypeExpr *t, llvm::Value *cura, FnWalk &w) {
+        TypeExpr *etype = nullptr;
+        SliceVal sv;
+        llvm::Value *lenv = nullptr;
+        if (t && t->kind == TY_SLICE) {
+            if (!is_slice_of_int(t) || !slice_value(an, w, sv))
+                return Unsup("a print of a slice the walk does not hold"), false;
+            etype = sv.etype;
+            lenv = sv.len;
+        } else if (t && t->kind == TY_ARRAY) {
+            auto *obj = Is<Ident>(an);
+            auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef) : w.fixeds.end();
+            if (fit == w.fixeds.end())
+                return Unsup("a print of an array the walk does not hold"), false;
+            auto &fx = fit->second;
+            etype = fx.etype;
+            lenv = llvm::ConstantInt::get(i64(), (uint64_t)fx.count);
+            sv.data = b.CreateInBoundsGEP(
+                fx.base->getAllocatedType(), fx.base,
+                { llvm::ConstantInt::get(i64(), 0), llvm::ConstantInt::get(i64(), 0) },
+                "pvd");
+        } else {
+            return false;
+        }
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        if (!is_int_ty(etype)) return Unsup("a print of an array element the walk does not render"), false;
+        if (etype->intstorage == IS_U8 || etype->intstorage == IS_I8) {
+            auto *cur = b.CreateLoad(i8ptr(), cura);
+            b.CreateMemMove(cur, llvm::MaybeAlign(1), sv.data, llvm::MaybeAlign(1), lenv);
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, lenv, "pcur+"), cura);
+            return true;
+        }
+        auto *zero = llvm::ConstantInt::get(i64(), 0);
+        auto *pre = b.GetInsertBlock();
+        auto *condbb = llvm::BasicBlock::Create(ctx, "parr_cond", w.fn);
+        auto *bodybb = llvm::BasicBlock::Create(ctx, "parr_body", w.fn);
+        auto *donebb = llvm::BasicBlock::Create(ctx, "parr_done", w.fn);
+        auto *startcur = b.CreateLoad(i8ptr(), cura);
+        b.CreateStore(llvm::ConstantInt::get(i8ty, '['), startcur);
+        b.CreateStore(b.CreateInBoundsGEP(
+            i8ty, startcur, llvm::ConstantInt::get(i64(), 1)), cura);
+        b.CreateBr(condbb);
+        b.SetInsertPoint(condbb);
+        auto *iv = b.CreatePHI(i64(), 2, "parr_i");
+        iv->addIncoming(zero, pre);
+        b.CreateCondBr(b.CreateICmpSLT(iv, lenv, "parr_test"), bodybb, donebb);
+        b.SetInsertPoint(bodybb);
+        // A separator before every element but the first.
+        auto *sepbb = llvm::BasicBlock::Create(ctx, "parr_sep", w.fn);
+        auto *elbb = llvm::BasicBlock::Create(ctx, "parr_el", w.fn);
+        b.CreateCondBr(b.CreateICmpEQ(iv, zero, "parr_first"), elbb, sepbb);
+        b.SetInsertPoint(sepbb);
+        emit_print_bytes(cura, ", ");
+        b.CreateBr(elbb);
+        b.SetInsertPoint(elbb);
+        auto *et = int_ll_ty(etype);
+        auto *ev = b.CreateLoad(et, b.CreateInBoundsGEP(et, sv.data, iv, "parr_p"),
+                                "parr_v");
+        auto *ev64 = et == i64() ? ev
+                   : is_uint_ty(etype) ? b.CreateZExt(ev, i64())
+                                       : b.CreateSExt(ev, i64());
+        auto *cur2 = b.CreateLoad(i8ptr(), cura);
+        auto *n = b.CreateCall(f_gs_fmt_i64, { cur2, ev64 });
+        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur2, n), cura);
+        auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "parr_next");
+        iv->addIncoming(next, b.GetInsertBlock());
+        b.CreateBr(condbb);
+        b.SetInsertPoint(donebb);
+        auto *endcur = b.CreateLoad(i8ptr(), cura);
+        b.CreateStore(llvm::ConstantInt::get(i8ty, ']'), endcur);
+        b.CreateStore(b.CreateInBoundsGEP(
+            i8ty, endcur, llvm::ConstantInt::get(i64(), 1)), cura);
+        return true;
+    }
+
     llvm::StructType *struct_ll_ty(StructInst *in) {
         std::vector<llvm::Type *> elems;
         for (auto *ft : in->ftypes) elems.push_back(int_ll_ty(ft));
@@ -1114,11 +1379,18 @@ struct CodeGenIR {
     // native width.
     void GenIndexStore(Assign *as, Index *ix, FnWalk &w) {
         auto *obj = Is<Ident>(ix->obj);
-        if (!obj || !obj->vdef) return Unsup("an index assignment into a non-variable");
-        auto fit = w.fixeds.find(obj->vdef);
-        auto *r = fit == w.fixeds.end() ? rz_head(w, obj->vdef) : nullptr;
-        if (fit == w.fixeds.end() && !r)
-            return Unsup("an index assignment into an array the walk does not hold");
+        auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef) : w.fixeds.end();
+        auto *r = (obj && obj->vdef && fit == w.fixeds.end())
+            ? rz_head(w, obj->vdef) : nullptr;
+        SliceVal sv;
+        bool isslice = false;
+        if (fit == w.fixeds.end() && !r) {
+            // A view: a slice local, or a range of an array or view. The
+            // subject expression is read out once.
+            isslice = slice_value(ix->obj, w, sv);
+            if (!isslice)
+                return Unsup("an index assignment into an array the walk does not hold");
+        }
         auto *idx = GenExpr(ix->idx, w);
         if (!idx) return;
         auto *rhs = GenExpr(as->rhs, w);
@@ -1134,6 +1406,20 @@ struct CodeGenIR {
             b.CreateUnreachable();
             b.SetInsertPoint(okbb);
         };
+        if (isslice) {
+            auto *et = int_ll_ty(sv.etype);
+            check(sv.len);
+            auto *p = b.CreateInBoundsGEP(et, sv.data, idx, "stp");
+            if (as->op != T_ASSIGN) {
+                auto *cur = b.CreateLoad(et, p, "stcur");
+                auto *cur64 = is_uint_ty(sv.etype) ? b.CreateZExt(cur, i64())
+                                                   : b.CreateSExt(cur, i64());
+                rhs = ArithEq(as->op, cur64, rhs, w);
+                if (!rhs) return Unsup("a compound index assignment of this operator");
+            }
+            b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
+            return;
+        }
         if (fit != w.fixeds.end()) {
             auto &fx = fit->second;
             auto *et = int_ll_ty(fx.etype);
@@ -1304,9 +1590,13 @@ struct CodeGenIR {
                     emit_struct_decl(vd, i, *vddef, w);
                     continue;
                 }
+                if (is_slice_of_int(vddef->type)) {
+                    emit_slice_decl(vd, i, *vddef, w);
+                    continue;
+                }
                 if (!is_int_ty(vddef->type))
-                    return Unsup(cat("a local of a type the walk does not hold at line ",
-                                     (long long)vd->line.line));
+                    return Unsup(cat("a local of ", type_label(vddef->type),
+                                     " at line ", (long long)vd->line.line));
                 auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(vddef->name));
                 if (i < vd->inits.size() && vd->inits[i]) {
                     auto *initv = GenExpr(vd->inits[i], w);
@@ -1328,6 +1618,19 @@ struct CodeGenIR {
             // i64 assignment to a local.
             auto *lv = Is<Ident>(as->lval);
             if (!lv || !lv->vdef) return Unsup("an assignment to a place the walk does not model");
+            // Re-pointing a slice local: the whole { data, len } view.
+            if (auto sit = w.slices.find(lv->vdef); sit != w.slices.end()) {
+                if (as->op != T_ASSIGN)
+                    return Unsup("a compound assignment to a slice");
+                SliceVal sv;
+                if (!slice_value(as->rhs, w, sv))
+                    return Unsup("a slice value the walk does not build");
+                auto *hdr = b.CreateInsertValue(
+                    b.CreateInsertValue(llvm::UndefValue::get(slice_ll_ty()),
+                                        sv.data, 0), sv.len, 1);
+                b.CreateStore(hdr, sit->second.base);
+                return;
+            }
             auto *rhs = GenExpr(as->rhs, w);
             if (!rhs) return;
             llvm::Value *cur = nullptr;
@@ -1439,7 +1742,7 @@ struct CodeGenIR {
                 b.SetInsertPoint(donebb);
                 return;
             }
-            if (fl->iterkind == IK_ARRAY) {
+            if (fl->iterkind == IK_ARRAY || fl->iterkind == IK_SLICE) {
                 // Element iteration over an int-element array: the binder
                 // names the element read per pass, the optional index
                 // binder its position, and the count re-reads each pass
@@ -1456,9 +1759,20 @@ struct CodeGenIR {
                         if (fit != w.fixeds.end()) fa = &fit->second;
                     }
                 }
-                if (!gr && !fa) return;
-                llvm::Type *et = gr ? int_ll_ty(gr->etype)
-                                    : int_ll_ty(fa->etype);
+                // A view: a slice local, a range of an array, or a range of a
+                // view. A slice local is re-read each pass (its body may
+                // re-point it, section 5.2); a range expression's view is the
+                // temporary it made.
+                SliceVal sv;
+                bool isv = false;
+                if (!gr && !fa) {
+                    isv = slice_value(fl->iter, w, sv);
+                    if (!isv) return;
+                }
+                auto *iid = isv ? Is<Ident>(fl->iter) : nullptr;
+                bool reload = iid && iid->vdef && w.slices.count(iid->vdef);
+                TypeExpr *etype = gr ? gr->etype : fa ? fa->etype : sv.etype;
+                llvm::Type *et = int_ll_ty(etype);
                 auto *fn = w.fn;
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
                 auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
@@ -1469,9 +1783,14 @@ struct CodeGenIR {
                 auto *iv = b.CreatePHI(i64(), 2, "for_i");
                 iv->addIncoming(llvm::ConstantInt::get(i64(), 0),
                                 b.GetInsertBlock()->getSinglePredecessor());
+                if (reload) {
+                    SliceVal fresh;
+                    if (slice_value(fl->iter, w, fresh)) sv = fresh;
+                }
                 llvm::Value *lenv = gr
                     ? (llvm::Value *)b.CreateLoad(i64(), gr->len, "for_len")
-                    : llvm::ConstantInt::get(i64(), (uint64_t)fa->count);
+                    : fa ? (llvm::Value *)llvm::ConstantInt::get(i64(), (uint64_t)fa->count)
+                         : sv.len;
                 b.CreateCondBr(b.CreateICmpULT(iv, lenv, "for_test"),
                                bodybb, donebb);
                 b.SetInsertPoint(bodybb);
@@ -1484,10 +1803,13 @@ struct CodeGenIR {
                                 fa->base,
                                 { llvm::ConstantInt::get(i64(), 0), iv },
                                 "for_ip"), "for_ev")
-                        : rz_load_elem(*gr,
-                            b.CreateLoad(i8ptr(), gr->base), iv, "for_ip");
+                        : gr ? rz_load_elem(*gr,
+                            b.CreateLoad(i8ptr(), gr->base), iv, "for_ip")
+                             : b.CreateLoad(et,
+                                 b.CreateInBoundsGEP(et, sv.data, iv, "for_ip"),
+                                 "for_ev");
                     b.CreateStore(et == i64() ? ev
-                        : is_uint_ty((fa ? fa->etype : gr->etype))
+                        : is_uint_ty(etype)
                             ? b.CreateZExt(ev, i64())
                             : b.CreateSExt(ev, i64()), slot);
                     w.locals[fl->vdef] = slot;
@@ -1510,7 +1832,8 @@ struct CodeGenIR {
                 b.SetInsertPoint(donebb);
                 return;
             }
-            return;
+            return Unsup(cat("a for loop over ", type_label(fl->iter->exprtype),
+                             " at line ", (long long)fl->line.line));
         }
         if (auto *brk = Is<Break>(n)) {
             if (!w.loops.empty()) {

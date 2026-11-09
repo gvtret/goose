@@ -140,12 +140,16 @@ growable int arrays with the same checks as reads. A construct the walk
 does not emit is refused with its kind and line (`--emit-ir` fails, no
 module is written) instead of being dropped. Flat int-field structs
 (no padding, fixed size) are local values: a literal builds them, and
-field reads, plain and compound field stores work on them. Fixtures
-that passed only because their unemitted statements or locals did not
-show in the output now refuse (13 so far). 21 of the codegen output
-fixtures pass through `--emit-ir`; the rest need the remaining M3 shapes
-(struct parameters, returns and copies, nested aggregates, slices,
-arrays returned and element-wise operations, strings as values) and the
-M4 modules. See
+field reads, plain and compound field stores work on them. A slice
+(`T[:]` of int) is a `{ data, len }` view: a local is built from a
+range over a fixed, growable or slice subject (`a[lo..hi]`, open and
+`^k` bounds), its `.len`, element reads and writes, `for x in s`,
+re-pointing, and print (raw bytes for `u8`, `[a, b, c]` otherwise) work.
+Fixtures that passed only because their unemitted statements or locals
+did not show in the output now refuse (13 so far). 22 of the codegen
+output fixtures pass through `--emit-ir`; the rest need the remaining
+M3 shapes (slice parameters, returns and struct fields, struct
+parameters and copies, nested aggregates, arrays returned and
+element-wise operations, strings as values) and the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.
