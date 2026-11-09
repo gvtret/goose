@@ -190,6 +190,7 @@ struct CodeGenIR {
         // target is one of them branches to its merge block with the value.
         struct InlExit {
             SFunction *sf = nullptr;
+            FnSpec *spec = nullptr;       // The inlined specialization.
             llvm::BasicBlock *merge = nullptr;
             std::vector<std::pair<llvm::Value *, llvm::BasicBlock *>> incoming;
         };
@@ -408,17 +409,23 @@ struct CodeGenIR {
             bool supported = true;
             for (auto *t : sp->argtypes) {
                 if (is_int_ty(t)) argtys.push_back(i64ty);
+                else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
                 else supported = false;
             }
             // Return protocol: ret0 is the call's value, every other
-            // result an out-pointer parameter the callee writes; all
-            // results must be int values for a multi-return shell.
+            // result an out-pointer parameter the callee writes; a single
+            // slice result comes back as the { data, len } it is.
             bool allretint = true;
             for (auto *rt : sp->rets)
                 if (!is_int_ty(rt)) allretint = false;
             llvm::Type *retty = voidty();
             if (!sp->rets.empty()) {
-                retty = is_int_ty(sp->rets[0]) && allretint ? i64ty : nullptr;
+                if (sp->rets.size() == 1 && is_slice_of_int(sp->rets[0]))
+                    retty = slice_ll_ty();
+                else if (is_int_ty(sp->rets[0]) && allretint)
+                    retty = i64ty;
+                else
+                    retty = nullptr;
                 if (!retty) supported = false;
                 for (size_t i = 1; i < sp->rets.size(); i++)
                     argtys.push_back(i8ptr());
@@ -444,9 +451,19 @@ struct CodeGenIR {
             w.body = sp->body;
             w.entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             b.SetInsertPoint(w.entry);
-            // Bind parameters (aligned with argtypes; i64 slots only).
-            for (size_t i = 0; i < sp->params.size() && i < fn->getFunctionType()->getNumParams(); ++i)
-                w.params[sp->params[i]] = fn->getArg(i);
+            // Bind parameters (aligned with argtypes): ints as i64 slots, a
+            // slice into an alloca so the body may re-point it.
+            for (size_t i = 0; i < sp->params.size() && i < fn->getFunctionType()->getNumParams(); ++i) {
+                auto *pt = i < sp->argtypes.size() ? sp->argtypes[i] : nullptr;
+                if (is_slice_of_int(pt)) {
+                    auto *slot = b.CreateAlloca(slice_ll_ty(), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(i), slot);
+                    w.slices[sp->params[i]] = { slot, pt->sub };
+                } else if (!pt || is_int_ty(pt)) {
+                    w.params[sp->params[i]] = fn->getArg(i);
+                }
+            }
             if (sp->body && sh.supported) GenStmt(sp->body, w);
             // Close any basic block the walk left unterminated. An if/else
             // merge block, for instance, only terminates when the statement
@@ -458,6 +475,8 @@ struct CodeGenIR {
                 if (!bri.getTerminator()) {
                     b.SetInsertPoint(&bri);
                     if (fn->getReturnType()->isVoidTy()) b.CreateRetVoid();
+                    else if (fn->getReturnType() == slice_ll_ty())
+                        b.CreateRet(llvm::Constant::getNullValue(slice_ll_ty()));
                     else b.CreateRet(llvm::ConstantInt::get(i64ty, 0));
                 }
             }
@@ -697,12 +716,29 @@ struct CodeGenIR {
         // A push is a statement whose walk yields no value.
         auto *pc = Is<Call>(n);
         auto valueless = pc && pc->builtin == B_PUSH;
-        if (!v && n && n->exprtype && n->exprtype->kind != TY_VOID && !valueless)
+        // A block terminated by a return contributes no value: the walk
+        // continues only for the statement that follows (dead code).
+        if (!v && n && n->exprtype && n->exprtype->kind != TY_VOID && !valueless
+            && !b.GetInsertBlock()->getTerminator())
             Unsup(cat("an expression of kind ", (int)n->nkind, " at line ", (long long)n->line.line));
         return v;
     }
     llvm::Value *GenExprRaw(Node *n, FnWalk &w) {
         if (!n) return nullptr;
+
+        // A block in a value position: the base-case inliner makes one of a
+        // self-call (bindings, then an if/else choosing the arms), the way
+        // the C backend's GenX reads a Block. Its statements run here and the
+        // tail is the value; a tail that returns has none.
+        if (auto *blk = Is<Block>(n)) {
+            for (auto *st : blk->stmts) GenStmt(st, w);
+            if (!blk->tail) return nullptr;
+            if (auto *tr = Is<Return>(blk->tail)) {
+                GenStmt(tr, w);
+                return nullptr;
+            }
+            return GenExpr(blk->tail, w);
+        }
         if (auto *il = Is<IntLit>(n))
             return llvm::ConstantInt::get(i64(), (uint64_t)il->val, true);
         if (auto *fl = Is<FltLit>(n))
@@ -792,6 +828,13 @@ struct CodeGenIR {
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
+                // A slice local as a value: the { data, len } it holds.
+                auto sit = w.slices.find(id->vdef);
+                if (sit != w.slices.end()) {
+                    auto *hdr = b.CreateLoad(slice_ll_ty(), sit->second.base, "sv");
+                    return slice_struct(b.CreateExtractValue(hdr, 0, "svd"),
+                                        b.CreateExtractValue(hdr, 1, "svn"));
+                }
             }
             return nullptr;
         }
@@ -1041,38 +1084,38 @@ struct CodeGenIR {
             auto *elsebb = ifx->elseb ? llvm::BasicBlock::Create(ctx, "else", fn) : nullptr;
             auto *merge = llvm::BasicBlock::Create(ctx, "ifmerge", fn);
             b.CreateCondBr(cond, thenbb, elsebb ? elsebb : merge);
-            // A branch's trailing value once its statements have run (a branch
-            // that returned has no value and its block is already terminated).
-            auto branchval = [&](Block *bb, llvm::BasicBlock *where) -> llvm::Value * {
-                if (!bb || !bb->tail) return nullptr;
-                if (where->getTerminator()) return nullptr;   // Branch returned.
-                b.SetInsertPoint(where);
-                return GenExpr(bb->tail, w);
-            };
+            // A branch is a block (its statements, then its tail) or one
+            // expression. Its value is what the tail yields; a branch that
+            // returns yields none and leaves its block terminated. The tail
+            // is evaluated exactly once.
             b.SetInsertPoint(thenbb);
-            if (ifx->thenb) GenStmt(ifx->thenb, w);
-            llvm::Value *thenval = branchval(ifx->thenb, b.GetInsertBlock());
-            if (!b.GetInsertBlock()->getTerminator()) b.CreateBr(merge);
+            llvm::Value *thenval = ifx->thenb ? GenExpr(ifx->thenb, w) : nullptr;
+            auto *thenend = b.GetInsertBlock();
+            if (!thenend->getTerminator()) b.CreateBr(merge);
             llvm::Value *elseval = nullptr;
+            llvm::BasicBlock *elseend = nullptr;
             if (elsebb) {
                 b.SetInsertPoint(elsebb);
-                if (auto *eb = Is<Block>(ifx->elseb)) GenStmt(eb, w);
-                else if (ifx->elseb)
-                    elseval = GenExpr(ifx->elseb, w);
-                if (!b.GetInsertBlock()->getTerminator()) b.CreateBr(merge);
-                if (!elseval) {
-                    auto *eb = Is<Block>(ifx->elseb);
-                    if (eb) elseval = branchval(eb, b.GetInsertBlock());
-                }
+                elseval = GenExpr(ifx->elseb, w);
+                elseend = b.GetInsertBlock();
+                if (!elseend->getTerminator()) b.CreateBr(merge);
             }
             b.SetInsertPoint(merge);
-            if (thenval && elseval && thenval != elseval) {
-                auto *phi = b.CreatePHI(i64(), 2, "ifval");
-                phi->addIncoming(thenval, thenbb);
-                phi->addIncoming(elseval, elsebb);
+            if (thenval && elseval && thenval != elseval
+                && thenval->getType() == elseval->getType()) {
+                auto *ty = thenval->getType();
+                auto *phi = b.CreatePHI(ty, 2, "ifval");
+                phi->addIncoming(thenval, thenend);
+                phi->addIncoming(elseval, elseend);
                 return phi;
             }
             return thenval ? thenval : elseval;
+        }
+        // A slice where a value is wanted (an if arm, a block's tail): the
+        // { data, len } the view names.
+        if (n->exprtype && is_slice_of_int(n->exprtype)) {
+            SliceVal sv;
+            if (slice_value(n, w, sv)) return slice_struct(sv.data, sv.len);
         }
         return nullptr;
     }
@@ -1148,6 +1191,31 @@ struct CodeGenIR {
     // one of the array locals the walk holds, or a range over another such
     // view. False when the walk does not hold the subject.
     bool slice_value(Node *n, FnWalk &w, SliceVal &out) {
+        // An inlined call whose result is a slice: the body's PHI is the
+        // { data, len } it built.
+        if (auto *ib = Is<InlineBlock>(n)) {
+            if (!ib->spec || ib->spec->rets.size() != 1
+                || !is_slice_of_int(ib->spec->rets[0]))
+                return false;
+            auto *v = GenInline(ib, w);
+            if (!v || v->getType() != slice_ll_ty()) return false;
+            out.data = b.CreateExtractValue(v, 0, "svd");
+            out.len = b.CreateExtractValue(v, 1, "svn");
+            out.etype = ib->spec->rets[0]->sub;
+            return true;
+        }
+        // A call whose one result is a slice: the { data, len } it returns.
+        if (auto *c = Is<Call>(n)) {
+            if (!c->spec || c->spec->rets.size() != 1
+                || !is_slice_of_int(c->spec->rets[0]))
+                return false;
+            auto *v = EmitDirectCall(c, w, nullptr);
+            if (!v) return false;
+            out.data = b.CreateExtractValue(v, 0, "svd");
+            out.len = b.CreateExtractValue(v, 1, "svn");
+            out.etype = c->spec->rets[0]->sub;
+            return true;
+        }
         if (auto *sl = Is<StrLit>(n)) {
             // A literal's bytes are one internal constant; the view is
             // { bytes, length }.
@@ -1467,9 +1535,9 @@ struct CodeGenIR {
         auto *sp = c->spec;
         if (!sp) return nullptr;
         for (auto *t : sp->argtypes)
-            if (!is_int_ty(t)) return nullptr;
+            if (!is_int_ty(t) && !is_slice_of_int(t)) return nullptr;
         for (auto *rt : sp->rets)
-            if (!is_int_ty(rt)) return nullptr;
+            if (!is_int_ty(rt) && !is_slice_of_int(rt)) return nullptr;
         auto nrets = sp->rets.size();
         if (nrets > 1 && (!outs || outs->size() < nrets)) return nullptr;
         string callee = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
@@ -1480,7 +1548,17 @@ struct CodeGenIR {
         auto expect = c->args.size() + (nrets > 1 ? nrets - 1 : 0);
         if (cf->getFunctionType()->getNumParams() != expect) return nullptr;
         std::vector<llvm::Value *> args;
-        for (auto *a : c->args) {
+        for (size_t ai = 0; ai < c->args.size(); ++ai) {
+            auto *a = c->args[ai];
+            auto *pt = ai < sp->argtypes.size() ? sp->argtypes[ai] : nullptr;
+            if (is_slice_of_int(pt)) {
+                SliceVal sv;
+                if (!slice_value(a, w, sv)) return nullptr;
+                auto *hdr = b.CreateInsertValue(
+                    llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
+                continue;
+            }
             auto *av = GenExpr(a, w);
             if (!av) return nullptr;
             args.push_back(av);
@@ -1489,18 +1567,35 @@ struct CodeGenIR {
         return b.CreateCall(cf, args);
     }
 
+    // The { data, len } an inlined callee's slice result is made of.
+    llvm::Value *slice_struct(llvm::Value *data, llvm::Value *len) {
+        auto *hdr = b.CreateInsertValue(llvm::UndefValue::get(slice_ll_ty()),
+                                        data, 0);
+        return b.CreateInsertValue(hdr, len, 1);
+    }
+
     // An inlined call body: its statements, then its tail value. Each return
     // of the callee (Return above) branches here with its value; the values
     // meet in a PHI. A fallthrough with no value, or no value at all, gives
     // no result.
     llvm::Value *GenInline(InlineBlock *ib, FnWalk &w) {
         auto *merge = llvm::BasicBlock::Create(ctx, "inlmerge", w.fn);
-        w.inl.push_back({ ib->sf, merge, {} });
+        w.inl.push_back({ ib->sf, ib->spec, merge, {} });
         size_t ei = w.inl.size() - 1;
+        bool sret = ib->spec && ib->spec->rets.size() == 1
+                 && is_slice_of_int(ib->spec->rets[0]);
         llvm::Value *tv = nullptr;
         if (ib->body) {
             for (auto *s : ib->body->stmts) GenStmt(s, w);
-            if (ib->body->tail) tv = GenExpr(ib->body->tail, w);
+            if (ib->body->tail) {
+                if (sret) {
+                    SliceVal sv;
+                    if (slice_value(ib->body->tail, w, sv))
+                        tv = slice_struct(sv.data, sv.len);
+                } else {
+                    tv = GenExpr(ib->body->tail, w);
+                }
+            }
         }
         auto *cur = b.GetInsertBlock();
         // A block after a return that no edge reaches is dead: it adds no
@@ -1517,9 +1612,10 @@ struct CodeGenIR {
         w.inl.pop_back();
         b.SetInsertPoint(merge);
         if (fell || incoming.empty()) return nullptr;
+        auto *ty = incoming[0].first->getType();
         for (auto &[v, bb] : incoming)
-            if (!v->getType()->isIntegerTy(64)) return nullptr;
-        auto *phi = b.CreatePHI(i64(), (unsigned)incoming.size(), "inl");
+            if (v->getType() != ty) return nullptr;
+        auto *phi = b.CreatePHI(ty, (unsigned)incoming.size(), "inl");
         for (auto &[v, bb] : incoming) phi->addIncoming(v, bb);
         return phi;
     }
@@ -1550,8 +1646,11 @@ struct CodeGenIR {
                 // return. Nested blocks evaluate their tail for effect and
                 // value only.
                 auto *tv = GenExpr(blk->tail, w);
-                if (top && tv && w.fn->getReturnType()->isIntegerTy(64) &&
-                    !b.GetInsertBlock()->getTerminator())
+                // The implicit return of the walked function's own body: the
+                // tail's value when its type is the shell's result type (an
+                // int; a slice's { data, len }).
+                if (top && tv && !b.GetInsertBlock()->getTerminator()
+                    && tv->getType() == w.fn->getReturnType())
                     b.CreateRet(tv);
             }
             return;
@@ -1899,10 +1998,19 @@ struct CodeGenIR {
                 while (ei > 0 && w.inl[ei - 1].sf != ret->target) --ei;
                 if (ei == 0) return;
                 --ei;
+                auto *ispec = w.inl[ei].spec;
+                bool sret = ispec && ispec->rets.size() == 1
+                         && is_slice_of_int(ispec->rets[0]);
                 llvm::Value *v = nullptr;
                 if (!ret->vals.empty()) {
-                    v = GenExpr(ret->vals[0], w);
-                    if (!v) return;
+                    if (sret) {
+                        SliceVal sv;
+                        if (!slice_value(ret->vals[0], w, sv)) return;
+                        v = slice_struct(sv.data, sv.len);
+                    } else {
+                        v = GenExpr(ret->vals[0], w);
+                        if (!v) return;
+                    }
                 }
                 if (v) w.inl[ei].incoming.push_back({ v, b.GetInsertBlock() });
                 b.CreateBr(w.inl[ei].merge);
@@ -1941,6 +2049,14 @@ struct CodeGenIR {
                 return;
             }
             if (!ret->vals.empty()) {
+                if (w.fn->getReturnType() == slice_ll_ty()) {
+                    SliceVal sv;
+                    if (!slice_value(ret->vals[0], w, sv)) return;
+                    auto *hdr = b.CreateInsertValue(
+                        llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                    b.CreateRet(b.CreateInsertValue(hdr, sv.len, 1));
+                    return;
+                }
                 auto *v = GenExpr(ret->vals[0], w);
                 if (v) b.CreateRet(v);
                 return;
@@ -1949,6 +2065,8 @@ struct CodeGenIR {
             // (the full walk uses the type's default).
             if (w.fn->getReturnType()->isIntegerTy(64))
                 b.CreateRet(llvm::ConstantInt::get(i64(), 0));
+            else if (w.fn->getReturnType() == slice_ll_ty())
+                b.CreateRet(llvm::Constant::getNullValue(slice_ll_ty()));
             return;
         }
         // Expression-as-statement (e.g. print(...)). A statement that is not
