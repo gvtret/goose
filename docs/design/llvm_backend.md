@@ -136,16 +136,22 @@ signed `/`, `%` follow the runtime (Euclidean `%`, checked zero and
 i64.min / -1), `>>` is arithmetic, `&&`/`||` short-circuit, and a
 callee's return inside an inlined body meets its call's merge in a
 PHI. Index assignments (plain and compound) store into fixed and
-growable int arrays with the same checks as reads. A construct the walk
-does not emit is refused with its kind and line (`--emit-ir` fails, no
-module is written) instead of being dropped. Flat int-field structs
+growable int arrays with the same checks as reads, and a `continue`
+lands in the loop's step block, so the counter advances exactly as a
+fallthrough does. `assert` is the runtime abort on a false test, and a
+global's `++` writes its global slot. A construct the walk does not emit
+is refused with its kind and line (`--emit-ir` fails, no module is
+written) instead of being dropped; a builtin other than `push`, `assert`
+and `print`, and `loop`, `match` or `defer`, count as such constructs.
+Flat int-field structs
 (no padding, fixed size) are local values: a literal builds them, and
 field reads, plain and compound field stores work on them. A slice
 (`T[:]` of int) is a `{ data, len }` view: a local is built from a
 range over a fixed, growable or slice subject (`a[lo..hi]`, open and
 `^k` bounds), its `.len`, element reads and writes, `for x in s`,
 re-pointing, and print (raw bytes for `u8`, `[a, b, c]` otherwise) work.
-A string literal is such a view of its constant bytes. A slice crosses a
+A string literal is such a view of its constant bytes, and also
+initializes a `u8[]` local or a `u8[>..]`'s first bytes. A slice crosses a
 call by value as the `{ ptr, i64 }` it is: a parameter is copied into the
 callee's own alloca (so the body may re-point it), and a call's single
 slice result returns the struct itself; a multi-result signature with a

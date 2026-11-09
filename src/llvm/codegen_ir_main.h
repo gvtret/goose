@@ -200,6 +200,8 @@ struct CodeGenIR {
         struct Loop {
             llvm::BasicBlock *condbb = nullptr;   // The loop's condition block.
             llvm::BasicBlock *donebb = nullptr;    // The loop's exit block.
+            llvm::BasicBlock *contbb = nullptr;    // Where `continue` resumes
+                                                   // (the increment, if any).
         };
         // Growable array locals of this walk: VarDef * -> header. base and
         // len are local allocas (their alloca'd header); the same record
@@ -605,10 +607,15 @@ struct CodeGenIR {
         auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
         auto *al = init ? Is<ArrayLit>(init) : nullptr;
         // A T[] local (no capacity, so no pushes) has the count its literal
-        // gives; a T[k] has its declared one.
+        // gives; a T[k] has its declared one. A u8[] built from a string
+        // literal is the literal's bytes.
+        auto *sl = init ? Is<StrLit>(init) : nullptr;
+        bool strinit = sl && tal->sub
+            && (tal->sub->intstorage == IS_U8 || tal->sub->intstorage == IS_I8);
         if (tal->akind == A_VAR) {
-            if (!al || al->fillval) return;
-            count = (int64_t)al->elems.size();
+            if (al && !al->fillval) count = (int64_t)al->elems.size();
+            else if (strinit) count = (int64_t)sl->val.size();
+            else return;
         }
         if (count < 0) return;
         auto *et = int_ll_ty(tal->sub);
@@ -622,6 +629,12 @@ struct CodeGenIR {
                            llvm::Align(8));
         }
         w.fixeds[&def] = { a, count, tal->sub };
+        if (!al && strinit) {
+            if (count)
+                b.CreateMemCpy(a, llvm::MaybeAlign(1), strlit_glob(sl->val),
+                               llvm::MaybeAlign(1), (uint64_t)count);
+            return;
+        }
         if (init && !al) return;      // Literal construction only here.
         if (!al) return;
         auto elem = [&](int64_t k, llvm::Value *v) {
@@ -652,10 +665,15 @@ struct CodeGenIR {
     // the full gs_sp machinery, which lands with the M3 completion.
     void emit_growable_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
         // This slice reads only literal construction; a copied array or a
-        // call giving its source is a later cut.
-        auto *al = i < vd->inits.size() && vd->inits[i]
-            ? Is<ArrayLit>(vd->inits[i]) : nullptr;
-        if (i < vd->inits.size() && vd->inits[i] && !al) return;
+        // call giving its source is a later cut. A u8[>..] may start from a
+        // string literal's bytes.
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        auto *al = init ? Is<ArrayLit>(init) : nullptr;
+        auto *sl = init ? Is<StrLit>(init) : nullptr;
+        auto *sub = def.type->arr->sub;
+        bool strinit = sl && sub
+            && (sub->intstorage == IS_U8 || sub->intstorage == IS_I8);
+        if (init && !al && !strinit) return;
         string sname = cat("gs_stk", stk_slots.size());
         auto *slot = new llvm::GlobalVariable(
             *mod, i8ptr(), /*isConstant=*/false,
@@ -672,6 +690,15 @@ struct CodeGenIR {
         b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
         auto &r = w.rzarrs[&def];
         r = { basea, lena, slot, def.type->arr->sub };
+        if (strinit) {
+            auto *n = llvm::ConstantInt::get(i64(), (uint64_t)sl->val.size());
+            if (!sl->val.empty())
+                b.CreateMemCpy(basev, llvm::MaybeAlign(1), strlit_glob(sl->val),
+                               llvm::MaybeAlign(1), (uint64_t)sl->val.size());
+            b.CreateStore(n, lena);
+            rz_sync_slot(r, basev, n);
+            return;
+        }
         // The literal's elements land in sequence; the fill form freezes
         // its value once (the C backend's FreezeFill contract,
         // codegen_construct.h:955) and repeats it in a loop.
@@ -967,6 +994,28 @@ struct CodeGenIR {
             // local: store the element at base+len, bump len, and keep the
             // runtime slot's top at the next free byte (the contract of
             // the runtime's section 1.2).
+            // assert(x) is the runtime abort on a false test (GS_E_ASSERT),
+            // exactly as the C backend's gs_abort check.
+            if (c->builtin == B_ASSERT && c->args.size() == 1) {
+                auto *v = GenExpr(c->args[0], w);
+                if (!v) return nullptr;
+                auto *bad = v->getType()->isIntegerTy(1)
+                    ? b.CreateNot(v, "assertnot")
+                    : b.CreateICmpEQ(v, llvm::ConstantInt::get(i64(), 0),
+                                     "assertnot");
+                auto *failbb = llvm::BasicBlock::Create(ctx, "assertfail", w.fn);
+                auto *okbb = llvm::BasicBlock::Create(ctx, "assertok", w.fn);
+                b.CreateCondBr(bad, failbb, okbb);
+                b.SetInsertPoint(failbb);
+                b.CreateCall(f_gs_abort, {
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 3),
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                           (uint64_t)c->line.line) });
+                b.CreateUnreachable();
+                b.SetInsertPoint(okbb);
+                return nullptr;
+            }
             if (c->builtin == B_PUSH && c->args.size() == 1) {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
@@ -1052,6 +1101,11 @@ struct CodeGenIR {
             if (c->spec) {
                 return EmitDirectCall(c, w, nullptr);
             }
+            // Any other builtin is a construct the walk does not emit: a
+            // void one would otherwise vanish from the program.
+            if (c->builtin >= 0 && c->builtin != B_PUSH)
+                Unsup(cat("a builtin call ", BuiltinByKind(c->builtin).name,
+                          " at line ", (long long)c->line.line));
             return nullptr;
         }
         if (auto *ib = Is<InlineBlock>(n)) return GenInline(ib, w);
@@ -1110,6 +1164,17 @@ struct CodeGenIR {
                 return phi;
             }
             return thenval ? thenval : elseval;
+        }
+        // Constructs this walk knows but does not lower yet are refused even
+        // when their type is void: dropping them would change the program.
+        switch (n->nkind) {
+            case NK_MatchExpr: case NK_LoopExpr: case NK_Defer:
+            case NK_ConstFor: case NK_ConstIf: case NK_ConstQuery:
+                Unsup(cat("a construct of kind ", (int)n->nkind, " at line ",
+                          (long long)n->line.line));
+                return nullptr;
+            default:
+                break;
         }
         // A slice where a value is wanted (an if arm, a block's tail): the
         // { data, len } the view names.
@@ -1304,21 +1369,19 @@ struct CodeGenIR {
         llvm::Value *lenv = nullptr;
         if (t && t->kind == TY_SLICE) {
             if (!is_slice_of_int(t) || !slice_value(an, w, sv))
-                return Unsup("a print of a slice the walk does not hold"), false;
+                return Unsup(cat("a print of a slice the walk does not hold at line ",
+                             (long long)an->line.line)), false;
             etype = sv.etype;
             lenv = sv.len;
         } else if (t && t->kind == TY_ARRAY) {
-            auto *obj = Is<Ident>(an);
-            auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef) : w.fixeds.end();
-            if (fit == w.fixeds.end())
-                return Unsup("a print of an array the walk does not hold"), false;
-            auto &fx = fit->second;
-            etype = fx.etype;
-            lenv = llvm::ConstantInt::get(i64(), (uint64_t)fx.count);
-            sv.data = b.CreateInBoundsGEP(
-                fx.base->getAllocatedType(), fx.base,
-                { llvm::ConstantInt::get(i64(), 0), llvm::ConstantInt::get(i64(), 0) },
-                "pvd");
+            // A fixed, length-stored or growable array local or global: the
+            // same view slice_value names (a growable one's length is the
+            // header's, read here at print time).
+            if (!slice_value(an, w, sv))
+                return Unsup(cat("a print of an array the walk does not hold at line ",
+                             (long long)an->line.line)), false;
+            etype = sv.etype;
+            lenv = sv.len;
         } else {
             return false;
         }
@@ -1587,13 +1650,18 @@ struct CodeGenIR {
         llvm::Value *tv = nullptr;
         if (ib->body) {
             for (auto *s : ib->body->stmts) GenStmt(s, w);
-            if (ib->body->tail) {
+            // The body's tail is its value, unless its type is void: then it
+            // is the last statement (a loop or a return), not a value.
+            Node *tn = ib->body->tail;
+            if (tn) {
+                bool valueless = !tn->exprtype || tn->exprtype->kind == TY_VOID;
                 if (sret) {
                     SliceVal sv;
-                    if (slice_value(ib->body->tail, w, sv))
-                        tv = slice_struct(sv.data, sv.len);
+                    if (slice_value(tn, w, sv)) tv = slice_struct(sv.data, sv.len);
+                } else if (valueless || Is<Return>(tn)) {
+                    GenStmt(tn, w);
                 } else {
-                    tv = GenExpr(ib->body->tail, w);
+                    tv = GenExpr(tn, w);
                 }
             }
         }
@@ -1792,7 +1860,7 @@ struct CodeGenIR {
             auto *condbb = llvm::BasicBlock::Create(ctx, "while_cond", fn);
             auto *bodybb = llvm::BasicBlock::Create(ctx, "while_body", fn);
             auto *donebb = llvm::BasicBlock::Create(ctx, "while_done", fn);
-            w.loops.push_back({condbb, donebb});
+            w.loops.push_back({condbb, donebb, condbb});
             b.CreateBr(condbb);
             b.SetInsertPoint(condbb);
             auto *cond = GenExpr(wh->cond, w);
@@ -1827,12 +1895,17 @@ struct CodeGenIR {
                 } else {
                     hi = GenExpr(fl->iter, w);
                 }
-                if (!lo || !hi) return;
+                if (!lo || !hi)
+                    return Unsup(cat("a for header at line ",
+                                     (long long)fl->line.line));
                 auto *fn = w.fn;
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
                 auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
                 auto *donebb = llvm::BasicBlock::Create(ctx, "for_done", fn);
-                w.loops.push_back({condbb, donebb});
+                // The counter's step runs in its own block: a `continue`
+                // lands there, so it steps exactly as a fallthrough does.
+                auto *incbb = llvm::BasicBlock::Create(ctx, "for_inc", fn);
+                w.loops.push_back({condbb, donebb, incbb});
                 b.CreateBr(condbb);
                 b.SetInsertPoint(condbb);
                 auto *iv = b.CreatePHI(i64(), 2, "for_i");
@@ -1847,12 +1920,11 @@ struct CodeGenIR {
                 }
                 if (fl->body) GenStmt(fl->body, w);
                 auto *body_end = b.GetInsertBlock();
-                if (!body_end->getTerminator()) {
-                    b.SetInsertPoint(body_end);
-                    auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "for_next");
-                    iv->addIncoming(next, body_end);
-                    b.CreateBr(condbb);
-                }
+                if (!body_end->getTerminator()) b.CreateBr(incbb);
+                b.SetInsertPoint(incbb);
+                auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "for_next");
+                iv->addIncoming(next, incbb);
+                b.CreateBr(condbb);
                 w.loops.pop_back();
                 b.SetInsertPoint(donebb);
                 return;
@@ -1882,7 +1954,10 @@ struct CodeGenIR {
                 bool isv = false;
                 if (!gr && !fa) {
                     isv = slice_value(fl->iter, w, sv);
-                    if (!isv) return;
+                    if (!isv)
+                        return Unsup(cat("a for loop over ",
+                                         type_label(fl->iter->exprtype),
+                                         " at line ", (long long)fl->line.line));
                 }
                 auto *iid = isv ? Is<Ident>(fl->iter) : nullptr;
                 bool reload = iid && iid->vdef && w.slices.count(iid->vdef);
@@ -1892,7 +1967,10 @@ struct CodeGenIR {
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
                 auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
                 auto *donebb = llvm::BasicBlock::Create(ctx, "for_done", fn);
-                w.loops.push_back({condbb, donebb});
+                // The counter's step runs in its own block: a `continue`
+                // lands there, so it steps exactly as a fallthrough does.
+                auto *incbb = llvm::BasicBlock::Create(ctx, "for_inc", fn);
+                w.loops.push_back({condbb, donebb, incbb});
                 b.CreateBr(condbb);
                 b.SetInsertPoint(condbb);
                 auto *iv = b.CreatePHI(i64(), 2, "for_i");
@@ -1937,12 +2015,11 @@ struct CodeGenIR {
                 }
                 if (fl->body) GenStmt(fl->body, w);
                 auto *body_end = b.GetInsertBlock();
-                if (!body_end->getTerminator()) {
-                    b.SetInsertPoint(body_end);
-                    auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "for_next");
-                    iv->addIncoming(next, body_end);
-                    b.CreateBr(condbb);
-                }
+                if (!body_end->getTerminator()) b.CreateBr(incbb);
+                b.SetInsertPoint(incbb);
+                auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "for_next");
+                iv->addIncoming(next, incbb);
+                b.CreateBr(condbb);
                 w.loops.pop_back();
                 b.SetInsertPoint(donebb);
                 return;
@@ -1966,7 +2043,8 @@ struct CodeGenIR {
         }
         if (auto *cont = Is<Continue>(n)) {
             if (w.loops.empty()) return;
-            b.CreateBr(w.loops.back().condbb);
+            auto &lp = w.loops.back();
+            b.CreateBr(lp.contbb ? lp.contbb : lp.condbb);
             return;
         }
         if (auto *inc = Is<IncDec>(n)) {
@@ -1975,7 +2053,21 @@ struct CodeGenIR {
             auto lit = w.locals.find(lv->vdef);
             if (lit == w.locals.end()) {
                 auto pit = w.params.find(lv->vdef);
-                if (pit == w.params.end()) return;
+                if (pit == w.params.end()) {
+                    // A program global: its own storage, not a stack slot.
+                    auto git = global_vars.find(lv->vdef);
+                    if (git == global_vars.end())
+                        return Unsup(cat("an increment of a variable the walk "
+                                         "does not hold at line ",
+                                         (long long)inc->line.line));
+                    auto *one = llvm::ConstantInt::get(i64(), 1);
+                    auto *cur = b.CreateLoad(i64(), git->second.gv,
+                                             llvm::Twine(lv->vdef->name));
+                    auto *nv = inc->op == T_INC ? b.CreateAdd(cur, one, "inc")
+                                                : b.CreateSub(cur, one, "dec");
+                    b.CreateStore(nv, git->second.gv);
+                    return;
+                }
                 auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
                 b.CreateStore(pit->second, alloca);
                 w.locals[lv->vdef] = alloca;
