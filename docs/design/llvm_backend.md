@@ -160,9 +160,10 @@ slice result returns the struct itself; a multi-result signature with a
 slice still refuses. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse (13 so far). 29 of the codegen output fixtures
-pass through `--emit-ir`; the rest need the remaining M3 shapes (struct
-fields of slices, struct parameters and copies, nested aggregates, arrays
-returned and element-wise operations) and the M4 modules. See
+in the output now refuse. 29 of the codegen output fixtures pass through
+`--emit-ir`; the largest remaining gaps are `append`/`pop`, references,
+limited arrays, struct parameters and copies, struct fields of slices or
+references, arrays returned by calls, and rendering of floats and structs,
+plus the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.
