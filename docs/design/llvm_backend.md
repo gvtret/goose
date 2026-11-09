@@ -133,7 +133,9 @@ format hooks one write per line (int values and string literals; the
 rest of print's alphabet lands with its shapes). Multi-result calls
 use out-pointers for results 1.. (result 0 is the call's value), and
 signed `/`, `%` follow the runtime (Euclidean `%`, checked zero and
-i64.min / -1), `>>` is arithmetic, `&&`/`||` short-circuit, and a
+i64.min / -1), `>>` is arithmetic (logical for an unsigned left
+operand), `<<`, `&`, `|`, `^` and `~` (and their compound forms) work,
+`&&`/`||` short-circuit, and a
 callee's return inside an inlined body meets its call's merge in a
 PHI. Index assignments (plain and compound) store into fixed and
 growable int arrays with the same checks as reads, and a `continue`

@@ -528,7 +528,7 @@ struct CodeGenIR {
     // bound-type slice and are left unwalked for now.
     llvm::Value *GenAsCast(AsCast *ac, FnWalk &w) {
         auto *st = ac->child->exprtype;
-        if (!st || st->kind != TY_INT || st->intstorage == IS_U64) return nullptr;
+        if (!st || st->kind != TY_INT) return nullptr;
         auto *c = GenExpr(ac->child, w);
         if (!c) return nullptr;
         // An index or bound type (`u32 in arr`, `u32 upto arr`): check the
@@ -568,17 +568,29 @@ struct CodeGenIR {
             || ac->totype->intstorage == IS_VARINT)
             return nullptr;
         auto tt = ac->totype->intstorage;
+        // u64 is the one source whose values exceed the int64 range the
+        // signed checks compute in: its narrowing compares unsigned (the
+        // C backend's GS_RANGE_U), and a u64 target needs no check.
+        bool su64 = st->intstorage == IS_U64;
         auto [slo, shi] = IntRange(st->intstorage);
         auto [lo, hi] = IntRange(tt);
-        if (!ac->unchecked && (slo < lo || shi > hi)) {
+        bool need = !ac->unchecked && (su64 ? tt != IS_U64
+                                            : (slo < lo || shi > hi));
+        if (need) {
             auto *one32 = llvm::ConstantInt::get(
                 llvm::Type::getInt32Ty(ctx), 0);
             auto *nullptrv = llvm::ConstantPointerNull::get(i8ptr());
             auto *okbb = llvm::BasicBlock::Create(ctx, "asok", w.fn);
             auto *failbb = llvm::BasicBlock::Create(ctx, "asfail", w.fn);
-            auto *lobr = b.CreateICmpSGE(c, llvm::ConstantInt::get(i64(), (uint64_t)lo));
-            auto *hibr = b.CreateICmpSLE(c, llvm::ConstantInt::get(i64(), (uint64_t)hi));
-            auto *inr = b.CreateAnd(lobr, hibr, "inrange");
+            llvm::Value *inr = nullptr;
+            if (su64) {
+                inr = b.CreateICmpULE(c,
+                    llvm::ConstantInt::get(i64(), (uint64_t)hi), "inrange");
+            } else {
+                auto *lobr = b.CreateICmpSGE(c, llvm::ConstantInt::get(i64(), (uint64_t)lo));
+                auto *hibr = b.CreateICmpSLE(c, llvm::ConstantInt::get(i64(), (uint64_t)hi));
+                inr = b.CreateAnd(lobr, hibr, "inrange");
+            }
             b.CreateCondBr(inr, okbb, failbb);
             b.SetInsertPoint(failbb);
             b.CreateCall(f_gs_asfail_i, {
@@ -781,6 +793,9 @@ struct CodeGenIR {
             if (!c) return nullptr;
             switch (un->op) {
                 case T_MINUS: return b.CreateNeg(c, "neg");
+                case T_BITNOT:
+                    return b.CreateXor(c, llvm::ConstantInt::get(i64(), (uint64_t)-1),
+                                       "bitnot");
                 case T_NOT: {
                     // `c` may be i1 (from a comparison) or i64 (from an
                     // integer expression).  Normalise to i1, invert, then
@@ -836,6 +851,13 @@ struct CodeGenIR {
                     return is_uint_ty(bin->left->exprtype) ? b.CreateLShr(l, sh, "shr")
                                                            : b.CreateAShr(l, sh, "shr");
                 }
+                case T_SHL: {
+                    auto *sh = b.CreateAnd(r, llvm::ConstantInt::get(i64(), 63), "shn");
+                    return b.CreateShl(l, sh, "shl");
+                }
+                case T_BITAND: return b.CreateAnd(l, r, "bitand");
+                case T_BITOR:  return b.CreateOr(l, r, "bitor");
+                case T_XOR:    return b.CreateXor(l, r, "xor");
                 case T_EQ:    return b.CreateICmpEQ(l, r, "eq");
                 case T_NEQ:   return b.CreateICmpNE(l, r, "ne");
                 case T_LT:    return b.CreateICmpSLT(l, r, "lt");
@@ -1512,6 +1534,15 @@ struct CodeGenIR {
             case T_MULEQ:   return b.CreateMul(cur, rhs, "muleq");
             case T_DIVEQ:   return GenDivMod(T_DIV, cur, rhs, w);
             case T_MODEQ:   return GenDivMod(T_MOD, cur, rhs, w);
+            case T_ANDEQ:   return b.CreateAnd(cur, rhs, "andeq");
+            case T_OREQ:    return b.CreateOr(cur, rhs, "oreq");
+            case T_XOREQ:   return b.CreateXor(cur, rhs, "xoreq");
+            case T_SHLEQ:
+                return b.CreateShl(cur,
+                    b.CreateAnd(rhs, llvm::ConstantInt::get(i64(), 63), "shn"), "shleq");
+            case T_SHREQ:
+                return b.CreateAShr(cur,
+                    b.CreateAnd(rhs, llvm::ConstantInt::get(i64(), 63), "shn"), "shreq");
             default:        return nullptr;
         }
     }
