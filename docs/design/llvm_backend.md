@@ -145,11 +145,13 @@ field reads, plain and compound field stores work on them. A slice
 range over a fixed, growable or slice subject (`a[lo..hi]`, open and
 `^k` bounds), its `.len`, element reads and writes, `for x in s`,
 re-pointing, and print (raw bytes for `u8`, `[a, b, c]` otherwise) work.
-Fixtures that passed only because their unemitted statements or locals
-did not show in the output now refuse (13 so far). 22 of the codegen
-output fixtures pass through `--emit-ir`; the rest need the remaining
-M3 shapes (slice parameters, returns and struct fields, struct
-parameters and copies, nested aggregates, arrays returned and
-element-wise operations, strings as values) and the M4 modules. See
+A string literal is such a view of its constant bytes. `goose llc`
+passes `-relocation-model=pic`, so a private constant's address links into
+the host's PIE executable. Fixtures that passed only because their
+unemitted statements or locals did not show in the output now refuse (13
+so far). 26 of the codegen output fixtures pass through `--emit-ir`; the
+rest need the remaining M3 shapes (slice parameters and returns, struct
+fields of slices, struct parameters and copies, nested aggregates, arrays
+returned and element-wise operations) and the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.

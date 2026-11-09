@@ -1110,9 +1110,8 @@ struct CodeGenIR {
         return b.CreateSelect(b.CreateICmpSLT(rem, zero), adj, rem, "mod");
     }
 
-    // Appends source bytes at the print cursor with one store per byte. Not
-    // memcpy from a private global: llc's static relocation model would put
-    // that global's absolute address in the object, which a PIE link rejects.
+    // Appends source bytes at the print cursor with one store per byte: no
+    // global constant and no memcpy calls for text the line itself carries.
     void emit_print_bytes(llvm::Value *cura, string_view bytes) {
         auto *i8ty = llvm::Type::getInt8Ty(ctx);
         auto *cur = b.CreateLoad(i8ptr(), cura);
@@ -1149,6 +1148,19 @@ struct CodeGenIR {
     // one of the array locals the walk holds, or a range over another such
     // view. False when the walk does not hold the subject.
     bool slice_value(Node *n, FnWalk &w, SliceVal &out) {
+        if (auto *sl = Is<StrLit>(n)) {
+            // A literal's bytes are one internal constant; the view is
+            // { bytes, length }.
+            if (!n->exprtype || n->exprtype->kind != TY_SLICE) return false;
+            auto *gv = strlit_glob(sl->val);
+            out.data = b.CreateInBoundsGEP(
+                gv->getValueType(), gv,
+                { llvm::ConstantInt::get(i64(), 0), llvm::ConstantInt::get(i64(), 0) },
+                "svd");
+            out.len = llvm::ConstantInt::get(i64(), (uint64_t)sl->val.size());
+            out.etype = n->exprtype->sub;
+            return true;
+        }
         if (auto *obj = Is<Ident>(n)) {
             if (!obj->vdef) return false;
             if (auto sit = w.slices.find(obj->vdef); sit != w.slices.end()) {

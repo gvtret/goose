@@ -1416,6 +1416,12 @@ static int RunLlc(const vector<string> &args, const string &exedir) {
     // Step 1: llc .ll -> .s
     vector<string> llcargv = { llc, infile, "-o", asmfile,
                                cat("-mtriple=", triple), "-filetype=asm" };
+#ifndef _WIN32
+    // The host linker builds a PIE by default, so static codegen's absolute
+    // relocations against .rodata (a private string literal's address, say)
+    // would be rejected at link time.
+    llcargv.push_back("-relocation-model=pic");
+#endif
     if (verbose) fprintf(stderr, "%s\n", CommandLineText(llcargv).c_str());
     auto r1 = RunProcess(llcargv, "", verbose);
     if (r1.code != 0) {
