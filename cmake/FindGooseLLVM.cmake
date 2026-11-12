@@ -1,4 +1,4 @@
-# FindGooseLLVM — locates LLVM >= 15 and its tools.
+# FindGooseLLVM: locates LLVM >= 15 and its tools.
 #
 # On success sets:
 #   GooseLLVM_FOUND        TRUE
@@ -42,7 +42,7 @@ if(NOT GOOSE_LLVM_FOUND)
         return()
     endif()
 
-    # Parse "15.0.1" → major = 15
+    # Parse "15.0.1" into major = 15
     string(REGEX MATCH "^([0-9]+)" _llvm_major_match "${_llvm_version}")
     set(_llvm_major "${_llvm_major_match}")
     if(_llvm_major LESS 15)

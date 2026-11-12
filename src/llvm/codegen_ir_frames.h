@@ -2,14 +2,14 @@
 //
 // Maps the C backend's frame and data-stack conventions to LLVM:
 //
-// * `gs_sp` — the i64 index into the TLS `@gs_stks` array, passed as
+// * `gs_sp` - the i64 index into the TLS `@gs_stks` array, passed as
 //   every stack-using function's first argument (codegen_frames.h:623
 //   in the C backend: `int64_t gs_sp`).
-// * `gs_at` — an i8* to a `gs_loc { i64 file, i64 line }` struct,
+// * `gs_at` - an i8* to a `gs_loc { i64 file, i64 line }` struct,
 //   the caller's location for a library function's abort message.
-// * `gs_stack` — the C `struct { i8* base; i64 top; i64 limit }`,
+// * `gs_stack` - the C `struct { i8* base; i64 top; i64 limit }`,
 //   one per thread program, held in `@gs_stks[gs_sp + k]` with
-//   per-function constant `k` (the §10.3 hidden-stack-argument
+//   per-function constant `k` (the section 10.3 hidden-stack-argument
 //   strategy).
 //
 // The TLS globals (gs_gl, gs_stks, gs_nstks, gs_current_thread_id,
