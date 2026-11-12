@@ -882,8 +882,15 @@ struct CodeGenIR {
                 case T_BITAND: return b.CreateAnd(l, r, "bitand");
                 case T_BITOR:  return b.CreateOr(l, r, "bitor");
                 case T_XOR:    return b.CreateXor(l, r, "xor");
-                case T_EQ:    return b.CreateICmpEQ(l, r, "eq");
-                case T_NEQ:   return b.CreateICmpNE(l, r, "ne");
+                case T_EQ:
+                case T_NEQ: {
+                    auto *lt = bin->left->exprtype;
+                    if (lt && is_flat_int_struct(lt))
+                        return struct_eq(l, r, lt->struc->inst,
+                                         bin->op == T_NEQ);
+                    return bin->op == T_EQ ? b.CreateICmpEQ(l, r, "eq")
+                                           : b.CreateICmpNE(l, r, "ne");
+                }
                 case T_LT:    return b.CreateICmpSLT(l, r, "lt");
                 case T_GT:    return b.CreateICmpSGT(l, r, "gt");
                 case T_LTEQ:  return b.CreateICmpSLE(l, r, "le");
@@ -1589,6 +1596,19 @@ struct CodeGenIR {
             return true;
         }
         return false;
+    }
+
+    // Structural equality of two flat int structs: field by field.
+    llvm::Value *struct_eq(llvm::Value *l, llvm::Value *r, StructInst *in,
+                           bool ne) {
+        auto *i1 = llvm::Type::getInt1Ty(ctx);
+        llvm::Value *eq = llvm::ConstantInt::getTrue(i1);
+        for (size_t f = 0; f < in->ftypes.size(); ++f) {
+            auto *a = b.CreateExtractValue(l, (unsigned)f, "sef");
+            auto *c = b.CreateExtractValue(r, (unsigned)f, "ser");
+            eq = b.CreateAnd(eq, b.CreateICmpEQ(a, c, "seq"), "seqand");
+        }
+        return ne ? b.CreateNot(eq, "sne") : eq;
     }
 
     // The field a literal's init names: by name, or by position for a

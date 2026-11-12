@@ -19,4 +19,7 @@ fn main() {
     s.a = 10;
     print(s.a, " ", s.b, " ", p.a);
     print(sum(swap(p)));
+    let t = Pair { a: 3, b: 4 };
+    print(t == p, " ", t != p);
+    print(swap(p) == Pair { a: 4, b: 3 });
 }
