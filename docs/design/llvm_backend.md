@@ -157,13 +157,18 @@ construct the walk does not emit
 is refused with its kind and line (`--emit-ir` fails, no module is
 written) instead of being dropped; a builtin other than `push`,
 `append`, `pop`, `pop_n`, `assert`
-and `print`, and `loop`, `match` or `defer`, count as such constructs.
-Flat int-field structs
-(no padding, fixed size) are values: a literal builds them, field reads,
-plain and compound field stores work on them, a copy moves the whole
-value between locals, and one crosses a call by value (a struct-shaped
+and `print`, and `match`, `defer` or a `loop` that carries a value, count
+as such constructs. A `loop` statement emits as a
+body block its `break`s leave for a done block, which is what a
+tail-recursive function becomes. Flat structs
+(no padding, fixed size, every field an int or another such struct) are
+values: a literal builds them, field reads, plain and compound field
+stores work on a field path to the leaf (`a`, `a.b`, `a.b.c`) at the
+leaf's own width, a copy moves the whole value between locals, and one
+crosses a call by value (a struct-shaped
 LLVM parameter, a single struct result, the callee's own copy in an
-alloca). A slice
+alloca). An int parameter gets a slot of the body's own from entry, so a
+loop that reassigns it each round reads what the last round stored. A slice
 (`T[:]` of int) is a `{ data, len }` view: a local is built from a
 range over a fixed, growable or slice subject (`a[lo..hi]`, open and
 `^k` bounds), its `.len`, element reads and writes, `for x in s`,
@@ -176,8 +181,9 @@ slice result returns the struct itself; a multi-result signature with a
 slice still refuses. A reference to an int (`T&`) is the C backend's
 pointer: it crosses a call as one (`i8*`, the argument the variable's
 slot), a parameter's holder is the argument, a `let px .= n` or
-`var r .= n` binding stores the slot of the variable its initializer
-names (the checker's synthetic `&` is what the walk reads through), a
+`var r .= n` binding stores the slot of the variable or the struct
+field its initializer names (an `&` is what the walk reads through,
+whether the checker's synthetic one or the source's own), a
 read loads the pointee at its own width, a plain assignment and `+=`
 write it, `++` steps it, and a rebind (`r .= m`) stores the new slot
 into the holder. A reference to a growable array (`T[>..]&`) is the pair
@@ -198,7 +204,7 @@ a loop body reuses its slot instead of walking the native stack off its
 end. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 36 of the codegen output fixtures pass through
+in the output now refuse. 38 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

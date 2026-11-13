@@ -353,16 +353,26 @@ struct CodeGenIR {
     }
 
     // A struct whose storage is plain: fixed size, flat, no padding, and
-    // every field an int. Its fields are in declaration order, so a field
-    // index is its position in st->fields.
-    static bool is_flat_int_struct(TypeExpr *t) {
+    // every field an int or another such struct (section 4.4 allows a field
+    // of any type the struct holds inline). Its fields are in declaration
+    // order, so a field index is its position in st->fields.
+    static bool is_flat_struct(TypeExpr *t) {
         if (!t || t->kind != TY_STRUCT || !t->struc || !t->struc->inst) return false;
         auto *in = t->struc->inst;
         if (in->sclass != SC_FIXED || !in->flat || in->failed || !in->st) return false;
         if (in->st->fields.empty() || in->ftypes.size() != in->st->fields.size()) return false;
-        for (size_t i = 0; i < in->st->fields.size(); ++i)
-            if (in->st->fields[i].ispad || !is_int_ty(in->ftypes[i])) return false;
+        for (size_t i = 0; i < in->st->fields.size(); ++i) {
+            if (in->st->fields[i].ispad) return false;
+            if (!is_int_ty(in->ftypes[i]) && !is_flat_struct(in->ftypes[i]))
+                return false;
+        }
         return true;
+    }
+
+    // A field's LLVM type: an int at its storage width, or a nested struct's
+    // own record.
+    llvm::Type *field_ll_ty(TypeExpr *ft) {
+        return is_int_ty(ft) ? int_ll_ty(ft) : struct_ll_ty(ft->struc->inst);
     }
 
     // A slice the walk holds: a view of int elements, { data, len }.
@@ -553,7 +563,7 @@ struct CodeGenIR {
                     argtys.push_back(i8ptr());
                 }
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
-                else if (is_flat_int_struct(t)) argtys.push_back(struct_ty(t));
+                else if (is_flat_struct(t)) argtys.push_back(struct_ty(t));
                 else supported = false;
             }
             // Return protocol: ret0 is the call's value, every other
@@ -561,13 +571,13 @@ struct CodeGenIR {
             // slice result comes back as the { data, len } it is.
             bool allretint = true;
             for (auto *rt : sp->rets)
-                if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_flat_int_struct(rt))
+                if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_flat_struct(rt))
                     allretint = false;
             llvm::Type *retty = voidty();
             if (!sp->rets.empty()) {
                 if (sp->rets.size() == 1 && is_slice_of_int(sp->rets[0]))
                     retty = slice_ll_ty();
-                else if (sp->rets.size() == 1 && is_flat_int_struct(sp->rets[0]))
+                else if (sp->rets.size() == 1 && is_flat_struct(sp->rets[0]))
                     retty = struct_ty(sp->rets[0]);
                 else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
                          && allretint)
@@ -632,14 +642,21 @@ struct CodeGenIR {
                     b.CreateStore(fn->getArg(argidx), slot);
                     w.refs[sp->params[i]] = { slot, pt->ref->sub };
                     argidx += 1;
-                } else if (is_flat_int_struct(pt)) {
+                } else if (is_flat_struct(pt)) {
                     auto *slot = b.CreateAlloca(struct_ty(pt), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(argidx), slot);
                     w.structs[sp->params[i]] = { slot, pt->struc->inst };
                     argidx += 1;
                 } else if (!pt || is_int_ty(pt) || is_bool_ty(pt)) {
-                    w.params[sp->params[i]] = fn->getArg(argidx);
+                    // An int parameter lives in a slot of the body's own from
+                    // the start: a loop that reassigns it each round (the
+                    // tail-recursion form) then reads what the last round
+                    // stored, not the value the call arrived with.
+                    auto *slot = entry_alloca(w, i64(),
+                                             llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(widen_store(pt, fn->getArg(argidx)), slot);
+                    w.locals[sp->params[i]] = slot;
                     argidx += 1;
                 }
             }
@@ -1107,7 +1124,7 @@ struct CodeGenIR {
                 case T_EQ:
                 case T_NEQ: {
                     auto *lt = bin->left->exprtype;
-                    if (lt && is_flat_int_struct(lt))
+                    if (lt && is_flat_struct(lt))
                         return struct_eq(l, r, lt->struc->inst,
                                          bin->op == T_NEQ);
                     return bin->op == T_EQ ? b.CreateICmpEQ(l, r, "eq")
@@ -1159,19 +1176,10 @@ struct CodeGenIR {
             return nullptr;
         }
         if (auto *dt = Is<Dot>(n)) {
-            // A field of a flat int struct local.
+            // A field of a flat struct: a field path from a local base, the
+            // leaf read at its own width.
             if (dt->IsField()) {
-                auto *obj = Is<Ident>(dt->obj);
-                auto sit = obj && obj->vdef ? w.structs.find(obj->vdef) : w.structs.end();
-                if (sit == w.structs.end() || dt->fieldidx < 0) return nullptr;
-                auto &sl = sit->second;
-                auto f = (unsigned)dt->fieldidx;
-                auto *et = int_ll_ty(sl.inst->ftypes[f]);
-                auto *p = b.CreateStructGEP(sl.base->getAllocatedType(), sl.base, f);
-                auto *v = b.CreateLoad(et, p, llvm::Twine(obj->vdef->name, ".f"));
-                if (et == i64()) return v;
-                return is_uint_ty(sl.inst->ftypes[f]) ? b.CreateZExt(v, i64())
-                                                      : b.CreateSExt(v, i64());
+                if (auto *v = GenFieldRead(dt, w)) return v;
             }
             // A member expression: this slice lowers `.len` and `.cap`
             // (member is a BuiltinKind, ast.h) on an array local the walk
@@ -1739,7 +1747,7 @@ struct CodeGenIR {
         }
         // A flat int struct where a value is wanted (an argument, an if
         // arm): the value the literal, local or call builds.
-        if (n->exprtype && is_flat_int_struct(n->exprtype)) {
+        if (n->exprtype && is_flat_struct(n->exprtype)) {
             llvm::Value *sv = nullptr;
             StructInst *si = nullptr;
             if (struct_value(n, w, sv, si)) return sv;
@@ -1951,7 +1959,7 @@ struct CodeGenIR {
         // (TypeCheck::AutoRef, typecheck_exprs.h:772): the reference names
         // what that `&` covers.
         if (auto *u = init ? Is<Unary>(init) : nullptr)
-            if (u->op == T_BITAND && u->synth)
+            if (u->op == T_BITAND)
                 init = u->child;
         auto *id = init ? Is<Ident>(init) : nullptr;
         if (is_growable_i64(ptee)) {
@@ -1978,6 +1986,16 @@ struct CodeGenIR {
             else {
                 auto git = global_vars.find(id->vdef);
                 if (git != global_vars.end()) ptr = git->second.gv;
+            }
+        } else if (auto *dt = init ? Is<Dot>(init) : nullptr) {
+            // A field of a struct: the address the path walks ends at, with
+            // the leaf's own width for every read and write through it.
+            llvm::Value *addr = nullptr;
+            StructInst *oi = nullptr;
+            TypeExpr *leaf = nullptr;
+            if (field_path_addr(dt, w, addr, oi, leaf) && is_int_ty(leaf)) {
+                ptr = addr;
+                ptee = leaf;
             }
         }
         if (!ptr)
@@ -2083,7 +2101,7 @@ struct CodeGenIR {
 
     llvm::StructType *struct_ll_ty(StructInst *in) {
         std::vector<llvm::Type *> elems;
-        for (auto *ft : in->ftypes) elems.push_back(int_ll_ty(ft));
+        for (auto *ft : in->ftypes) elems.push_back(field_ll_ty(ft));
         return llvm::StructType::get(ctx, elems);
     }
 
@@ -2096,7 +2114,7 @@ struct CodeGenIR {
     // body's PHI. False when the walk does not hold the value.
     bool struct_value(Node *n, FnWalk &w, llvm::Value *&out, StructInst *&inst) {
         if (auto *bk = Is<Block>(n)) {
-            if (!n->exprtype || !is_flat_int_struct(n->exprtype)) return false;
+            if (!n->exprtype || !is_flat_struct(n->exprtype)) return false;
             auto *v = GenExpr(n, w);
             if (!v) return false;
             out = v;
@@ -2110,8 +2128,19 @@ struct CodeGenIR {
             out = b.CreateLoad(struct_ll_ty(inst), sit->second.base, "stv");
             return true;
         }
+        if (auto *dt = Is<Dot>(n)) {
+            // A struct-typed field of a path: the whole value at its place.
+            llvm::Value *addr = nullptr;
+            StructInst *oi = nullptr;
+            TypeExpr *leaf = nullptr;
+            if (!field_path_addr(dt, w, addr, oi, leaf) || !is_flat_struct(leaf))
+                return false;
+            inst = leaf->struc->inst;
+            out = b.CreateLoad(struct_ll_ty(inst), addr, "stv");
+            return true;
+        }
         if (auto *sl = Is<StructLit>(n)) {
-            if (!sl->exprtype || !is_flat_int_struct(sl->exprtype)) return false;
+            if (!sl->exprtype || !is_flat_struct(sl->exprtype)) return false;
             inst = sl->exprtype->struc->inst;
             if (sl->defaultall || sl->implicit
                 || sl->inits.size() != inst->st->fields.size())
@@ -2125,19 +2154,27 @@ struct CodeGenIR {
             }
             auto *slot = entry_alloca(w, struct_ll_ty(inst), "sttmp");
             for (size_t k = 0; k < sl->inits.size(); ++k) {
+                auto f = (unsigned)at[k];
+                auto *p = b.CreateStructGEP(struct_ll_ty(inst), slot, f);
+                if (is_flat_struct(inst->ftypes[f])) {
+                    // A nested struct field takes the whole value it built.
+                    llvm::Value *fv = nullptr;
+                    StructInst *fi = nullptr;
+                    if (!struct_value(sl->inits[k].val, w, fv, fi)) return false;
+                    b.CreateStore(fv, p);
+                    continue;
+                }
                 auto *v = GenExpr(sl->inits[k].val, w);
                 if (!v) return false;
-                auto f = (unsigned)at[k];
                 auto *et = int_ll_ty(inst->ftypes[f]);
-                b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et),
-                              b.CreateStructGEP(struct_ll_ty(inst), slot, f));
+                b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et), p);
             }
             out = b.CreateLoad(struct_ll_ty(inst), slot, "stv");
             return true;
         }
         if (auto *c = Is<Call>(n)) {
             if (!c->spec || c->spec->rets.size() != 1
-                || !is_flat_int_struct(c->spec->rets[0])) return false;
+                || !is_flat_struct(c->spec->rets[0])) return false;
             auto *v = EmitDirectCall(c, w, nullptr);
             if (!v) return false;
             out = v;
@@ -2146,7 +2183,7 @@ struct CodeGenIR {
         }
         if (auto *ib = Is<InlineBlock>(n)) {
             if (!ib->spec || ib->spec->rets.size() != 1
-                || !is_flat_int_struct(ib->spec->rets[0])) return false;
+                || !is_flat_struct(ib->spec->rets[0])) return false;
             auto *v = GenInline(ib, w);
             if (!v || v->getType() != struct_ty(ib->spec->rets[0])) return false;
             out = v;
@@ -2225,26 +2262,94 @@ struct CodeGenIR {
     }
 
     // `p.f = v` or `p.f op= v` on a flat int struct local.
+    // The address of the value a field path names, with the struct it lives
+    // in and the type of the leaf: `a`, `a.b`, `a.b.c`. The base is a struct
+    // local or the temporary a struct value was built in; every step is a
+    // field of the struct before it, and a non-struct field may only end the
+    // path. False where the walk does not hold such a place.
+    bool field_path_addr(Node *n, FnWalk &w, llvm::Value *&addr,
+                         StructInst *&inst, TypeExpr *&leaf) {
+        auto *dt = Is<Dot>(n);
+        if (!dt || !dt->IsField() || dt->fieldidx < 0) return false;
+        // The object side: the base local, or one more field of the path.
+        if (auto *odt = Is<Dot>(dt->obj)) {
+            llvm::Value *oa = nullptr;
+            StructInst *oi = nullptr;
+            TypeExpr *ol = nullptr;
+            if (!field_path_addr(odt, w, oa, oi, ol)) return false;
+            if (!is_flat_struct(ol)) return false;
+            inst = ol->struc->inst;
+            addr = oa;
+        } else {
+            auto *obj = Is<Ident>(dt->obj);
+            auto sit = obj && obj->vdef ? w.structs.find(obj->vdef)
+                                        : w.structs.end();
+            if (sit != w.structs.end()) {
+                inst = sit->second.inst;
+                addr = sit->second.base;
+            } else {
+                // A struct value that is not a local: a call's result or a
+                // literal. It is built in a temporary of its own, whose
+                // address the path walks.
+                llvm::Value *sv = nullptr;
+                StructInst *si = nullptr;
+                if (!struct_value(dt->obj, w, sv, si)) return false;
+                auto *tmp = entry_alloca(w, struct_ll_ty(si), "stpath");
+                b.CreateStore(sv, tmp);
+                inst = si;
+                addr = tmp;
+            }
+        }
+        auto f = (unsigned)dt->fieldidx;
+        if (f >= inst->ftypes.size()) return false;
+        leaf = inst->ftypes[f];
+        addr = b.CreateStructGEP(struct_ll_ty(inst), addr, f, "fldp");
+        return true;
+    }
+
+    // A field read: the leaf's value at its own width, widened to the walk's
+    // i64 (a nested struct comes back as the whole value, for the caller's
+    // own struct path).
+    llvm::Value *GenFieldRead(Dot *dt, FnWalk &w) {
+        llvm::Value *addr = nullptr;
+        StructInst *inst = nullptr;
+        TypeExpr *leaf = nullptr;
+        if (!field_path_addr(dt, w, addr, inst, leaf)) return nullptr;
+        if (is_flat_struct(leaf))
+            return b.CreateLoad(struct_ll_ty(leaf->struc->inst), addr, "stfld");
+        auto *et = int_ll_ty(leaf);
+        auto *v = b.CreateLoad(et, addr, "fld");
+        if (et == i64()) return v;
+        return is_uint_ty(leaf) ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
+    }
+
     void GenFieldStore(Assign *as, Dot *dt, FnWalk &w) {
-        auto *obj = Is<Ident>(dt->obj);
-        auto sit = obj && obj->vdef ? w.structs.find(obj->vdef) : w.structs.end();
-        if (sit == w.structs.end() || dt->fieldidx < 0 || !dt->IsField())
+        llvm::Value *addr = nullptr;
+        StructInst *inst = nullptr;
+        TypeExpr *leaf = nullptr;
+        if (!field_path_addr(dt, w, addr, inst, leaf))
             return Unsup("a field store into a value the walk does not hold");
+        if (is_flat_struct(leaf)) {
+            if (as->op != T_ASSIGN)
+                return Unsup("a compound assignment to a struct field");
+            llvm::Value *sv = nullptr;
+            StructInst *si = nullptr;
+            if (!struct_value(as->rhs, w, sv, si))
+                return Unsup("a struct value the walk does not build");
+            b.CreateStore(sv, addr);
+            return;
+        }
         auto *rhs = GenExpr(as->rhs, w);
         if (!rhs) return;
-        auto &sl = sit->second;
-        auto f = (unsigned)dt->fieldidx;
-        auto *et = int_ll_ty(sl.inst->ftypes[f]);
-        auto *p = b.CreateStructGEP(sl.base->getAllocatedType(), sl.base, f);
+        auto *et = int_ll_ty(leaf);
         if (as->op != T_ASSIGN) {
-            auto *cur = b.CreateLoad(et, p, "fcur");
-            auto *cur64 = is_uint_ty(sl.inst->ftypes[f]) ? b.CreateZExt(cur, i64())
-                                                         : b.CreateSExt(cur, i64());
-            rhs = ArithEq(as->op, cur64, rhs, w,
-                          is_uint_ty(sl.inst->ftypes[f]));
+            auto *cur = b.CreateLoad(et, addr, "fcur");
+            auto *cur64 = is_uint_ty(leaf) ? b.CreateZExt(cur, i64())
+                                           : b.CreateSExt(cur, i64());
+            rhs = ArithEq(as->op, cur64, rhs, w, is_uint_ty(leaf));
             if (!rhs) return Unsup("a compound field assignment of this operator");
         }
-        b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
+        b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), addr);
     }
 
     // The value a compound assignment stores: `cur op rhs`, null for an
@@ -2372,13 +2477,13 @@ struct CodeGenIR {
         if (!sp) return nullptr;
         for (auto *t : sp->argtypes)
             if (!is_int_ty(t) && !is_bool_ty(t) && !is_slice_of_int(t)
-                && !is_flat_int_struct(t)
+                && !is_flat_struct(t)
                 && !(t && t->kind == TY_REF
                      && (is_int_ty(t->ref->sub)
                          || is_growable_i64(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
-                && !is_flat_int_struct(rt)) return nullptr;
+                && !is_flat_struct(rt)) return nullptr;
         auto nrets = sp->rets.size();
         if (nrets > 1 && (!outs || outs->size() < nrets)) return nullptr;
         string callee = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
@@ -2404,7 +2509,7 @@ struct CodeGenIR {
                 args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
                 continue;
             }
-            if (is_flat_int_struct(pt)) {
+            if (is_flat_struct(pt)) {
                 llvm::Value *sv = nullptr;
                 StructInst *si = nullptr;
                 if (!struct_value(a, w, sv, si) || si != pt->struc->inst)
@@ -2418,7 +2523,7 @@ struct CodeGenIR {
                 // or a reference's pair loaded from its holder.
                 auto *a2 = a;
                 if (auto *u = Is<Unary>(a2))
-                    if (u->op == T_BITAND && u->synth) a2 = u->child;
+                    if (u->op == T_BITAND) a2 = u->child;
                 auto *id = Is<Ident>(a2);
                 llvm::Value *hp = nullptr;
                 llvm::Value *spv = nullptr;
@@ -2434,7 +2539,7 @@ struct CodeGenIR {
                 // reference, whose stored pointer is.
                 auto *a2 = a;
                 if (auto *u = Is<Unary>(a2))
-                    if (u->op == T_BITAND && u->synth) a2 = u->child;
+                    if (u->op == T_BITAND) a2 = u->child;
                 auto *id = Is<Ident>(a2);
                 llvm::Value *ptr = nullptr;
                 if (id && id->vdef) {
@@ -2481,7 +2586,7 @@ struct CodeGenIR {
         bool sret = ib->spec && ib->spec->rets.size() == 1
                  && is_slice_of_int(ib->spec->rets[0]);
         bool stret = ib->spec && ib->spec->rets.size() == 1
-                  && is_flat_int_struct(ib->spec->rets[0]);
+                  && is_flat_struct(ib->spec->rets[0]);
         llvm::Value *tv = nullptr;
         if (ib->body) {
             for (auto *s : ib->body->stmts) GenStmt(s, w);
@@ -2610,7 +2715,7 @@ struct CodeGenIR {
                     emit_limited_decl(vd, i, *vddef, w);
                     continue;
                 }
-                if (is_flat_int_struct(vddef->type)) {
+                if (is_flat_struct(vddef->type)) {
                     emit_struct_decl(vd, i, *vddef, w);
                     continue;
                 }
@@ -2682,7 +2787,7 @@ struct CodeGenIR {
                                  "growable array");
                 auto *rhs = as->rhs;
                 if (auto *u = Is<Unary>(rhs))
-                    if (u->op == T_BITAND && u->synth)
+                    if (u->op == T_BITAND)
                         rhs = u->child;
                 auto *rid = Is<Ident>(rhs);
                 llvm::Value *hp = nullptr;
@@ -2706,7 +2811,7 @@ struct CodeGenIR {
                     // The checker wraps a rebinding rhs in a synthetic `&`
                     // (CheckRebind): the new pointer is what it covers.
                     if (auto *u = Is<Unary>(rhs))
-                        if (u->op == T_BITAND && u->synth)
+                        if (u->op == T_BITAND)
                             rhs = u->child;
                     auto *rid = Is<Ident>(rhs);
                     llvm::Value *nptr = nullptr;
@@ -2781,6 +2886,25 @@ struct CodeGenIR {
             } else {
                 Unsup("an assignment to a variable the walk does not hold");
             }
+            return;
+        }
+        if (auto *le = Is<LoopExpr>(n)) {
+            // `loop { ... }`: an unconditional loop that leaves only by the
+            // breaks in its body. A loop expression carrying a value (a
+            // `break v` that names it) is a later cut.
+            if (le->exprtype && le->exprtype->kind != TY_VOID)
+                return Unsup(cat("a loop expression of a value at line ",
+                                 (long long)le->line.line));
+            auto *fn = w.fn;
+            auto *bodybb = llvm::BasicBlock::Create(ctx, "loop_body", fn);
+            auto *donebb = llvm::BasicBlock::Create(ctx, "loop_done", fn);
+            w.loops.push_back({bodybb, donebb, bodybb});
+            b.CreateBr(bodybb);
+            b.SetInsertPoint(bodybb);
+            if (le->body) GenStmt(le->body, w);
+            if (!b.GetInsertBlock()->getTerminator()) b.CreateBr(bodybb);
+            w.loops.pop_back();
+            b.SetInsertPoint(donebb);
             return;
         }
         if (auto *wh = Is<While>(n)) {
@@ -3077,7 +3201,7 @@ struct CodeGenIR {
                 bool sret = ispec && ispec->rets.size() == 1
                          && is_slice_of_int(ispec->rets[0]);
                 bool stret = ispec && ispec->rets.size() == 1
-                          && is_flat_int_struct(ispec->rets[0]);
+                          && is_flat_struct(ispec->rets[0]);
                 llvm::Value *v = nullptr;
                 if (!ret->vals.empty()) {
                     if (sret) {
