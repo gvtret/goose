@@ -22,6 +22,7 @@
 #include <llvm/IR/Instructions.h>
 #include <memory>
 #include <string>
+#include <deque>
 #include <unordered_map>
 #include "includes.h"
 #include "ast.h"
@@ -69,6 +70,7 @@ struct CodeGenIR {
     llvm::Function *f_gs_divovf = nullptr;           // (ptr,i32), noreturn
     llvm::Function *f_gs_abort = nullptr;            // (i32,ptr,i32), noreturn
     llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
+    llvm::Function *f_gs_fmt_u64 = nullptr;          // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_fmt_bool = nullptr;         // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_out_bytes = nullptr;        // (ptr,i64)
 
@@ -161,6 +163,7 @@ struct CodeGenIR {
         dcl("gs_divovf", f_gs_divovf, V, { P, I32 });
         dcl("gs_abort", f_gs_abort, V, { I32, P, I32 });
         dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
+        dcl("gs_fmt_u64", f_gs_fmt_u64, I, { P, I });
         dcl("gs_fmt_bool", f_gs_fmt_bool, I, { P, I });
         dcl("gs_out_bytes", f_gs_out_bytes, V, { P, I });
     }
@@ -210,12 +213,25 @@ struct CodeGenIR {
         // shape also carries a global's thread-local header (storage
         // shared across bodies instead of a stack frame's).
         struct RzArr {
-            llvm::Value *base = nullptr;           // The region base.
-            llvm::Value *len = nullptr;            // The element count.
-            llvm::GlobalVariable *slot = nullptr;  // The gs_stack { top } owner.
+            llvm::Value *base = nullptr;           // The header's base field.
+            llvm::Value *len = nullptr;            // The header's count field.
+            llvm::Value *slot = nullptr;           // The gs_stack { top } owner.
+            llvm::Value *hdr = nullptr;            // The { base, len } header.
             TypeExpr *etype = nullptr;             // The element type.
         };
         std::unordered_map<VarDef *, RzArr> rzarrs;
+        // Reference locals and parameters to a growable array: one holder
+        // of { header pointer, stack pointer }, the pair the C backend's
+        // gs_rref carries. Every use loads the pair, so a rebind is seen
+        // there, and the header's fields stay the caller's own.
+        struct RzRefLoc {
+            llvm::AllocaInst *holder = nullptr;    // The { hdr, stk } pair.
+            TypeExpr *etype = nullptr;             // The element type.
+        };
+        std::unordered_map<VarDef *, RzRefLoc> rzrefs;
+        // Views materialized through a reference: one record per use, held
+        // where its address stays stable for the site that asked for it.
+        std::deque<RzArr> rzviews;
         // Fixed arrays (T[k]) of int elements walked in this body: the
         // element storage lands in one alloca of [count x elemty].
         struct FixedArr {
@@ -286,6 +302,17 @@ struct CodeGenIR {
         return v;
     }
 
+    // A value stored into a variable of a narrow int type wraps at that
+    // storage's width, as the C backend's store does: the low bits kept,
+    // then widened back (unsigned zero, signed sign) into the walk's i64.
+    llvm::Value *widen_store(TypeExpr *t, llvm::Value *v) {
+        if (!t || t->kind != TY_INT || !v) return v;
+        auto *st = int_ll_ty(t);
+        if (st == i64() || v->getType() != i64()) return v;
+        auto *tr = b.CreateTrunc(v, st, "narrow");
+        return is_uint_ty(t) ? b.CreateZExt(tr, i64()) : b.CreateSExt(tr, i64());
+    }
+
     // A growable array of an int-walkable element: the data-stack slice's
     // subject. A_GROWSHRINK stays out for now: shrinking from the front
     // moves gs_rhdr.base, which this slice does not lower.
@@ -353,6 +380,30 @@ struct CodeGenIR {
         return llvm::StructType::get(ctx, { i8ptr(), i64() });
     }
 
+    // A reference to a growable array: the pair the C backend carries as
+    // `gs_rref { gs_rhdr *hdr; gs_stack *stk; }` (codegen_types.h:510).
+    llvm::StructType *rzref_ll_ty() {
+        return llvm::StructType::get(ctx, { i8ptr(), i8ptr() });
+    }
+
+    // Constant GEP indices: the zero pointer step and a struct field
+    // number (which the IR always spells i32).
+    llvm::Constant *idx0() { return llvm::ConstantInt::get(i64(), 0); }
+    llvm::Constant *fld(unsigned k) {
+        return llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), k);
+    }
+
+    // A local's storage in the entry block: a declaration inside a loop
+    // body would otherwise allocate on every pass and walk the native stack
+    // off its end, where C gives the function one frame slot the scope
+    // reuses.
+    llvm::AllocaInst *entry_alloca(FnWalk &w, llvm::Type *ty,
+                                   const llvm::Twine &name) {
+        auto &entry = w.fn->getEntryBlock();
+        llvm::IRBuilder<> tmp(&entry, entry.begin());
+        return tmp.CreateAlloca(ty, nullptr, name);
+    }
+
     llvm::Type *int_ll_ty(TypeExpr *t) {
         switch (t->intstorage) {
             case IS_I8: case IS_U8:   return llvm::Type::getInt8Ty(ctx);
@@ -391,14 +442,63 @@ struct CodeGenIR {
         return gv;
     }
 
-    // A growable array's header by name holder: a local of this walk or a
-    // program global. Null where the name is neither.
+    // A growable array's header by name holder: a local of this walk, a
+    // program global, or a reference (whose view is materialized here, the
+    // pair loaded fresh so a rebind is seen). Null where the name is none.
     FnWalk::RzArr *rz_head(FnWalk &w, VarDef *d) {
         auto lit = w.rzarrs.find(d);
         if (lit != w.rzarrs.end()) return &lit->second;
         auto git = global_rzs.find(d);
         if (git != global_rzs.end()) return &git->second;
+        auto rit = w.rzrefs.find(d);
+        if (rit != w.rzrefs.end()) {
+            llvm::Value *hp = nullptr;
+            llvm::Value *sp = nullptr;
+            if (!growable_pair(w, d, hp, sp)) return nullptr;
+            FnWalk::RzArr v;
+            v.hdr = hp;
+            v.slot = sp;
+            v.etype = rit->second.etype;
+            v.base = b.CreateInBoundsGEP(slice_ll_ty(), hp, { idx0(), fld(0) },
+                                         "rzbase");
+            v.len = b.CreateInBoundsGEP(slice_ll_ty(), hp, { idx0(), fld(1) },
+                                        "rzlen");
+            w.rzviews.push_back(v);
+            return &w.rzviews.back();
+        }
         return nullptr;
+    }
+
+    // The { header, stack } pair naming the growable array a name holds, or
+    // a reference to one (its pair is loaded from the holder at this point
+    // of the walk, so a rebind before it is seen). False where the walk
+    // does not hold the name.
+    bool growable_pair(FnWalk &w, VarDef *d, llvm::Value *&hdr,
+                       llvm::Value *&stk) {
+        auto lit = w.rzarrs.find(d);
+        if (lit != w.rzarrs.end()) {
+            hdr = lit->second.hdr;
+            stk = lit->second.slot;
+            return true;
+        }
+        auto git = global_rzs.find(d);
+        if (git != global_rzs.end()) {
+            hdr = git->second.hdr;
+            stk = git->second.slot;
+            return true;
+        }
+        auto rit = w.rzrefs.find(d);
+        if (rit != w.rzrefs.end()) {
+            auto *holder = rit->second.holder;
+            hdr = b.CreateLoad(i8ptr(),
+                               b.CreateStructGEP(rzref_ll_ty(), holder, 0),
+                               "rzhdr");
+            stk = b.CreateLoad(i8ptr(),
+                               b.CreateStructGEP(rzref_ll_ty(), holder, 1),
+                               "rzstk");
+            return true;
+        }
+        return false;
     }
 
     // ------------------------------------------------------------------
@@ -446,6 +546,12 @@ struct CodeGenIR {
                 if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
                 else if (t->kind == TY_REF && is_int_ty(t->ref->sub))
                     argtys.push_back(i8ptr());
+                else if (t->kind == TY_REF && is_growable_i64(t->ref->sub)) {
+                    // A reference to a growable array: the C backend's
+                    // (gs_rhdr *, gs_stack *) pair, two pointers.
+                    argtys.push_back(i8ptr());
+                    argtys.push_back(i8ptr());
+                }
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
                 else if (is_flat_int_struct(t)) argtys.push_back(struct_ty(t));
                 else supported = false;
@@ -494,28 +600,47 @@ struct CodeGenIR {
             w.entry = llvm::BasicBlock::Create(ctx, "entry", fn);
             b.SetInsertPoint(w.entry);
             // Bind parameters (aligned with argtypes): ints as i64 slots, a
-            // slice into an alloca so the body may re-point it.
-            for (size_t i = 0; i < sp->params.size() && i < fn->getFunctionType()->getNumParams(); ++i) {
+            // slice into an alloca so the body may re-point it. A reference
+            // to a growable array takes two arguments, so the argument
+            // index advances by what each parameter consumed.
+            size_t argidx = 0;
+            for (size_t i = 0; i < sp->params.size()
+                 && argidx < fn->getFunctionType()->getNumParams(); ++i) {
                 auto *pt = i < sp->argtypes.size() ? sp->argtypes[i] : nullptr;
-                if (is_slice_of_int(pt)) {
+                if (pt && pt->kind == TY_REF && is_growable_i64(pt->ref->sub)) {
+                    // The pair of pointers the caller passed, kept in one
+                    // holder the body reads; a rebind rewrites it.
+                    auto *holder = b.CreateAlloca(rzref_ll_ty(), nullptr,
+                                                  llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(argidx),
+                                  b.CreateStructGEP(rzref_ll_ty(), holder, 0));
+                    b.CreateStore(fn->getArg(argidx + 1),
+                                  b.CreateStructGEP(rzref_ll_ty(), holder, 1));
+                    w.rzrefs[sp->params[i]] = { holder, pt->ref->sub->arr->sub };
+                    argidx += 2;
+                } else if (is_slice_of_int(pt)) {
                     auto *slot = b.CreateAlloca(slice_ll_ty(), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
-                    b.CreateStore(fn->getArg(i), slot);
+                    b.CreateStore(fn->getArg(argidx), slot);
                     w.slices[sp->params[i]] = { slot, pt->sub };
+                    argidx += 1;
                 } else if (pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
                     // A reference parameter: one pointer holder, its store
                     // the argument's slot; the body's rebinds write there.
                     auto *slot = b.CreateAlloca(i8ptr(), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
-                    b.CreateStore(fn->getArg(i), slot);
+                    b.CreateStore(fn->getArg(argidx), slot);
                     w.refs[sp->params[i]] = { slot, pt->ref->sub };
+                    argidx += 1;
                 } else if (is_flat_int_struct(pt)) {
                     auto *slot = b.CreateAlloca(struct_ty(pt), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
-                    b.CreateStore(fn->getArg(i), slot);
+                    b.CreateStore(fn->getArg(argidx), slot);
                     w.structs[sp->params[i]] = { slot, pt->struc->inst };
+                    argidx += 1;
                 } else if (!pt || is_int_ty(pt) || is_bool_ty(pt)) {
-                    w.params[sp->params[i]] = fn->getArg(i);
+                    w.params[sp->params[i]] = fn->getArg(argidx);
+                    argidx += 1;
                 }
             }
             if (sp->body && sh.supported) GenStmt(sp->body, w);
@@ -687,8 +812,8 @@ struct CodeGenIR {
         if (count < 0) return;
         auto *et = int_ll_ty(tal->sub);
         auto *a = count
-            ? b.CreateAlloca(llvm::ArrayType::get(et, (uint64_t)count),
-                             nullptr, llvm::Twine(def.name))
+            ? entry_alloca(w, llvm::ArrayType::get(et, (uint64_t)count),
+                           llvm::Twine(def.name))
             : nullptr;
         if (a && et->getScalarSizeInBits() % 8 == 0) {
             b.CreateMemSet(a, (llvm::Value *)b.getInt8(0),
@@ -745,10 +870,10 @@ struct CodeGenIR {
                              (long long)vd->line.line));
         auto cap = tal->size;
         auto *et = int_ll_ty(sub);
-        auto *a = b.CreateAlloca(llvm::ArrayType::get(et, (uint64_t)cap),
-                                 nullptr, llvm::Twine(def.name));
-        auto *len = b.CreateAlloca(i64(), nullptr,
-                                   llvm::Twine(def.name, ".len"));
+        auto *a = entry_alloca(w, llvm::ArrayType::get(et, (uint64_t)cap),
+                               llvm::Twine(def.name));
+        auto *len = entry_alloca(w, i64(),
+                                 llvm::Twine(def.name, ".len"));
         b.CreateMemSet(a, (llvm::Value *)b.getInt8(0),
                        (uint64_t)cap * (et->getScalarSizeInBits() / 8),
                        llvm::Align(8));
@@ -812,13 +937,17 @@ struct CodeGenIR {
         stk_slots.push_back(slot);
         // The header: gs_rhdr { base, len }. After main's reservation the
         // slot reads the region base.
-        auto *basea = b.CreateAlloca(i8ptr(), nullptr, llvm::Twine(def.name, ".base"));
-        auto *lena = b.CreateAlloca(i64(), nullptr, llvm::Twine(def.name, ".len"));
+        auto *hdra = entry_alloca(w, slice_ll_ty(),
+                                  llvm::Twine(def.name, ".hdr"));
+        auto *basea = b.CreateInBoundsGEP(slice_ll_ty(), hdra, { idx0(), fld(0) },
+                                          llvm::Twine(def.name, ".base"));
+        auto *lena = b.CreateInBoundsGEP(slice_ll_ty(), hdra, { idx0(), fld(1) },
+                                         llvm::Twine(def.name, ".len"));
         auto *basev = b.CreateLoad(i8ptr(), slot, llvm::Twine(def.name, ".top"));
         b.CreateStore(basev, basea);
         b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
         auto &r = w.rzarrs[&def];
-        r = { basea, lena, slot, def.type->arr->sub };
+        r = { basea, lena, slot, hdra, def.type->arr->sub };
         if (strinit) {
             auto *n = llvm::ConstantInt::get(i64(), (uint64_t)sl->val.size());
             if (!sl->val.empty())
@@ -961,8 +1090,8 @@ struct CodeGenIR {
                 case T_PLUS:  return b.CreateAdd(l, r, "add");
                 case T_MINUS: return b.CreateSub(l, r, "sub");
                 case T_MUL:   return b.CreateMul(l, r, "mul");
-                case T_DIV:   return GenDivMod(T_DIV, l, r, w);
-                case T_MOD:   return GenDivMod(T_MOD, l, r, w);
+                case T_DIV:   return GenDivMod(T_DIV, l, r, w, is_uint_ty(bin->exprtype));
+                case T_MOD:   return GenDivMod(T_MOD, l, r, w, is_uint_ty(bin->exprtype));
                 case T_SHR: {
                     auto *sh = b.CreateAnd(r, llvm::ConstantInt::get(i64(), 63), "shn");
                     return is_uint_ty(bin->left->exprtype) ? b.CreateLShr(l, sh, "shr")
@@ -1472,7 +1601,7 @@ struct CodeGenIR {
                     stk_slots.push_back(gs_pstk);
                 }
                 auto *basev = b.CreateLoad(i8ptr(), gs_pstk, "pline");
-                auto *cura = b.CreateAlloca(i8ptr(), nullptr, "pcur");
+                auto *cura = entry_alloca(w, i8ptr(), "pcur");
                 b.CreateStore(basev, cura);
                 auto *i8ty = llvm::Type::getInt8Ty(ctx);
                 for (size_t ai = 0; ai < c->args.size(); ++ai) {
@@ -1497,9 +1626,13 @@ struct CodeGenIR {
                         return Unsup(cat("a print argument at line ",
                                          (long long)an->line.line)), nullptr;
                     auto *cur = b.CreateLoad(i8ptr(), cura);
-                    auto *n = b.CreateCall(
-                        is_bool_ty(an->exprtype) ? f_gs_fmt_bool : f_gs_fmt_i64,
-                        { cur, as_i64(x) });
+                    // u64 renders unsigned, as the C backend's hook does;
+                    // every narrower int widens to an i64 that fits.
+                    auto *hook = is_bool_ty(an->exprtype) ? f_gs_fmt_bool
+                        : (an->exprtype->kind == TY_INT
+                           && an->exprtype->intstorage == IS_U64)
+                            ? f_gs_fmt_u64 : f_gs_fmt_i64;
+                    auto *n = b.CreateCall(hook, { cur, as_i64(x) });
                     b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
                                   cura);
                 }
@@ -1635,12 +1768,18 @@ struct CodeGenIR {
 
     // A signed `/` or `%` as the runtime's gs_div_i64 / gs_mod_i64: a zero
     // divisor and i64.min / -1 fail; `%` is Euclidean (a negative remainder
-    // takes |divisor| on), where `/` truncates.
-    llvm::Value *GenDivMod(TType op, llvm::Value *l, llvm::Value *r, FnWalk &w) {
+    // takes |divisor| on), where `/` truncates. An unsigned operand's
+    // values are zero-extended, so its division is the plain udiv/urem (a
+    // zero divisor still aborts).
+    llvm::Value *GenDivMod(TType op, llvm::Value *l, llvm::Value *r,
+                           FnWalk &w, bool uns = false) {
         auto *zero = llvm::ConstantInt::get(i64(), 0);
         auto *minus1 = llvm::ConstantInt::get(i64(), (uint64_t)-1, true);
         auto *intmin = llvm::ConstantInt::get(i64(), (uint64_t)1 << 63);
         div_guard(b.CreateICmpEQ(r, zero, "divzero"), f_gs_divfail, w);
+        if (uns)
+            return op == T_DIV ? b.CreateUDiv(l, r, "div")
+                               : b.CreateURem(l, r, "rem");
         div_guard(b.CreateAnd(b.CreateICmpEQ(l, intmin), b.CreateICmpEQ(r, minus1)),
                   f_gs_divovf, w);
         if (op == T_DIV) return b.CreateSDiv(l, r, "div");
@@ -1815,6 +1954,23 @@ struct CodeGenIR {
             if (u->op == T_BITAND && u->synth)
                 init = u->child;
         auto *id = init ? Is<Ident>(init) : nullptr;
+        if (is_growable_i64(ptee)) {
+            // A reference to a growable array keeps the pair the C backend
+            // passes: the header and the stack the array lives on. A push
+            // through it lands on the array's top and count.
+            llvm::Value *hp = nullptr;
+            llvm::Value *sp = nullptr;
+            if (!id || !id->vdef || !growable_pair(w, id->vdef, hp, sp))
+                return Unsup(cat("a reference bound to a value the walk does "
+                                 "not hold at line ",
+                                 (long long)vd->line.line));
+            auto *holder = entry_alloca(w, rzref_ll_ty(),
+                                        llvm::Twine(def.name));
+            b.CreateStore(hp, b.CreateStructGEP(rzref_ll_ty(), holder, 0));
+            b.CreateStore(sp, b.CreateStructGEP(rzref_ll_ty(), holder, 1));
+            w.rzrefs[&def] = { holder, ptee->arr->sub };
+            return;
+        }
         llvm::Value *ptr = nullptr;
         if (id && id->vdef) {
             auto lit = w.locals.find(id->vdef);
@@ -1827,7 +1983,7 @@ struct CodeGenIR {
         if (!ptr)
             return Unsup(cat("a reference bound to a value the walk does "
                              "not hold at line ", (long long)vd->line.line));
-        auto *slot = b.CreateAlloca(i8ptr(), nullptr, llvm::Twine(def.name));
+        auto *slot = entry_alloca(w, i8ptr(), llvm::Twine(def.name));
         b.CreateStore(ptr, slot);
         w.refs[&def] = { slot, ptee };
     }
@@ -1840,7 +1996,7 @@ struct CodeGenIR {
             return Unsup(cat("a slice value of ", type_label(def.type),
                              " the walk does not build at line ",
                              (long long)vd->line.line));
-        auto *slot = b.CreateAlloca(slice_ll_ty(), nullptr, llvm::Twine(def.name));
+        auto *slot = entry_alloca(w, slice_ll_ty(), llvm::Twine(def.name));
         auto *hdr = b.CreateInsertValue(llvm::UndefValue::get(slice_ll_ty()),
                                         sv.data, 0);
         hdr = b.CreateInsertValue(hdr, sv.len, 1);
@@ -1910,7 +2066,9 @@ struct CodeGenIR {
                    : is_uint_ty(etype) ? b.CreateZExt(ev, i64())
                                        : b.CreateSExt(ev, i64());
         auto *cur2 = b.CreateLoad(i8ptr(), cura);
-        auto *n = b.CreateCall(f_gs_fmt_i64, { cur2, ev64 });
+        auto *hook = etype && etype->kind == TY_INT
+            && etype->intstorage == IS_U64 ? f_gs_fmt_u64 : f_gs_fmt_i64;
+        auto *n = b.CreateCall(hook, { cur2, ev64 });
         b.CreateStore(b.CreateInBoundsGEP(i8ty, cur2, n), cura);
         auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "parr_next");
         iv->addIncoming(next, b.GetInsertBlock());
@@ -1965,7 +2123,7 @@ struct CodeGenIR {
                     || !sl->inits[k].val) return false;
                 at.push_back(f);
             }
-            auto *slot = b.CreateAlloca(struct_ll_ty(inst), nullptr, "sttmp");
+            auto *slot = entry_alloca(w, struct_ll_ty(inst), "sttmp");
             for (size_t k = 0; k < sl->inits.size(); ++k) {
                 auto *v = GenExpr(sl->inits[k].val, w);
                 if (!v) return false;
@@ -2031,8 +2189,8 @@ struct CodeGenIR {
         if (!sl) {
             // A copy of another struct value: a local, a call's result or an
             // inlined body's.
-            auto *slot = b.CreateAlloca(struct_ll_ty(in), nullptr,
-                                        llvm::Twine(def.name));
+            auto *slot = entry_alloca(w, struct_ll_ty(in),
+                                      llvm::Twine(def.name));
             llvm::Value *sv = nullptr;
             StructInst *si = nullptr;
             if (!init || !struct_value(init, w, sv, si) || si != in)
@@ -2054,7 +2212,7 @@ struct CodeGenIR {
                 return Unsup("a struct literal the walk does not build");
             at.push_back(f);
         }
-        auto *slot = b.CreateAlloca(struct_ll_ty(in), nullptr, llvm::Twine(def.name));
+        auto *slot = entry_alloca(w, struct_ll_ty(in), llvm::Twine(def.name));
         for (size_t k = 0; k < sl->inits.size(); ++k) {
             auto *v = GenExpr(sl->inits[k].val, w);
             if (!v) return;
@@ -2082,21 +2240,24 @@ struct CodeGenIR {
             auto *cur = b.CreateLoad(et, p, "fcur");
             auto *cur64 = is_uint_ty(sl.inst->ftypes[f]) ? b.CreateZExt(cur, i64())
                                                          : b.CreateSExt(cur, i64());
-            rhs = ArithEq(as->op, cur64, rhs, w);
+            rhs = ArithEq(as->op, cur64, rhs, w,
+                          is_uint_ty(sl.inst->ftypes[f]));
             if (!rhs) return Unsup("a compound field assignment of this operator");
         }
         b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
     }
 
     // The value a compound assignment stores: `cur op rhs`, null for an
-    // operator the walk does not model.
-    llvm::Value *ArithEq(TType op, llvm::Value *cur, llvm::Value *rhs, FnWalk &w) {
+    // operator the walk does not model. `uns` says the target's storage is
+    // unsigned, which changes `/` and `%` (and nothing else here).
+    llvm::Value *ArithEq(TType op, llvm::Value *cur, llvm::Value *rhs,
+                         FnWalk &w, bool uns = false) {
         switch (op) {
             case T_PLUSEQ:  return b.CreateAdd(cur, rhs, "pluseq");
             case T_MINUSEQ: return b.CreateSub(cur, rhs, "minuseq");
             case T_MULEQ:   return b.CreateMul(cur, rhs, "muleq");
-            case T_DIVEQ:   return GenDivMod(T_DIV, cur, rhs, w);
-            case T_MODEQ:   return GenDivMod(T_MOD, cur, rhs, w);
+            case T_DIVEQ:   return GenDivMod(T_DIV, cur, rhs, w, uns);
+            case T_MODEQ:   return GenDivMod(T_MOD, cur, rhs, w, uns);
             case T_ANDEQ:   return b.CreateAnd(cur, rhs, "andeq");
             case T_OREQ:    return b.CreateOr(cur, rhs, "oreq");
             case T_XOREQ:   return b.CreateXor(cur, rhs, "xoreq");
@@ -2152,7 +2313,7 @@ struct CodeGenIR {
                 auto *cur = b.CreateLoad(et, p, "stcur");
                 auto *cur64 = is_uint_ty(sv.etype) ? b.CreateZExt(cur, i64())
                                                    : b.CreateSExt(cur, i64());
-                rhs = ArithEq(as->op, cur64, rhs, w);
+                rhs = ArithEq(as->op, cur64, rhs, w, is_uint_ty(sv.etype));
                 if (!rhs) return Unsup("a compound index assignment of this operator");
             }
             b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
@@ -2169,7 +2330,7 @@ struct CodeGenIR {
                 auto *cur = b.CreateLoad(et, p, "stcur");
                 auto *cur64 = is_uint_ty(fx.etype) ? b.CreateZExt(cur, i64())
                                                    : b.CreateSExt(cur, i64());
-                rhs = ArithEq(as->op, cur64, rhs, w);
+                rhs = ArithEq(as->op, cur64, rhs, w, is_uint_ty(fx.etype));
                 if (!rhs) return Unsup("a compound index assignment of this operator");
             }
             b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
@@ -2186,7 +2347,7 @@ struct CodeGenIR {
                 auto *cur = b.CreateLoad(et, p, "stcur");
                 auto *cur64 = is_uint_ty(lm.etype) ? b.CreateZExt(cur, i64())
                                                    : b.CreateSExt(cur, i64());
-                rhs = ArithEq(as->op, cur64, rhs, w);
+                rhs = ArithEq(as->op, cur64, rhs, w, is_uint_ty(lm.etype));
                 if (!rhs) return Unsup("a compound index assignment of this operator");
             }
             b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
@@ -2197,7 +2358,7 @@ struct CodeGenIR {
         check(lenv);
         if (as->op != T_ASSIGN) {
             auto *cur = rz_load_elem(*r, basev, idx, "stcur");
-            rhs = ArithEq(as->op, cur, rhs, w);
+            rhs = ArithEq(as->op, cur, rhs, w, is_uint_ty(r->etype));
             if (!rhs) return Unsup("a compound index assignment of this operator");
         }
         rz_store_elem(*r, basev, idx, rhs);
@@ -2211,7 +2372,10 @@ struct CodeGenIR {
         if (!sp) return nullptr;
         for (auto *t : sp->argtypes)
             if (!is_int_ty(t) && !is_bool_ty(t) && !is_slice_of_int(t)
-                && !is_flat_int_struct(t)) return nullptr;
+                && !is_flat_int_struct(t)
+                && !(t && t->kind == TY_REF
+                     && (is_int_ty(t->ref->sub)
+                         || is_growable_i64(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
                 && !is_flat_int_struct(rt)) return nullptr;
@@ -2223,6 +2387,10 @@ struct CodeGenIR {
         auto *cf = mod->getFunction(callee);
         if (!cf) return nullptr;
         auto expect = c->args.size() + (nrets > 1 ? nrets - 1 : 0);
+        // A reference to a growable array crosses a call as two pointers.
+        for (auto *t : sp->argtypes)
+            if (t && t->kind == TY_REF && is_growable_i64(t->ref->sub))
+                expect += 1;
         if (cf->getFunctionType()->getNumParams() != expect) return nullptr;
         std::vector<llvm::Value *> args;
         for (size_t ai = 0; ai < c->args.size(); ++ai) {
@@ -2244,10 +2412,30 @@ struct CodeGenIR {
                 args.push_back(sv);
                 continue;
             }
+            if (pt && pt->kind == TY_REF && is_growable_i64(pt->ref->sub)) {
+                // A reference to a growable array passes the pair naming
+                // the array: a local's or a global's own header and stack,
+                // or a reference's pair loaded from its holder.
+                auto *a2 = a;
+                if (auto *u = Is<Unary>(a2))
+                    if (u->op == T_BITAND && u->synth) a2 = u->child;
+                auto *id = Is<Ident>(a2);
+                llvm::Value *hp = nullptr;
+                llvm::Value *spv = nullptr;
+                if (!id || !id->vdef || !growable_pair(w, id->vdef, hp, spv))
+                    return nullptr;
+                args.push_back(hp);
+                args.push_back(spv);
+                continue;
+            }
             if (pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
                 // A reference parameter's argument is the place it names:
-                // a variable this walk holds, whose slot is passed.
-                auto *id = Is<Ident>(a);
+                // a variable this walk holds, whose slot is passed, or a
+                // reference, whose stored pointer is.
+                auto *a2 = a;
+                if (auto *u = Is<Unary>(a2))
+                    if (u->op == T_BITAND && u->synth) a2 = u->child;
+                auto *id = Is<Ident>(a2);
                 llvm::Value *ptr = nullptr;
                 if (id && id->vdef) {
                     auto lit = w.locals.find(id->vdef);
@@ -2255,6 +2443,12 @@ struct CodeGenIR {
                     else {
                         auto gvit = global_vars.find(id->vdef);
                         if (gvit != global_vars.end()) ptr = gvit->second.gv;
+                        else {
+                            auto rit = w.refs.find(id->vdef);
+                            if (rit != w.refs.end())
+                                ptr = b.CreateLoad(i8ptr(), rit->second.base,
+                                                   "refp");
+                        }
                     }
                 }
                 if (!ptr) return nullptr;
@@ -2383,7 +2577,7 @@ struct CodeGenIR {
                 std::vector<llvm::AllocaInst *> slots(vd->defs.size(), nullptr);
                 for (size_t i = 0; i < vd->defs.size(); ++i) {
                     if (!vd->defs[i] || !is_int_ty(vd->defs[i]->type)) return;
-                    slots[i] = b.CreateAlloca(i64(), nullptr, llvm::Twine(vd->defs[i]->name));
+                    slots[i] = entry_alloca(w, i64(), llvm::Twine(vd->defs[i]->name));
                     outs[i] = slots[i];
                 }
                 auto *v0 = EmitDirectCall(c, w, &outs);
@@ -2424,17 +2618,21 @@ struct CodeGenIR {
                     emit_slice_decl(vd, i, *vddef, w);
                     continue;
                 }
-                if (vddef->type->kind == TY_REF && is_int_ty(vddef->type->ref->sub)) {
+                if (vddef->type->kind == TY_REF
+                    && (is_int_ty(vddef->type->ref->sub)
+                        || is_growable_i64(vddef->type->ref->sub))) {
                     emit_ref_decl(vd, i, *vddef, w);
                     continue;
                 }
                 if (!is_int_ty(vddef->type) && !is_bool_ty(vddef->type))
                     return Unsup(cat("a local of ", type_label(vddef->type),
                                      " at line ", (long long)vd->line.line));
-                auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(vddef->name));
+                auto *alloca = entry_alloca(w, i64(), llvm::Twine(vddef->name));
                 if (i < vd->inits.size() && vd->inits[i]) {
                     auto *initv = GenExpr(vd->inits[i], w);
-                    if (initv) b.CreateStore(as_i64(initv), alloca);
+                    if (initv)
+                        b.CreateStore(widen_store(vddef->type, as_i64(initv)),
+                                      alloca);
                 }
                 w.locals[vddef] = alloca;
             }
@@ -2476,6 +2674,28 @@ struct CodeGenIR {
                 b.CreateStore(hdr, sit->second.base);
                 return;
             }
+            // A reference to a growable array: a rebind re-points its pair,
+            // which every later use loads.
+            if (auto rrit = w.rzrefs.find(lv->vdef); rrit != w.rzrefs.end()) {
+                if (as->op != T_DOTASSIGN)
+                    return Unsup("an assignment through a reference to a "
+                                 "growable array");
+                auto *rhs = as->rhs;
+                if (auto *u = Is<Unary>(rhs))
+                    if (u->op == T_BITAND && u->synth)
+                        rhs = u->child;
+                auto *rid = Is<Ident>(rhs);
+                llvm::Value *hp = nullptr;
+                llvm::Value *sp = nullptr;
+                if (!rid || !rid->vdef || !growable_pair(w, rid->vdef, hp, sp))
+                    return Unsup(cat("a rebind to a value the walk does "
+                                     "not hold at line ",
+                                     (long long)as->line.line));
+                auto *holder = rrit->second.holder;
+                b.CreateStore(hp, b.CreateStructGEP(rzref_ll_ty(), holder, 0));
+                b.CreateStore(sp, b.CreateStructGEP(rzref_ll_ty(), holder, 1));
+                return;
+            }
             // A reference store goes into the pointee; `r .= e` (a rebind)
             // stores the new pointer instead, which the walk takes from a
             // variable it holds for now.
@@ -2512,7 +2732,7 @@ struct CodeGenIR {
                     auto *cur = b.CreateLoad(et, p, "refcur");
                     auto *cur64 = is_uint_ty(rit->second.ptee)
                         ? b.CreateZExt(cur, i64()) : b.CreateSExt(cur, i64());
-                    rhs = ArithEq(as->op, cur64, rhs, w);
+                    rhs = ArithEq(as->op, cur64, rhs, w, is_uint_ty(rit->second.ptee));
                     if (!rhs) return Unsup("a compound assignment of this operator");
                 }
                 b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
@@ -2529,7 +2749,7 @@ struct CodeGenIR {
                     auto pit = w.params.find(lv->vdef);
                     if (pit != w.params.end()) {
                         // A parameter is not an lvalue here: rebind into a local.
-                        auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
+                        auto *alloca = entry_alloca(w, i64(), llvm::Twine(lv->vdef->name));
                         b.CreateStore(pit->second, alloca);
                         w.locals[lv->vdef] = alloca;
                         cur = pit->second;
@@ -2539,25 +2759,25 @@ struct CodeGenIR {
                         cur = b.CreateLoad(i64(), lit->second, llvm::Twine(lv->vdef->name));
                     }
                 }
-                rhs = ArithEq(as->op, cur, rhs, w);
+                rhs = ArithEq(as->op, cur, rhs, w, is_uint_ty(lv->exprtype));
                 if (!rhs) return Unsup("a compound assignment of this operator");
             }
             auto pit2 = w.params.find(lv->vdef);
             auto lit2 = w.locals.find(lv->vdef);
             auto gv2 = global_vars.find(lv->vdef);
             if (gv2 != global_vars.end()) {
-                b.CreateStore(rhs, gv2->second.gv);
+                b.CreateStore(widen_store(lv->vdef->type, rhs), gv2->second.gv);
             } else if (pit2 != w.params.end()) {
                 // Plain assign to a parameter: store into a shadow alloca.
                 if (lit2 == w.locals.end()) {
-                    auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
+                    auto *alloca = entry_alloca(w, i64(), llvm::Twine(lv->vdef->name));
                     b.CreateStore(pit2->second, alloca);
                     w.locals[lv->vdef] = alloca;
                     lit2 = w.locals.find(lv->vdef);
                 }
-                b.CreateStore(rhs, lit2->second);
+                b.CreateStore(widen_store(lv->vdef->type, rhs), lit2->second);
             } else if (lit2 != w.locals.end()) {
-                b.CreateStore(rhs, lit2->second);
+                b.CreateStore(widen_store(lv->vdef->type, rhs), lit2->second);
             } else {
                 Unsup("an assignment to a variable the walk does not hold");
             }
@@ -2622,7 +2842,7 @@ struct CodeGenIR {
                 b.CreateCondBr(cond, bodybb, donebb);
                 b.SetInsertPoint(bodybb);
                 if (fl->vdef) {
-                    auto *slot = b.CreateAlloca(i64(), nullptr, llvm::Twine(fl->vdef->name));
+                    auto *slot = entry_alloca(w, i64(), llvm::Twine(fl->vdef->name));
                     b.CreateStore(iv, slot);
                     w.locals[fl->vdef] = slot;
                 }
@@ -2702,9 +2922,31 @@ struct CodeGenIR {
                 b.CreateCondBr(b.CreateICmpULT(iv, lenv, "for_test"),
                                bodybb, donebb);
                 b.SetInsertPoint(bodybb);
-                if (fl->vdef) {
-                    auto *slot = b.CreateAlloca(i64(), nullptr,
-                                                llvm::Twine(fl->vdef->name));
+                if (fl->vdef && fl->byref) {
+                    // `for &x in xs`: the binder is a reference to the
+                    // element, so the body's writes land in the array itself
+                    // (the C backend binds the element's address).
+                    llvm::Value *ep = fa
+                        ? (fa->base
+                            ? (llvm::Value *)b.CreateInBoundsGEP(
+                                fa->base->getAllocatedType(), fa->base,
+                                { llvm::ConstantInt::get(i64(), 0), iv },
+                                "for_rp")
+                            : (llvm::Value *)llvm::ConstantPointerNull::get(i8ptr()))
+                        : gr ? (llvm::Value *)b.CreateInBoundsGEP(
+                            et, b.CreateLoad(i8ptr(), gr->base), iv, "for_rp")
+                        : la ? (llvm::Value *)b.CreateInBoundsGEP(
+                            la->base->getAllocatedType(), la->base,
+                            { llvm::ConstantInt::get(i64(), 0), iv }, "for_rp")
+                             : (llvm::Value *)b.CreateInBoundsGEP(et, sv.data, iv,
+                                                                  "for_rp");
+                    auto *slot = entry_alloca(w, i8ptr(),
+                                              llvm::Twine(fl->vdef->name));
+                    b.CreateStore(ep, slot);
+                    w.refs[fl->vdef] = { slot, etype };
+                } else if (fl->vdef) {
+                    auto *slot = entry_alloca(w, i64(),
+                                              llvm::Twine(fl->vdef->name));
                     // A zero-count array has no alloca: its body never runs,
                     // and the binder's value is a typed zero.
                     llvm::Value *ev = fa
@@ -2732,8 +2974,8 @@ struct CodeGenIR {
                     w.locals[fl->vdef] = slot;
                 }
                 if (fl->idxdef) {
-                    auto *slot = b.CreateAlloca(i64(), nullptr,
-                                                llvm::Twine(fl->idxdef->name));
+                    auto *slot = entry_alloca(w, i64(),
+                                              llvm::Twine(fl->idxdef->name));
                     b.CreateStore(iv, slot);
                     w.locals[fl->idxdef] = slot;
                 }
@@ -2801,10 +3043,11 @@ struct CodeGenIR {
                                              llvm::Twine(lv->vdef->name));
                     auto *nv = inc->op == T_INC ? b.CreateAdd(cur, one, "inc")
                                                 : b.CreateSub(cur, one, "dec");
-                    b.CreateStore(nv, git->second.gv);
+                    b.CreateStore(widen_store(lv->vdef->type, nv),
+                                  git->second.gv);
                     return;
                 }
-                auto *alloca = b.CreateAlloca(i64(), nullptr, llvm::Twine(lv->vdef->name));
+                auto *alloca = entry_alloca(w, i64(), llvm::Twine(lv->vdef->name));
                 b.CreateStore(pit->second, alloca);
                 w.locals[lv->vdef] = alloca;
                 lit = w.locals.find(lv->vdef);
@@ -2813,7 +3056,7 @@ struct CodeGenIR {
             auto *cur = b.CreateLoad(i64(), lit->second, llvm::Twine(lv->vdef->name));
             auto *nv = inc->op == T_INC ? b.CreateAdd(cur, one, "inc")
                                         : b.CreateSub(cur, one, "dec");
-            b.CreateStore(nv, lit->second);
+            b.CreateStore(widen_store(lv->vdef->type, nv), lit->second);
             return;
         }
         if (auto *ret = Is<Return>(n)) {
@@ -3000,19 +3243,25 @@ struct CodeGenIR {
                         cat("gs_stk", stk_slots.size()), nullptr,
                         llvm::GlobalValue::GeneralDynamicTLSModel);
                     stk_slots.push_back(slot);
-                    auto *basegv = new llvm::GlobalVariable(
-                        *mod, i8ptr(), false,
+                    auto *hdrgv = new llvm::GlobalVariable(
+                        *mod, slice_ll_ty(), false,
                         llvm::GlobalValue::InternalLinkage,
-                        llvm::ConstantPointerNull::get(i8ptr()),
-                        gname + ".base", nullptr,
+                        llvm::ConstantStruct::get(
+                            slice_ll_ty(),
+                            { llvm::ConstantPointerNull::get(i8ptr()),
+                              llvm::ConstantInt::get(i64ty, 0) }),
+                        gname + ".hdr", nullptr,
                         llvm::GlobalValue::GeneralDynamicTLSModel);
-                    auto *lengv = new llvm::GlobalVariable(
-                        *mod, i64ty, false,
-                        llvm::GlobalValue::InternalLinkage,
-                        llvm::ConstantInt::get(i64ty, 0),
-                        gname + ".len", nullptr,
-                        llvm::GlobalValue::GeneralDynamicTLSModel);
-                    global_rzs[d] = { basegv, lengv, slot, d->type->arr->sub };
+                    llvm::Constant *bidx[2] = { idx0(), fld(0) };
+                    llvm::Constant *lidx[2] = { idx0(), fld(1) };
+                    auto *basegv =
+                        llvm::ConstantExpr::getInBoundsGetElementPtr(
+                            slice_ll_ty(), hdrgv, bidx);
+                    auto *lengv =
+                        llvm::ConstantExpr::getInBoundsGetElementPtr(
+                            slice_ll_ty(), hdrgv, lidx);
+                    global_rzs[d] = { basegv, lengv, slot, hdrgv,
+                                      d->type->arr->sub };
                     continue;
                 }
                 if (!is_int_ty(d->type)) continue;

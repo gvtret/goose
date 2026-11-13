@@ -180,12 +180,28 @@ slot), a parameter's holder is the argument, a `let px .= n` or
 names (the checker's synthetic `&` is what the walk reads through), a
 read loads the pointee at its own width, a plain assignment and `+=`
 write it, `++` steps it, and a rebind (`r .= m`) stores the new slot
-into the holder. `goose llc` passes `-relocation-model=pic`, so a
+into the holder. A reference to a growable array (`T[>..]&`) is the pair
+the C backend carries, `{ header, stack }` as two pointers: the local or
+global header is one `{ base, count }` record (the C `gs_rhdr`), a
+reference binding stores the pair in its holder and every use loads it
+again, so a rebind is seen; `push` through the reference lands on the
+array's top and count, and such a parameter crosses a call as two
+arguments (the walk's argument index advances by what each parameter
+consumed). `for &x in xs` binds the element's address, so the body's
+writes land in the array. An int local of a narrow storage type
+(`u32`, `u16`, `u8` and their signed forms) truncates on every store to
+it, and a read widens by its signedness; `/` and `%` on an unsigned
+operand are `udiv`/`urem` (a zero divisor still aborts), and `u64`
+prints through the unsigned hook, as the C backend's does. Every local's
+storage is allocated in the function's entry block, so a declaration in
+a loop body reuses its slot instead of walking the native stack off its
+end. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 33 of the codegen output fixtures pass through
-`--emit-ir`; the largest remaining gaps are references to aggregates
-(fixed and growable arrays, structs, enums), limited arrays
+in the output now refuse. 36 of the codegen output fixtures pass through
+`--emit-ir`; the largest remaining gaps are references to other
+aggregates (fixed arrays, structs, enums),
+limited arrays
 built by copy from other values (the runtime-capacity `T[..]` form with
 them), appends of call results, struct parameters and copies,
 struct fields of slices or
