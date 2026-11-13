@@ -236,6 +236,16 @@ struct CodeGenIR {
             TypeExpr *etype = nullptr;             // The element type.
         };
         std::unordered_map<VarDef *, LimArr> limiteds;
+        // Reference locals and parameters (T& of an int): one alloca
+        // holding the pointer the reference names. A parameter's stores
+        // its argument, a declaration's the variable its initializer
+        // names, and a rebind (`r .= e`) a new one; every read and write
+        // of the reference loads the pointer and reaches the pointee.
+        struct RefLoc {
+            llvm::AllocaInst *base = nullptr;      // The pointer holder.
+            TypeExpr *ptee = nullptr;              // The pointee's type.
+        };
+        std::unordered_map<VarDef *, RefLoc> refs;
         // Flat int-field struct locals: their storage and the struct's layout.
         struct StructLoc {
             llvm::AllocaInst *base = nullptr;
@@ -434,6 +444,8 @@ struct CodeGenIR {
             bool supported = true;
             for (auto *t : sp->argtypes) {
                 if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
+                else if (t->kind == TY_REF && is_int_ty(t->ref->sub))
+                    argtys.push_back(i8ptr());
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
                 else if (is_flat_int_struct(t)) argtys.push_back(struct_ty(t));
                 else supported = false;
@@ -490,6 +502,13 @@ struct CodeGenIR {
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(i), slot);
                     w.slices[sp->params[i]] = { slot, pt->sub };
+                } else if (pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
+                    // A reference parameter: one pointer holder, its store
+                    // the argument's slot; the body's rebinds write there.
+                    auto *slot = b.CreateAlloca(i8ptr(), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(i), slot);
+                    w.refs[sp->params[i]] = { slot, pt->ref->sub };
                 } else if (is_flat_int_struct(pt)) {
                     auto *slot = b.CreateAlloca(struct_ty(pt), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
@@ -982,6 +1001,17 @@ struct CodeGenIR {
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
+                // A reference reads out the pointee's value: the pointer
+                // it names, then the int stored there.
+                auto rit = w.refs.find(id->vdef);
+                if (rit != w.refs.end()) {
+                    auto *p = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                    auto *et = int_ll_ty(rit->second.ptee);
+                    auto *v = b.CreateLoad(et, p, llvm::Twine(id->vdef->name));
+                    if (et == i64()) return v;
+                    return is_uint_ty(rit->second.ptee)
+                        ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
+                }
                 // A flat int struct local as a value.
                 auto stit = w.structs.find(id->vdef);
                 if (stit != w.structs.end()) {
@@ -1771,6 +1801,37 @@ struct CodeGenIR {
         return true;
     }
 
+    // A reference binding (`let px .= n`, `var r .= n`): one pointer
+    // holder whose store is the variable the initializer names. The
+    // initializer must be a variable this slice holds for now; an
+    // element's or a field's address is a later cut.
+    void emit_ref_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
+        auto *ptee = def.type->ref->sub;
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        // The checker wraps an lvalue initializer in a synthetic `&`
+        // (TypeCheck::AutoRef, typecheck_exprs.h:772): the reference names
+        // what that `&` covers.
+        if (auto *u = init ? Is<Unary>(init) : nullptr)
+            if (u->op == T_BITAND && u->synth)
+                init = u->child;
+        auto *id = init ? Is<Ident>(init) : nullptr;
+        llvm::Value *ptr = nullptr;
+        if (id && id->vdef) {
+            auto lit = w.locals.find(id->vdef);
+            if (lit != w.locals.end()) ptr = lit->second;
+            else {
+                auto git = global_vars.find(id->vdef);
+                if (git != global_vars.end()) ptr = git->second.gv;
+            }
+        }
+        if (!ptr)
+            return Unsup(cat("a reference bound to a value the walk does "
+                             "not hold at line ", (long long)vd->line.line));
+        auto *slot = b.CreateAlloca(i8ptr(), nullptr, llvm::Twine(def.name));
+        b.CreateStore(ptr, slot);
+        w.refs[&def] = { slot, ptee };
+    }
+
     // `var s: T[:] = <view>`: the view lands in a { data, len } alloca.
     void emit_slice_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
         auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
@@ -2183,6 +2244,23 @@ struct CodeGenIR {
                 args.push_back(sv);
                 continue;
             }
+            if (pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
+                // A reference parameter's argument is the place it names:
+                // a variable this walk holds, whose slot is passed.
+                auto *id = Is<Ident>(a);
+                llvm::Value *ptr = nullptr;
+                if (id && id->vdef) {
+                    auto lit = w.locals.find(id->vdef);
+                    if (lit != w.locals.end()) ptr = lit->second;
+                    else {
+                        auto gvit = global_vars.find(id->vdef);
+                        if (gvit != global_vars.end()) ptr = gvit->second.gv;
+                    }
+                }
+                if (!ptr) return nullptr;
+                args.push_back(ptr);
+                continue;
+            }
             auto *av = GenExpr(a, w);
             if (!av) return nullptr;
             args.push_back(as_i64(av));
@@ -2346,6 +2424,10 @@ struct CodeGenIR {
                     emit_slice_decl(vd, i, *vddef, w);
                     continue;
                 }
+                if (vddef->type->kind == TY_REF && is_int_ty(vddef->type->ref->sub)) {
+                    emit_ref_decl(vd, i, *vddef, w);
+                    continue;
+                }
                 if (!is_int_ty(vddef->type) && !is_bool_ty(vddef->type))
                     return Unsup(cat("a local of ", type_label(vddef->type),
                                      " at line ", (long long)vd->line.line));
@@ -2392,6 +2474,48 @@ struct CodeGenIR {
                     b.CreateInsertValue(llvm::UndefValue::get(slice_ll_ty()),
                                         sv.data, 0), sv.len, 1);
                 b.CreateStore(hdr, sit->second.base);
+                return;
+            }
+            // A reference store goes into the pointee; `r .= e` (a rebind)
+            // stores the new pointer instead, which the walk takes from a
+            // variable it holds for now.
+            if (auto rit = w.refs.find(lv->vdef); rit != w.refs.end()) {
+                auto *p = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                if (as->op == T_DOTASSIGN) {
+                    auto *rhs = as->rhs;
+                    // The checker wraps a rebinding rhs in a synthetic `&`
+                    // (CheckRebind): the new pointer is what it covers.
+                    if (auto *u = Is<Unary>(rhs))
+                        if (u->op == T_BITAND && u->synth)
+                            rhs = u->child;
+                    auto *rid = Is<Ident>(rhs);
+                    llvm::Value *nptr = nullptr;
+                    if (rid && rid->vdef) {
+                        auto lit = w.locals.find(rid->vdef);
+                        if (lit != w.locals.end()) nptr = lit->second;
+                        else {
+                            auto gvit = global_vars.find(rid->vdef);
+                            if (gvit != global_vars.end()) nptr = gvit->second.gv;
+                        }
+                    }
+                    if (!nptr)
+                        return Unsup(cat("a rebind to a value the walk does "
+                                         "not hold at line ",
+                                         (long long)as->line.line));
+                    b.CreateStore(nptr, rit->second.base);
+                    return;
+                }
+                auto *rhs = as_i64(GenExpr(as->rhs, w));
+                if (!rhs) return;
+                auto *et = int_ll_ty(rit->second.ptee);
+                if (as->op != T_ASSIGN) {
+                    auto *cur = b.CreateLoad(et, p, "refcur");
+                    auto *cur64 = is_uint_ty(rit->second.ptee)
+                        ? b.CreateZExt(cur, i64()) : b.CreateSExt(cur, i64());
+                    rhs = ArithEq(as->op, cur64, rhs, w);
+                    if (!rhs) return Unsup("a compound assignment of this operator");
+                }
+                b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
                 return;
             }
             auto *rhs = as_i64(GenExpr(as->rhs, w));
@@ -2650,6 +2774,18 @@ struct CodeGenIR {
         if (auto *inc = Is<IncDec>(n)) {
             auto *lv = Is<Ident>(inc->lval);
             if (!lv || !lv->vdef) return;
+            auto rit = w.refs.find(lv->vdef);
+            if (rit != w.refs.end()) {
+                // A step of the reference's pointee, through its pointer.
+                auto *p = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                auto *et = int_ll_ty(rit->second.ptee);
+                auto *cur = b.CreateLoad(et, p, llvm::Twine(lv->vdef->name));
+                auto *one = llvm::ConstantInt::get(et, 1);
+                auto *nv = inc->op == T_INC
+                    ? b.CreateAdd(cur, one, "inc") : b.CreateSub(cur, one, "dec");
+                b.CreateStore(nv, p);
+                return;
+            }
             auto lit = w.locals.find(lv->vdef);
             if (lit == w.locals.end()) {
                 auto pit = w.params.find(lv->vdef);

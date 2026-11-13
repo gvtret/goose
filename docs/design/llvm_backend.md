@@ -173,11 +173,19 @@ initializes a `u8[]` local or a `u8[>..]`'s first bytes. A slice crosses a
 call by value as the `{ ptr, i64 }` it is: a parameter is copied into the
 callee's own alloca (so the body may re-point it), and a call's single
 slice result returns the struct itself; a multi-result signature with a
-slice still refuses. `goose llc` passes `-relocation-model=pic`, so a
+slice still refuses. A reference to an int (`T&`) is the C backend's
+pointer: it crosses a call as one (`i8*`, the argument the variable's
+slot), a parameter's holder is the argument, a `let px .= n` or
+`var r .= n` binding stores the slot of the variable its initializer
+names (the checker's synthetic `&` is what the walk reads through), a
+read loads the pointee at its own width, a plain assignment and `+=`
+write it, `++` steps it, and a rebind (`r .= m`) stores the new slot
+into the holder. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 32 of the codegen output fixtures pass through
-`--emit-ir`; the largest remaining gaps are references, limited arrays
+in the output now refuse. 33 of the codegen output fixtures pass through
+`--emit-ir`; the largest remaining gaps are references to aggregates
+(fixed and growable arrays, structs, enums), limited arrays
 built by copy from other values (the runtime-capacity `T[..]` form with
 them), appends of call results, struct parameters and copies,
 struct fields of slices or
