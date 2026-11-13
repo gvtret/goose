@@ -145,11 +145,18 @@ global's `++` writes its global slot. `append` copies a fixed array's, a
 slice's or (for a byte element) a string literal's elements onto a
 growable array's top and adds their count to the length, the source
 evaluated first; `pop` reads the last element's value back in value and
-statement position, an empty one the runtime's `GS_E_POP` abort. A
+statement position, an empty one the runtime's `GS_E_POP` abort, and
+`pop_n` drops a count of them at once past `GS_E_POPN`. A limited
+array (`T[..k]` of int elements) is a fixed-slot value with a count:
+a literal or a string literal (byte elements) sets it, `push` and
+`append` grow it behind the declared capacity (`GS_E_CAPACITY` past
+it), `pop` and `pop_n` shrink it, index reads and stores check the
+count, `.len` and `.cap` read the header, a `for` names each element
+and print renders the run. A
 construct the walk does not emit
 is refused with its kind and line (`--emit-ir` fails, no module is
 written) instead of being dropped; a builtin other than `push`,
-`append`, `pop`, `assert`
+`append`, `pop`, `pop_n`, `assert`
 and `print`, and `loop`, `match` or `defer`, count as such constructs.
 Flat int-field structs
 (no padding, fixed size) are values: a literal builds them, field reads,
@@ -169,9 +176,10 @@ slice result returns the struct itself; a multi-result signature with a
 slice still refuses. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 31 of the codegen output fixtures pass through
-`--emit-ir`; the largest remaining gaps are references,
-limited arrays, appends of call results, struct parameters and copies,
+in the output now refuse. 32 of the codegen output fixtures pass through
+`--emit-ir`; the largest remaining gaps are references, limited arrays
+built by copy from other values (the runtime-capacity `T[..]` form with
+them), appends of call results, struct parameters and copies,
 struct fields of slices or
 references, arrays returned by calls, and rendering of floats and structs,
 plus the M4 modules. See

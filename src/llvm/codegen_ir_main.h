@@ -224,6 +224,18 @@ struct CodeGenIR {
             TypeExpr *etype = nullptr;             // The element type.
         };
         std::unordered_map<VarDef *, FixedArr> fixeds;
+        // Limited arrays (T[..k]) of int elements walked in this body: the
+        // static-capacity fixed-slot value (section 4.1). The slots are one
+        // alloca of [cap x elemty] and the count one i64 alloca; the C
+        // value form lays them together as one struct { len, e[k] }, which
+        // a later ABI slice mirrors.
+        struct LimArr {
+            llvm::AllocaInst *base = nullptr;      // The element slots.
+            llvm::AllocaInst *len = nullptr;       // The element count.
+            int64_t cap = -1;                      // The declared capacity.
+            TypeExpr *etype = nullptr;             // The element type.
+        };
+        std::unordered_map<VarDef *, LimArr> limiteds;
         // Flat int-field struct locals: their storage and the struct's layout.
         struct StructLoc {
             llvm::AllocaInst *base = nullptr;
@@ -692,6 +704,68 @@ struct CodeGenIR {
         }
     }
 
+    // A static-capacity limited array local (`var a: i64[..k]`): its
+    // capacity is the declared constant, the slots one alloca, and the
+    // count an i64 alloca that a literal (or a string literal's bytes for
+    // a u8 one) sets. Construction by copy from another array's value is
+    // a later cut, as is the runtime-capacity `T[..]` form.
+    void emit_limited_decl(VarDecl *vd, size_t i, VarDef &def, FnWalk &w) {
+        auto *tal = def.type->arr;
+        if (tal->size < 0)
+            return Unsup(cat("a local of a runtime-capacity limited array "
+                             "at line ", (long long)vd->line.line));
+        auto *init = i < vd->inits.size() ? vd->inits[i] : nullptr;
+        auto *al = init ? Is<ArrayLit>(init) : nullptr;
+        auto *sl = init ? Is<StrLit>(init) : nullptr;
+        auto *sub = tal->sub;
+        bool strinit = sl && sub
+            && (sub->intstorage == IS_U8 || sub->intstorage == IS_I8);
+        if (init && !al && !strinit)
+            return Unsup(cat("a limited array constructed from a value the "
+                             "walk does not build at line ",
+                             (long long)vd->line.line));
+        auto cap = tal->size;
+        auto *et = int_ll_ty(sub);
+        auto *a = b.CreateAlloca(llvm::ArrayType::get(et, (uint64_t)cap),
+                                 nullptr, llvm::Twine(def.name));
+        auto *len = b.CreateAlloca(i64(), nullptr,
+                                   llvm::Twine(def.name, ".len"));
+        b.CreateMemSet(a, (llvm::Value *)b.getInt8(0),
+                       (uint64_t)cap * (et->getScalarSizeInBits() / 8),
+                       llvm::Align(8));
+        w.limiteds[&def] = { a, len, cap, sub };
+        if (strinit) {
+            auto n = (uint64_t)sl->val.size();
+            if (n > (uint64_t)cap) n = (uint64_t)cap;
+            if (n)
+                b.CreateMemCpy(a, llvm::MaybeAlign(1), strlit_glob(sl->val),
+                               llvm::MaybeAlign(1), n);
+            b.CreateStore(llvm::ConstantInt::get(i64(), n), len);
+            return;
+        }
+        if (!al) return;
+        auto count = CodeGen::LitCount(al);
+        if (count > cap) count = cap;
+        b.CreateStore(llvm::ConstantInt::get(i64(), (uint64_t)count), len);
+        auto elem = [&](int64_t k, llvm::Value *v) {
+            auto *ev = et == i64() ? v : b.CreateTrunc(v, et);
+            b.CreateStore(ev, b.CreateInBoundsGEP(a->getAllocatedType(), a,
+                { llvm::ConstantInt::get(i64(), 0),
+                  llvm::ConstantInt::get(i64(), k) }, "fkp"));
+        };
+        if (al->fillval) {
+            auto *v = GenExpr(al->fillval, w);
+            if (!v) return;
+            for (int64_t k = 0; k < count; k++) elem(k, v);
+        } else {
+            for (int64_t k = 0; k < count && (size_t)k < al->elems.size(); k++) {
+                auto *v = GenExpr(al->elems[(size_t)k], w);
+                if (!v) return;
+                elem(k, v);
+            }
+        }
+    }
+
     // A growable array local (`var a: i64[>..] = [...]`): its storage is one
     // dedicated data stack. The slot is a lazy thread-local gs_stack { top
     // } owned by this slice; emit_program_entry reserves each slot's
@@ -940,21 +1014,37 @@ struct CodeGenIR {
                 return is_uint_ty(sl.inst->ftypes[f]) ? b.CreateZExt(v, i64())
                                                       : b.CreateSExt(v, i64());
             }
-            // A member expression: this slice lowers `.len` (member is a
-            // BuiltinKind, ast.h) on a growable i64 array local.
-            if (dt->member == B_LEN) {
+            // A member expression: this slice lowers `.len` and `.cap`
+            // (member is a BuiltinKind, ast.h) on an array local the walk
+            // holds.
+            if (dt->member == B_LEN || dt->member == B_CAP) {
                 auto *obj = Is<Ident>(dt->obj);
                 if (obj && obj->vdef) {
+                    if (auto lit = w.limiteds.find(obj->vdef);
+                        lit != w.limiteds.end()) {
+                        // A limited array's capacity is the declared
+                        // constant; its count reads out of the header.
+                        if (dt->member == B_CAP)
+                            return llvm::ConstantInt::get(
+                                i64(), (uint64_t)lit->second.cap);
+                        return b.CreateLoad(
+                            i64(), lit->second.len,
+                            llvm::Twine(obj->vdef->name, ".lenv"));
+                    }
                     if (auto fit = w.fixeds.find(obj->vdef);
-                        fit != w.fixeds.end())
+                        fit != w.fixeds.end() && dt->member == B_LEN)
                         return llvm::ConstantInt::get(i64(),
                                                       (uint64_t)fit->second.count);
-                    if (auto *r = rz_head(w, obj->vdef))
-                        return b.CreateLoad(i64(), r->len,
-                                            llvm::Twine(obj->vdef->name, ".lenv"));
+                    if (dt->member == B_LEN) {
+                        if (auto *r = rz_head(w, obj->vdef))
+                            return b.CreateLoad(i64(), r->len,
+                                                llvm::Twine(obj->vdef->name, ".lenv"));
+                    }
                 }
-                SliceVal sv;
-                if (slice_value(dt->obj, w, sv)) return sv.len;
+                if (dt->member == B_LEN) {
+                    SliceVal sv;
+                    if (slice_value(dt->obj, w, sv)) return sv.len;
+                }
             }
             return nullptr;
         }
@@ -995,6 +1085,35 @@ struct CodeGenIR {
                     if (et == i64()) return v;
                     return is_uint_ty(fit->second.etype)
                         ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
+                }
+                if (auto lit = w.limiteds.find(obj->vdef);
+                    lit != w.limiteds.end()) {
+                    auto &lm = lit->second;
+                    auto *idxv = GenExpr(ix->idx, w);
+                    if (!idxv) return nullptr;
+                    auto *lenv = b.CreateLoad(i64(), lm.len, "limlen");
+                    if (!ix->nobc) {
+                        auto *okbb = llvm::BasicBlock::Create(ctx, "limok", w.fn);
+                        auto *failbb = llvm::BasicBlock::Create(ctx, "limfail", w.fn);
+                        b.CreateCondBr(b.CreateICmpULT(idxv, lenv, "limin"),
+                                       okbb, failbb);
+                        b.SetInsertPoint(failbb);
+                        b.CreateCall(f_gs_idxfail, {
+                            idxv, lenv,
+                            llvm::ConstantPointerNull::get(i8ptr()),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(ctx), 0) });
+                        b.CreateUnreachable();
+                        b.SetInsertPoint(okbb);
+                    }
+                    auto *et = int_ll_ty(lm.etype);
+                    auto *p = b.CreateInBoundsGEP(lm.base->getAllocatedType(),
+                        lm.base, { llvm::ConstantInt::get(i64(), 0), idxv },
+                        "limip");
+                    auto *v = b.CreateLoad(et, p, "limval");
+                    if (et == i64()) return v;
+                    return is_uint_ty(lm.etype) ? b.CreateZExt(v, i64())
+                                                : b.CreateSExt(v, i64());
                 }
                 if (auto *r = rz_head(w, obj->vdef)) {
                     auto *idxv = GenExpr(ix->idx, w);
@@ -1094,6 +1213,41 @@ struct CodeGenIR {
                         rz_sync_slot(*r, basev, nlen);
                         return nullptr;
                     }
+                    // A static-capacity limited receiver: the same shape,
+                    // with the element count's growth bounded by the
+                    // declared capacity (GS_E_CAPACITY past it).
+                    if (auto lit = w.limiteds.find(recv->vdef);
+                        lit != w.limiteds.end()) {
+                        auto *v = GenExpr(c->args[0], w);
+                        if (!v) return nullptr;
+                        auto &lm = lit->second;
+                        auto *nl = b.CreateLoad(i64(), lm.len, "limlen");
+                        auto *okbb = llvm::BasicBlock::Create(ctx, "pushok", w.fn);
+                        auto *failbb = llvm::BasicBlock::Create(ctx, "pushcap", w.fn);
+                        b.CreateCondBr(b.CreateICmpULT(
+                            nl, llvm::ConstantInt::get(
+                                i64(), (uint64_t)lm.cap), "pushin"),
+                            okbb, failbb);
+                        b.SetInsertPoint(failbb);
+                        b.CreateCall(f_gs_abort, {
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(ctx), 0),
+                            llvm::ConstantPointerNull::get(i8ptr()),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(ctx),
+                                (uint64_t)c->line.line) });
+                        b.CreateUnreachable();
+                        b.SetInsertPoint(okbb);
+                        auto *et = int_ll_ty(lm.etype);
+                        auto *p = b.CreateInBoundsGEP(lm.base->getAllocatedType(),
+                            lm.base, { llvm::ConstantInt::get(i64(), 0), nl },
+                            "puship");
+                        b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et), p);
+                        b.CreateStore(b.CreateAdd(
+                            nl, llvm::ConstantInt::get(i64(), 1), "limlen+1"),
+                            lm.len);
+                        return nullptr;
+                    }
                 }
             }
             // append (memberof spelling: the receiver is the callee's Dot
@@ -1104,12 +1258,15 @@ struct CodeGenIR {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
                 auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
-                if (!r)
+                auto lit = recv && recv->vdef
+                    ? w.limiteds.find(recv->vdef) : w.limiteds.end();
+                if (!r && lit == w.limiteds.end())
                     return Unsup(cat("an append onto a variable the walk does "
                                      "not hold at line ",
                                      (long long)c->line.line)), nullptr;
-                bool byteelem = r->etype->intstorage == IS_U8
-                    || r->etype->intstorage == IS_I8;
+                bool byteelem = (r ? r->etype : lit->second.etype)->intstorage
+                                    == IS_U8
+                    || (r ? r->etype : lit->second.etype)->intstorage == IS_I8;
                 llvm::Value *data = nullptr, *n = nullptr;
                 if (auto *sl = Is<StrLit>(c->args[0])) {
                     if (!byteelem)
@@ -1137,17 +1294,49 @@ struct CodeGenIR {
                     data = sv.data;
                     n = sv.len;
                 }
-                auto *basev = b.CreateLoad(i8ptr(), r->base, "rzbase");
-                auto *lenv = b.CreateLoad(i64(), r->len, "rzlen");
-                auto *et = int_ll_ty(r->etype);
+                auto *et = int_ll_ty(r ? r->etype : lit->second.etype);
                 auto *esz = llvm::ConstantInt::get(
                     i64(), (uint64_t)(et->getScalarSizeInBits() / 8));
-                auto *dst = b.CreateInBoundsGEP(et, basev, lenv, "apdst");
-                b.CreateMemCpy(dst, llvm::MaybeAlign(1), data, llvm::MaybeAlign(1),
-                               b.CreateMul(n, esz, "apbytes"));
-                auto *nlen = b.CreateAdd(lenv, n, "rzlen+");
-                b.CreateStore(nlen, r->len);
-                rz_sync_slot(*r, basev, nlen);
+                if (r) {
+                    auto *basev = b.CreateLoad(i8ptr(), r->base, "rzbase");
+                    auto *lenv = b.CreateLoad(i64(), r->len, "rzlen");
+                    auto *dst = b.CreateInBoundsGEP(et, basev, lenv, "apdst");
+                    b.CreateMemCpy(dst, llvm::MaybeAlign(1), data,
+                                   llvm::MaybeAlign(1),
+                                   b.CreateMul(n, esz, "apbytes"));
+                    auto *nlen = b.CreateAdd(lenv, n, "rzlen+");
+                    b.CreateStore(nlen, r->len);
+                    rz_sync_slot(*r, basev, nlen);
+                } else {
+                    auto &lm = lit->second;
+                    auto *ol = b.CreateLoad(i64(), lm.len, "limlen");
+                    // The declared capacity bounds the run: past it the
+                    // runtime's GS_E_CAPACITY abort, as the C backend
+                    // emits it (codegen_builtins.h).
+                    auto *okbb = llvm::BasicBlock::Create(ctx, "apok", w.fn);
+                    auto *failbb = llvm::BasicBlock::Create(ctx, "apcap", w.fn);
+                    b.CreateCondBr(b.CreateICmpULE(
+                        b.CreateAdd(ol, n, "limend"),
+                        llvm::ConstantInt::get(i64(), (uint64_t)lm.cap),
+                        "apin"), okbb, failbb);
+                    b.SetInsertPoint(failbb);
+                    b.CreateCall(f_gs_abort, {
+                        llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(ctx), 0),
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(ctx),
+                            (uint64_t)c->line.line) });
+                    b.CreateUnreachable();
+                    b.SetInsertPoint(okbb);
+                    auto *dst = b.CreateInBoundsGEP(
+                        lm.base->getAllocatedType(), lm.base,
+                        { llvm::ConstantInt::get(i64(), 0), ol }, "apdst");
+                    b.CreateMemCpy(dst, llvm::MaybeAlign(1), data,
+                                   llvm::MaybeAlign(1),
+                                   b.CreateMul(n, esz, "apbytes"));
+                    b.CreateStore(b.CreateAdd(ol, n, "limlen+"), lm.len);
+                }
                 return nullptr;
             }
             // pop (memberof spelling) from a growable int array the walk
@@ -1159,12 +1348,15 @@ struct CodeGenIR {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
                 auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
-                if (!r)
+                auto lit = recv && recv->vdef
+                    ? w.limiteds.find(recv->vdef) : w.limiteds.end();
+                if (!r && lit == w.limiteds.end())
                     return Unsup(cat("a pop from a variable the walk does not "
                                      "hold at line ", (long long)c->line.line)),
                         nullptr;
-                auto *basev = b.CreateLoad(i8ptr(), r->base, "rzbase");
-                auto *lenv = b.CreateLoad(i64(), r->len, "rzlen");
+                auto *basev = r ? b.CreateLoad(i8ptr(), r->base, "rzbase") : nullptr;
+                auto *lenv = r ? b.CreateLoad(i64(), r->len, "rzlen")
+                    : b.CreateLoad(i64(), lit->second.len, "limlen");
                 if (!c->nobc) {
                     auto *okbb = llvm::BasicBlock::Create(ctx, "popok", w.fn);
                     auto *failbb = llvm::BasicBlock::Create(ctx, "popfail", w.fn);
@@ -1181,10 +1373,58 @@ struct CodeGenIR {
                     b.SetInsertPoint(okbb);
                 }
                 auto *nlen = b.CreateSub(lenv, llvm::ConstantInt::get(i64(), 1),
-                                         "rzlen-1");
-                b.CreateStore(nlen, r->len);
-                rz_sync_slot(*r, basev, nlen);
-                return rz_load_elem(*r, basev, nlen, "rzpop");
+                                         "len-1");
+                if (r) {
+                    b.CreateStore(nlen, r->len);
+                    rz_sync_slot(*r, basev, nlen);
+                    return rz_load_elem(*r, basev, nlen, "rzpop");
+                }
+                b.CreateStore(nlen, lit->second.len);
+                auto *et = int_ll_ty(lit->second.etype);
+                auto *ev = b.CreateLoad(
+                    et, b.CreateInBoundsGEP(et, lit->second.base, nlen, "limpop"),
+                    "limpop");
+                if (et == i64()) return ev;
+                return is_uint_ty(lit->second.etype)
+                    ? b.CreateZExt(ev, i64()) : b.CreateSExt(ev, i64());
+            }
+            // pop_n drops the count's last elements at once (the count's
+            // argument first, then the length it may itself have changed):
+            // one unsigned compare rejects a count past the length and a
+            // negative one alike, the runtime's GS_E_POPN abort.
+            if (c->builtin == B_POP_N && c->args.size() == 1) {
+                auto *rd = Is<Dot>(c->callee);
+                auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+                auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
+                auto lit = recv && recv->vdef
+                    ? w.limiteds.find(recv->vdef) : w.limiteds.end();
+                if (!r && lit == w.limiteds.end())
+                    return Unsup(cat("a pop_n from an array the walk does not "
+                                     "hold at line ", (long long)c->line.line)),
+                        nullptr;
+                auto *nn = GenExpr(c->args[0], w);
+                if (!nn) return nullptr;
+                auto *lenv = r ? b.CreateLoad(i64(), r->len, "rzlen")
+                    : b.CreateLoad(i64(), lit->second.len, "limlen");
+                auto *okbb = llvm::BasicBlock::Create(ctx, "pnok", w.fn);
+                auto *failbb = llvm::BasicBlock::Create(ctx, "pnfail", w.fn);
+                b.CreateCondBr(b.CreateICmpULE(nn, lenv, "pnin"), okbb, failbb);
+                b.SetInsertPoint(failbb);
+                b.CreateCall(f_gs_abort, {
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 15),
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                           (uint64_t)c->line.line) });
+                b.CreateUnreachable();
+                b.SetInsertPoint(okbb);
+                auto *nlen = b.CreateSub(lenv, nn, "len-n");
+                if (r) {
+                    b.CreateStore(nlen, r->len);
+                    rz_sync_slot(*r, b.CreateLoad(i8ptr(), r->base), nlen);
+                } else {
+                    b.CreateStore(nlen, lit->second.len);
+                }
+                return nullptr;
             }
             // print's line alphabet this slice covers: int values and
             // string literals, with no separator of its own, rendered into the same
@@ -1490,6 +1730,15 @@ struct CodeGenIR {
                     : (llvm::Value *)llvm::ConstantPointerNull::get(i8ptr());
                 out.len = llvm::ConstantInt::get(i64(), (uint64_t)fx.count);
                 out.etype = fx.etype;
+                return true;
+            }
+            if (auto lit = w.limiteds.find(obj->vdef); lit != w.limiteds.end()) {
+                auto &lm = lit->second;
+                out.data = b.CreateInBoundsGEP(lm.base->getAllocatedType(),
+                    lm.base, { llvm::ConstantInt::get(i64(), 0),
+                               llvm::ConstantInt::get(i64(), 0) }, "svd");
+                out.len = b.CreateLoad(i64(), lm.len, "svn");
+                out.etype = lm.etype;
                 return true;
             }
             if (auto *r = rz_head(w, obj->vdef)) {
@@ -1807,11 +2056,12 @@ struct CodeGenIR {
     void GenIndexStore(Assign *as, Index *ix, FnWalk &w) {
         auto *obj = Is<Ident>(ix->obj);
         auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef) : w.fixeds.end();
-        auto *r = (obj && obj->vdef && fit == w.fixeds.end())
+        auto lit = obj && obj->vdef ? w.limiteds.find(obj->vdef) : w.limiteds.end();
+        auto *r = (obj && obj->vdef && fit == w.fixeds.end() && lit == w.limiteds.end())
             ? rz_head(w, obj->vdef) : nullptr;
         SliceVal sv;
         bool isslice = false;
-        if (fit == w.fixeds.end() && !r) {
+        if (fit == w.fixeds.end() && lit == w.limiteds.end() && !r) {
             // A view: a slice local, or a range of an array or view. The
             // subject expression is read out once.
             isslice = slice_value(ix->obj, w, sv);
@@ -1857,6 +2107,23 @@ struct CodeGenIR {
             if (as->op != T_ASSIGN) {
                 auto *cur = b.CreateLoad(et, p, "stcur");
                 auto *cur64 = is_uint_ty(fx.etype) ? b.CreateZExt(cur, i64())
+                                                   : b.CreateSExt(cur, i64());
+                rhs = ArithEq(as->op, cur64, rhs, w);
+                if (!rhs) return Unsup("a compound index assignment of this operator");
+            }
+            b.CreateStore(et == i64() ? rhs : b.CreateTrunc(rhs, et), p);
+            return;
+        }
+        if (lit != w.limiteds.end()) {
+            auto &lm = lit->second;
+            auto *et = int_ll_ty(lm.etype);
+            auto *lenv = b.CreateLoad(i64(), lm.len, "limlen");
+            check(lenv);
+            auto *p = b.CreateInBoundsGEP(lm.base->getAllocatedType(), lm.base,
+                { llvm::ConstantInt::get(i64(), 0), idx }, "stip");
+            if (as->op != T_ASSIGN) {
+                auto *cur = b.CreateLoad(et, p, "stcur");
+                auto *cur64 = is_uint_ty(lm.etype) ? b.CreateZExt(cur, i64())
                                                    : b.CreateSExt(cur, i64());
                 rhs = ArithEq(as->op, cur64, rhs, w);
                 if (!rhs) return Unsup("a compound index assignment of this operator");
@@ -2065,6 +2332,12 @@ struct CodeGenIR {
                     emit_fixed_decl(vd, i, *vddef, w);
                     continue;
                 }
+                if (vddef->type->kind == TY_ARRAY
+                    && vddef->type->arr->akind == A_LIMITED
+                    && is_int_ty(vddef->type->arr->sub)) {
+                    emit_limited_decl(vd, i, *vddef, w);
+                    continue;
+                }
                 if (is_flat_int_struct(vddef->type)) {
                     emit_struct_decl(vd, i, *vddef, w);
                     continue;
@@ -2250,11 +2523,16 @@ struct CodeGenIR {
                 auto *obj = Is<Ident>(fl->iter);
                 FnWalk::RzArr *gr = nullptr;
                 FnWalk::FixedArr *fa = nullptr;
+                FnWalk::LimArr *la = nullptr;
                 if (obj && obj->vdef) {
                     gr = rz_head(w, obj->vdef);
                     if (!gr) {
                         auto fit = w.fixeds.find(obj->vdef);
                         if (fit != w.fixeds.end()) fa = &fit->second;
+                        else {
+                            auto lit = w.limiteds.find(obj->vdef);
+                            if (lit != w.limiteds.end()) la = &lit->second;
+                        }
                     }
                 }
                 // A view: a slice local, a range of an array, or a range of a
@@ -2263,7 +2541,7 @@ struct CodeGenIR {
                 // temporary it made.
                 SliceVal sv;
                 bool isv = false;
-                if (!gr && !fa) {
+                if (!gr && !fa && !la) {
                     isv = slice_value(fl->iter, w, sv);
                     if (!isv)
                         return Unsup(cat("a for loop over ",
@@ -2272,7 +2550,8 @@ struct CodeGenIR {
                 }
                 auto *iid = isv ? Is<Ident>(fl->iter) : nullptr;
                 bool reload = iid && iid->vdef && w.slices.count(iid->vdef);
-                TypeExpr *etype = gr ? gr->etype : fa ? fa->etype : sv.etype;
+                TypeExpr *etype = gr ? gr->etype
+                    : fa ? fa->etype : la ? la->etype : sv.etype;
                 llvm::Type *et = int_ll_ty(etype);
                 auto *fn = w.fn;
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
@@ -2294,6 +2573,7 @@ struct CodeGenIR {
                 llvm::Value *lenv = gr
                     ? (llvm::Value *)b.CreateLoad(i64(), gr->len, "for_len")
                     : fa ? (llvm::Value *)llvm::ConstantInt::get(i64(), (uint64_t)fa->count)
+                    : la ? (llvm::Value *)b.CreateLoad(i64(), la->len, "for_len")
                          : sv.len;
                 b.CreateCondBr(b.CreateICmpULT(iv, lenv, "for_test"),
                                bodybb, donebb);
@@ -2313,6 +2593,11 @@ struct CodeGenIR {
                             : (llvm::Value *)llvm::Constant::getNullValue(et))
                         : gr ? rz_load_elem(*gr,
                             b.CreateLoad(i8ptr(), gr->base), iv, "for_ip")
+                        : la ? b.CreateLoad(et,
+                            b.CreateInBoundsGEP(la->base->getAllocatedType(),
+                                la->base,
+                                { llvm::ConstantInt::get(i64(), 0), iv },
+                                "for_ip"), "for_ev")
                              : b.CreateLoad(et,
                                  b.CreateInBoundsGEP(et, sv.data, iv, "for_ip"),
                                  "for_ev");
