@@ -167,7 +167,10 @@ stores work on a field path to the leaf (`a`, `a.b`, `a.b.c`) at the
 leaf's own width, a copy moves the whole value between locals, and one
 crosses a call by value (a struct-shaped
 LLVM parameter, a single struct result, the callee's own copy in an
-alloca). An int parameter gets a slot of the body's own from entry, so a
+alloca). A reference to a flat struct crosses a call as one pointer;
+a `.=` binding, a parameter, a field path root and a call result all
+name the struct body through it, and a `var r = f()` binding reads the
+whole value at the pointer. An int parameter gets a slot of the body's own from entry, so a
 loop that reassigns it each round reads what the last round stored. A slice
 (`T[:]` of int) is a `{ data, len }` view: a local is built from a
 range over a fixed, growable or slice subject (`a[lo..hi]`, open and
@@ -209,7 +212,7 @@ a loop body reuses its slot instead of walking the native stack off its
 end. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 41 of the codegen output fixtures pass through
+in the output now refuse. 42 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

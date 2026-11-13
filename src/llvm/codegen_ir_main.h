@@ -321,6 +321,21 @@ struct CodeGenIR {
             && t->ref->sub->kind == TY_INT && int_ll_ty(t->ref->sub) == i64();
     }
 
+    // The flat struct a reference type points at, or null: the pointee a
+    // path or a whole-value read reaches through the pointer.
+    static TypeExpr *struct_ref_pointee(TypeExpr *t) {
+        return t && t->kind == TY_REF && is_flat_struct(t->ref->sub)
+             ? t->ref->sub : nullptr;
+    }
+
+    // A reference this slice carries as one pointer: its pointee is an i64
+    // or a flat int struct, both of which live in an alloca of their own.
+    // A growable pointee is the { header, stack } pair instead (rzrefs).
+    bool is_flat_ref(TypeExpr *t) {
+        return t && t->kind == TY_REF
+            && (is_i64_ref(t) || is_flat_struct(t->ref->sub));
+    }
+
     // A growable array of an int-walkable element: the data-stack slice's
     // subject. A_GROWSHRINK stays out for now: shrinking from the front
     // moves gs_rhdr.base, which this slice does not lower.
@@ -564,6 +579,8 @@ struct CodeGenIR {
                 if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
                 else if (t->kind == TY_REF && is_int_ty(t->ref->sub))
                     argtys.push_back(i8ptr());
+                else if (t->kind == TY_REF && is_flat_struct(t->ref->sub))
+                    argtys.push_back(i8ptr());
                 else if (t->kind == TY_REF && is_growable_i64(t->ref->sub)) {
                     // A reference to a growable array: the C backend's
                     // (gs_rhdr *, gs_stack *) pair, two pointers.
@@ -587,7 +604,7 @@ struct CodeGenIR {
                     retty = slice_ll_ty();
                 else if (sp->rets.size() == 1 && is_flat_struct(sp->rets[0]))
                     retty = struct_ty(sp->rets[0]);
-                else if (sp->rets.size() == 1 && is_i64_ref(sp->rets[0]))
+                else if (sp->rets.size() == 1 && is_flat_ref(sp->rets[0]))
                     retty = i8ptr();
                 else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
                          && allretint)
@@ -644,7 +661,9 @@ struct CodeGenIR {
                     b.CreateStore(fn->getArg(argidx), slot);
                     w.slices[sp->params[i]] = { slot, pt->sub };
                     argidx += 1;
-                } else if (pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
+                } else if (pt->kind == TY_REF
+                           && (is_int_ty(pt->ref->sub)
+                               || is_flat_struct(pt->ref->sub))) {
                     // A reference parameter: one pointer holder, its store
                     // the argument's slot; the body's rebinds write there.
                     auto *slot = b.CreateAlloca(i8ptr(), nullptr,
@@ -1164,6 +1183,10 @@ struct CodeGenIR {
                 auto rit = w.refs.find(id->vdef);
                 if (rit != w.refs.end()) {
                     auto *p = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                    if (is_flat_struct(rit->second.ptee))
+                        return b.CreateLoad(
+                            struct_ll_ty(rit->second.ptee->struc->inst), p,
+                            llvm::Twine(id->vdef->name));
                     auto *et = int_ll_ty(rit->second.ptee);
                     auto *v = b.CreateLoad(et, p, llvm::Twine(id->vdef->name));
                     if (et == i64()) return v;
@@ -1684,8 +1707,10 @@ struct CodeGenIR {
                 if (!v) return nullptr;
                 // A single reference result in a value position reads
                 // through it: binding a call's reference to a fixed-size
-                // value takes a copy of the pointee (4.1).
-                if (c->spec->rets.size() == 1 && is_i64_ref(c->spec->rets[0]))
+                // value takes a copy of the pointee (4.1). A void call
+                // has no result at all.
+                if (c->spec->rets.size() == 1
+                    && is_i64_ref(c->spec->rets[0]))
                     return b.CreateLoad(i64(), v, "refv");
                 return v;
             }
@@ -2005,6 +2030,37 @@ struct CodeGenIR {
             w.rzrefs[&def] = { holder, ptee->arr->sub };
             return;
         }
+        if (is_flat_struct(ptee)) {
+            // A reference to a struct: the address its initializer names is
+            // the body every read and write through the holder reaches. A
+            // call handing one back yields the pointer itself.
+            llvm::Value *ptr = nullptr;
+            if (auto *c = init ? Is<Call>(init) : nullptr) {
+                if (!c->spec || c->spec->rets.size() != 1
+                    || !struct_ref_pointee(c->spec->rets[0]))
+                    return Unsup(cat("a reference bound to a value the walk "
+                                     "does not hold at line ",
+                                     (long long)vd->line.line));
+                ptr = EmitDirectCall(c, w, nullptr);
+            } else if (auto *ib = init ? Is<InlineBlock>(init) : nullptr) {
+                if (!ib->spec || ib->spec->rets.size() != 1
+                    || !struct_ref_pointee(ib->spec->rets[0]))
+                    return Unsup(cat("a reference bound to a value the walk "
+                                     "does not hold at line ",
+                                     (long long)vd->line.line));
+                ptr = GenInline(ib, w);
+            } else {
+                ptr = ref_addr(init, w);
+            }
+            if (!ptr)
+                return Unsup(cat("a reference bound to a value the walk does "
+                                 "not hold at line ",
+                                 (long long)vd->line.line));
+            auto *slot = entry_alloca(w, i8ptr(), llvm::Twine(def.name));
+            b.CreateStore(ptr, slot);
+            w.refs[&def] = { slot, ptee };
+            return;
+        }
         llvm::Value *ptr = nullptr;
         // The initializer may be a call (or an inlined body) whose single
         // result is the reference itself: the pointer it yields is what the
@@ -2062,6 +2118,8 @@ struct CodeGenIR {
                 return b.CreateLoad(i8ptr(), rit->second.base, "refp");
             auto lit = w.locals.find(id->vdef);
             if (lit != w.locals.end()) return lit->second;
+            auto sit = w.structs.find(id->vdef);
+            if (sit != w.structs.end()) return sit->second.base;
             auto git = global_vars.find(id->vdef);
             if (git != global_vars.end()) return git->second.gv;
             return nullptr;
@@ -2070,9 +2128,10 @@ struct CodeGenIR {
             llvm::Value *addr = nullptr;
             StructInst *oi = nullptr;
             TypeExpr *leaf = nullptr;
-            if (field_path_addr(dt, w, addr, oi, leaf) && is_int_ty(leaf)
-                && int_ll_ty(leaf) == i64())
-                return addr;
+            if (!field_path_addr(dt, w, addr, oi, leaf)) return nullptr;
+            if (is_flat_struct(leaf)) return addr;
+            if (is_int_ty(leaf) && int_ll_ty(leaf) == i64()) return addr;
+            return nullptr;
         }
         return nullptr;
     }
@@ -2193,6 +2252,14 @@ struct CodeGenIR {
             return true;
         }
         if (auto *id = Is<Ident>(n)) {
+            auto rit = id->vdef ? w.refs.find(id->vdef) : w.refs.end();
+            if (rit != w.refs.end() && is_flat_struct(rit->second.ptee)) {
+                inst = rit->second.ptee->struc->inst;
+                out = b.CreateLoad(
+                    struct_ll_ty(inst),
+                    b.CreateLoad(i8ptr(), rit->second.base, "refp"), "stv");
+                return true;
+            }
             auto sit = id->vdef ? w.structs.find(id->vdef) : w.structs.end();
             if (sit == w.structs.end()) return false;
             inst = sit->second.inst;
@@ -2355,9 +2422,32 @@ struct CodeGenIR {
             auto *obj = Is<Ident>(dt->obj);
             auto sit = obj && obj->vdef ? w.structs.find(obj->vdef)
                                         : w.structs.end();
-            if (sit != w.structs.end()) {
+            auto rit = obj && obj->vdef ? w.refs.find(obj->vdef)
+                                        : w.refs.end();
+            if (rit != w.refs.end() && is_flat_struct(rit->second.ptee)) {
+                // A reference to a struct: the path starts at the pointee
+                // the holder names.
+                inst = rit->second.ptee->struc->inst;
+                addr = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+            } else if (sit != w.structs.end()) {
                 inst = sit->second.inst;
                 addr = sit->second.base;
+            } else if (auto *cr = Is<Call>(dt->obj); cr && cr->spec
+                       && cr->spec->rets.size() == 1
+                       && struct_ref_pointee(cr->spec->rets[0])) {
+                // A call handing a reference to a struct back: the pointer
+                // it yields is the path's base.
+                auto *pv = EmitDirectCall(cr, w, nullptr);
+                if (!pv) return false;
+                inst = struct_ref_pointee(cr->spec->rets[0])->struc->inst;
+                addr = pv;
+            } else if (auto *ir = Is<InlineBlock>(dt->obj); ir && ir->spec
+                       && ir->spec->rets.size() == 1
+                       && struct_ref_pointee(ir->spec->rets[0])) {
+                auto *pv = GenInline(ir, w);
+                if (!pv) return false;
+                inst = struct_ref_pointee(ir->spec->rets[0])->struc->inst;
+                addr = pv;
             } else {
                 // A struct value that is not a local: a call's result or a
                 // literal. It is built in a temporary of its own, whose
@@ -2551,10 +2641,11 @@ struct CodeGenIR {
                 && !is_flat_struct(t)
                 && !(t && t->kind == TY_REF
                      && (is_int_ty(t->ref->sub)
-                         || is_growable_i64(t->ref->sub)))) return nullptr;
+                         || is_growable_i64(t->ref->sub)
+                         || is_flat_struct(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
-                && !is_flat_struct(rt) && !is_i64_ref(rt)) return nullptr;
+                && !is_flat_struct(rt) && !is_flat_ref(rt)) return nullptr;
         auto nrets = sp->rets.size();
         // A multi-result call in a value position (not bound to locals)
         // discards results 1..: it materializes their out-slots here and
@@ -2614,6 +2705,12 @@ struct CodeGenIR {
                 args.push_back(spv);
                 continue;
             }
+            if (pt->kind == TY_REF && is_flat_struct(pt->ref->sub)) {
+                auto *ptr = ref_addr(a, w);
+                if (!ptr) return nullptr;
+                args.push_back(ptr);
+                continue;
+            }
             if (pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
                 // A reference parameter's argument is the place it names:
                 // a variable this walk holds, whose slot is passed, or a
@@ -2669,7 +2766,7 @@ struct CodeGenIR {
         bool stret = ib->spec && ib->spec->rets.size() == 1
                   && is_flat_struct(ib->spec->rets[0]);
         bool refret = ib->spec && ib->spec->rets.size() == 1
-                   && is_i64_ref(ib->spec->rets[0]);
+                   && is_flat_ref(ib->spec->rets[0]);
         llvm::Value *tv = nullptr;
         if (ib->body) {
             for (auto *s : ib->body->stmts) GenStmt(s, w);
@@ -2745,7 +2842,7 @@ struct CodeGenIR {
                 // the function hands back.
                 if (top && w.fn->getReturnType()->isPointerTy() && w.spec
                     && w.spec->rets.size() == 1
-                    && is_i64_ref(w.spec->rets[0])
+                    && is_flat_ref(w.spec->rets[0])
                     && !b.GetInsertBlock()->getTerminator()) {
                     if (auto *p = ref_addr(blk->tail, w)) b.CreateRet(p);
                     return;
@@ -2825,7 +2922,8 @@ struct CodeGenIR {
                 }
                 if (vddef->type->kind == TY_REF
                     && (is_int_ty(vddef->type->ref->sub)
-                        || is_growable_i64(vddef->type->ref->sub))) {
+                        || is_growable_i64(vddef->type->ref->sub)
+                        || is_flat_struct(vddef->type->ref->sub))) {
                     emit_ref_decl(vd, i, *vddef, w);
                     continue;
                 }
@@ -3303,7 +3401,7 @@ struct CodeGenIR {
                 bool stret = ispec && ispec->rets.size() == 1
                           && is_flat_struct(ispec->rets[0]);
                 bool refret = ispec && ispec->rets.size() == 1
-                           && is_i64_ref(ispec->rets[0]);
+                           && is_flat_ref(ispec->rets[0]);
                 llvm::Value *v = nullptr;
                 if (!ret->vals.empty()) {
                     if (sret) {
@@ -3379,7 +3477,7 @@ struct CodeGenIR {
                 }
                 if (w.fn->getReturnType()->isPointerTy() && w.spec
                     && w.spec->rets.size() == 1
-                    && is_i64_ref(w.spec->rets[0])) {
+                    && is_flat_ref(w.spec->rets[0])) {
                     auto *p = ref_addr(ret->vals[0], w);
                     if (p) b.CreateRet(p);
                     return;
