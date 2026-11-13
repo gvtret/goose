@@ -186,7 +186,12 @@ field its initializer names (an `&` is what the walk reads through,
 whether the checker's synthetic one or the source's own), a
 read loads the pointee at its own width, a plain assignment and `+=`
 write it, `++` steps it, and a rebind (`r .= m`) stores the new slot
-into the holder. A reference to a growable array (`T[>..]&`) is the pair
+into the holder. A function may return such a reference (`-> i64&`): the
+shell's result is the pointer itself, the returning expression's address
+(a local's slot, a global's, a reference parameter's pointee, a field's
+leaf) is what it hands back, and a value position reads through it while
+`var r .= f()` keeps the pointer, so the binding writes the original.
+A reference to a growable array (`T[>..]&`) is the pair
 the C backend carries, `{ header, stack }` as two pointers: the local or
 global header is one `{ base, count }` record (the C `gs_rhdr`), a
 reference binding stores the pair in its holder and every use loads it
@@ -204,7 +209,7 @@ a loop body reuses its slot instead of walking the native stack off its
 end. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 38 of the codegen output fixtures pass through
+in the output now refuse. 41 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

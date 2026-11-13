@@ -313,6 +313,14 @@ struct CodeGenIR {
         return is_uint_ty(t) ? b.CreateZExt(tr, i64()) : b.CreateSExt(tr, i64());
     }
 
+    // A reference to an i64, the one pointee width this slice gives a
+    // function result: every narrower local lives widened in an i64 slot, so
+    // its address is not the value's.
+    bool is_i64_ref(TypeExpr *t) {
+        return t && t->kind == TY_REF && t->ref->sub
+            && t->ref->sub->kind == TY_INT && int_ll_ty(t->ref->sub) == i64();
+    }
+
     // A growable array of an int-walkable element: the data-stack slice's
     // subject. A_GROWSHRINK stays out for now: shrinking from the front
     // moves gs_rhdr.base, which this slice does not lower.
@@ -579,6 +587,8 @@ struct CodeGenIR {
                     retty = slice_ll_ty();
                 else if (sp->rets.size() == 1 && is_flat_struct(sp->rets[0]))
                     retty = struct_ty(sp->rets[0]);
+                else if (sp->rets.size() == 1 && is_i64_ref(sp->rets[0]))
+                    retty = i8ptr();
                 else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
                          && allretint)
                     retty = i64ty;
@@ -676,6 +686,8 @@ struct CodeGenIR {
                     else if (fn->getReturnType()->isStructTy())
                         b.CreateRet(llvm::Constant::getNullValue(
                             fn->getReturnType()));
+                    else if (fn->getReturnType()->isPointerTy())
+                        b.CreateRet(llvm::ConstantPointerNull::get(i8ptr()));
                     else b.CreateRet(llvm::ConstantInt::get(i64ty, 0));
                 }
             }
@@ -1668,7 +1680,14 @@ struct CodeGenIR {
                 return Unsup(cat("a variant dispatch call at line ",
                                  (long long)c->line.line)), nullptr;
             if (c->spec) {
-                return EmitDirectCall(c, w, nullptr);
+                auto *v = EmitDirectCall(c, w, nullptr);
+                if (!v) return nullptr;
+                // A single reference result in a value position reads
+                // through it: binding a call's reference to a fixed-size
+                // value takes a copy of the pointee (4.1).
+                if (c->spec->rets.size() == 1 && is_i64_ref(c->spec->rets[0]))
+                    return b.CreateLoad(i64(), v, "refv");
+                return v;
             }
             // Any other builtin is a construct the walk does not emit: a
             // void one would otherwise vanish from the program.
@@ -1677,7 +1696,14 @@ struct CodeGenIR {
                           " at line ", (long long)c->line.line));
             return nullptr;
         }
-        if (auto *ib = Is<InlineBlock>(n)) return GenInline(ib, w);
+        if (auto *ib = Is<InlineBlock>(n)) {
+            auto *v = GenInline(ib, w);
+            if (!v) return nullptr;
+            if (ib->spec && ib->spec->rets.size() == 1
+                && is_i64_ref(ib->spec->rets[0]))
+                return b.CreateLoad(i64(), v, "refv");
+            return v;
+        }
         if (auto *eb = Is<EarlyBlock>(n)) {
             // A `block { ... }` expression: walk its body's statements and
             // return the body's tail value (a value-carrying break).
@@ -1980,7 +2006,24 @@ struct CodeGenIR {
             return;
         }
         llvm::Value *ptr = nullptr;
-        if (id && id->vdef) {
+        // The initializer may be a call (or an inlined body) whose single
+        // result is the reference itself: the pointer it yields is what the
+        // holder keeps.
+        if (auto *c = init ? Is<Call>(init) : nullptr) {
+            if (!c->spec || c->spec->rets.size() != 1
+                || !is_i64_ref(c->spec->rets[0]))
+                return Unsup(cat("a reference bound to a value the walk does "
+                                 "not hold at line ",
+                                 (long long)vd->line.line));
+            ptr = EmitDirectCall(c, w, nullptr);
+        } else if (auto *ib = init ? Is<InlineBlock>(init) : nullptr) {
+            if (!ib->spec || ib->spec->rets.size() != 1
+                || !is_i64_ref(ib->spec->rets[0]))
+                return Unsup(cat("a reference bound to a value the walk does "
+                                 "not hold at line ",
+                                 (long long)vd->line.line));
+            ptr = GenInline(ib, w);
+        } else if (id && id->vdef) {
             auto lit = w.locals.find(id->vdef);
             if (lit != w.locals.end()) ptr = lit->second;
             else {
@@ -2004,6 +2047,34 @@ struct CodeGenIR {
         auto *slot = entry_alloca(w, i8ptr(), llvm::Twine(def.name));
         b.CreateStore(ptr, slot);
         w.refs[&def] = { slot, ptee };
+    }
+
+    // The address a reference-valued expression names: what a function
+    // returning `i64&` hands back, and what a `.=` binding keeps. A local or
+    // global slot, the pointer a reference holds, or a field path's leaf.
+    llvm::Value *ref_addr(Node *n, FnWalk &w) {
+        if (auto *u = Is<Unary>(n))
+            if (u->op == T_BITAND) n = u->child;
+        if (auto *id = Is<Ident>(n)) {
+            if (!id->vdef) return nullptr;
+            auto rit = w.refs.find(id->vdef);
+            if (rit != w.refs.end())
+                return b.CreateLoad(i8ptr(), rit->second.base, "refp");
+            auto lit = w.locals.find(id->vdef);
+            if (lit != w.locals.end()) return lit->second;
+            auto git = global_vars.find(id->vdef);
+            if (git != global_vars.end()) return git->second.gv;
+            return nullptr;
+        }
+        if (auto *dt = Is<Dot>(n)) {
+            llvm::Value *addr = nullptr;
+            StructInst *oi = nullptr;
+            TypeExpr *leaf = nullptr;
+            if (field_path_addr(dt, w, addr, oi, leaf) && is_int_ty(leaf)
+                && int_ll_ty(leaf) == i64())
+                return addr;
+        }
+        return nullptr;
     }
 
     // `var s: T[:] = <view>`: the view lands in a { data, len } alloca.
@@ -2483,9 +2554,19 @@ struct CodeGenIR {
                          || is_growable_i64(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
-                && !is_flat_struct(rt)) return nullptr;
+                && !is_flat_struct(rt) && !is_i64_ref(rt)) return nullptr;
         auto nrets = sp->rets.size();
-        if (nrets > 1 && (!outs || outs->size() < nrets)) return nullptr;
+        // A multi-result call in a value position (not bound to locals)
+        // discards results 1..: it materializes their out-slots here and
+        // returns only the value.
+        std::vector<llvm::Value *> localouts;
+        if (nrets > 1 && (!outs || outs->size() < nrets)) {
+            localouts.assign(nrets, nullptr);
+            for (size_t i = 1; i < nrets; ++i)
+                localouts[i] = entry_alloca(w, i64(),
+                                            cat("mr", (long long)i));
+            outs = &localouts;
+        }
         string callee = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
         if (name_counts[sp->sf->qname] > 1)
             callee += cat("_", sp->id);
@@ -2587,6 +2668,8 @@ struct CodeGenIR {
                  && is_slice_of_int(ib->spec->rets[0]);
         bool stret = ib->spec && ib->spec->rets.size() == 1
                   && is_flat_struct(ib->spec->rets[0]);
+        bool refret = ib->spec && ib->spec->rets.size() == 1
+                   && is_i64_ref(ib->spec->rets[0]);
         llvm::Value *tv = nullptr;
         if (ib->body) {
             for (auto *s : ib->body->stmts) GenStmt(s, w);
@@ -2602,6 +2685,10 @@ struct CodeGenIR {
                     StructInst *si = nullptr;
                     llvm::Value *sv = nullptr;
                     if (struct_value(tn, w, sv, si)) tv = sv;
+                } else if (refret) {
+                    // An inlined body returning a reference: its tail names
+                    // the address the call would have handed back.
+                    tv = ref_addr(tn, w);
                 } else if (valueless || Is<Return>(tn)) {
                     GenStmt(tn, w);
                 } else {
@@ -2654,6 +2741,15 @@ struct CodeGenIR {
                     GenStmt(blk->tail, w);
                     return;
                 }
+                // A reference result: the body's tail names the address
+                // the function hands back.
+                if (top && w.fn->getReturnType()->isPointerTy() && w.spec
+                    && w.spec->rets.size() == 1
+                    && is_i64_ref(w.spec->rets[0])
+                    && !b.GetInsertBlock()->getTerminator()) {
+                    if (auto *p = ref_addr(blk->tail, w)) b.CreateRet(p);
+                    return;
+                }
                 // A value-producing tail of the top-level body: the implicit
                 // return. Nested blocks evaluate their tail for effect and
                 // value only.
@@ -2681,7 +2777,11 @@ struct CodeGenIR {
                 std::vector<llvm::Value *> outs(vd->defs.size(), nullptr);
                 std::vector<llvm::AllocaInst *> slots(vd->defs.size(), nullptr);
                 for (size_t i = 0; i < vd->defs.size(); ++i) {
-                    if (!vd->defs[i] || !is_int_ty(vd->defs[i]->type)) return;
+                    // A bool result slots like an int: the walk carries both
+                    // as i64.
+                    if (!vd->defs[i]
+                        || (!is_int_ty(vd->defs[i]->type)
+                            && !is_bool_ty(vd->defs[i]->type))) return;
                     slots[i] = entry_alloca(w, i64(), llvm::Twine(vd->defs[i]->name));
                     outs[i] = slots[i];
                 }
@@ -3202,6 +3302,8 @@ struct CodeGenIR {
                          && is_slice_of_int(ispec->rets[0]);
                 bool stret = ispec && ispec->rets.size() == 1
                           && is_flat_struct(ispec->rets[0]);
+                bool refret = ispec && ispec->rets.size() == 1
+                           && is_i64_ref(ispec->rets[0]);
                 llvm::Value *v = nullptr;
                 if (!ret->vals.empty()) {
                     if (sret) {
@@ -3211,6 +3313,9 @@ struct CodeGenIR {
                     } else if (stret) {
                         StructInst *si = nullptr;
                         if (!struct_value(ret->vals[0], w, v, si)) return;
+                    } else if (refret) {
+                        v = ref_addr(ret->vals[0], w);
+                        if (!v) return;
                     } else {
                         v = GenExpr(ret->vals[0], w);
                         if (!v) return;
@@ -3243,9 +3348,13 @@ struct CodeGenIR {
                     if (!v) return;
                     vals.push_back(v);
                 }
+                // An out-pointer is written at the walk's own width: a bool
+                // result stores as i64, not as the i1 its compare produced,
+                // or the caller would read the slot's other bytes.
                 for (size_t i = 1; i < vals.size(); ++i)
-                    b.CreateStore(vals[i], w.fn->getArg(w.outstart + i - 1));
-                b.CreateRet(vals[0]);
+                    b.CreateStore(as_i64(vals[i]),
+                                  w.fn->getArg(w.outstart + i - 1));
+                b.CreateRet(as_i64(vals[0]));
                 return;
             }
             if (ret->vals.empty() && w.fn->getReturnType()->isVoidTy()) {
@@ -3268,6 +3377,13 @@ struct CodeGenIR {
                     b.CreateRet(sv);
                     return;
                 }
+                if (w.fn->getReturnType()->isPointerTy() && w.spec
+                    && w.spec->rets.size() == 1
+                    && is_i64_ref(w.spec->rets[0])) {
+                    auto *p = ref_addr(ret->vals[0], w);
+                    if (p) b.CreateRet(p);
+                    return;
+                }
                 auto *v = GenExpr(ret->vals[0], w);
                 if (v) b.CreateRet(as_i64(v));
                 return;
@@ -3281,6 +3397,8 @@ struct CodeGenIR {
             else if (w.fn->getReturnType()->isStructTy())
                 b.CreateRet(llvm::Constant::getNullValue(
                     w.fn->getReturnType()));
+            else if (w.fn->getReturnType()->isPointerTy())
+                b.CreateRet(llvm::ConstantPointerNull::get(i8ptr()));
             return;
         }
         // Expression-as-statement (e.g. print(...)). A statement that is not
