@@ -141,9 +141,15 @@ PHI. Index assignments (plain and compound) store into fixed and
 growable int arrays with the same checks as reads, and a `continue`
 lands in the loop's step block, so the counter advances exactly as a
 fallthrough does. `assert` is the runtime abort on a false test, and a
-global's `++` writes its global slot. A construct the walk does not emit
+global's `++` writes its global slot. `append` copies a fixed array's, a
+slice's or (for a byte element) a string literal's elements onto a
+growable array's top and adds their count to the length, the source
+evaluated first; `pop` reads the last element's value back in value and
+statement position, an empty one the runtime's `GS_E_POP` abort. A
+construct the walk does not emit
 is refused with its kind and line (`--emit-ir` fails, no module is
-written) instead of being dropped; a builtin other than `push`, `assert`
+written) instead of being dropped; a builtin other than `push`,
+`append`, `pop`, `assert`
 and `print`, and `loop`, `match` or `defer`, count as such constructs.
 Flat int-field structs
 (no padding, fixed size) are values: a literal builds them, field reads,
@@ -163,9 +169,10 @@ slice result returns the struct itself; a multi-result signature with a
 slice still refuses. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 30 of the codegen output fixtures pass through
-`--emit-ir`; the largest remaining gaps are `append`/`pop`, references,
-limited arrays, struct parameters and copies, struct fields of slices or
+in the output now refuse. 31 of the codegen output fixtures pass through
+`--emit-ir`; the largest remaining gaps are references,
+limited arrays, appends of call results, struct parameters and copies,
+struct fields of slices or
 references, arrays returned by calls, and rendering of floats and structs,
 plus the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the

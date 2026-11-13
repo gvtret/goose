@@ -1096,6 +1096,96 @@ struct CodeGenIR {
                     }
                 }
             }
+            // append (memberof spelling: the receiver is the callee's Dot
+            // obj) onto a growable int array the walk holds. The source's
+            // elements are evaluated first, as the C backend evaluates
+            // them, copied to the top, and the length grows by their count.
+            if (c->builtin == B_APPEND && c->args.size() == 1) {
+                auto *rd = Is<Dot>(c->callee);
+                auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+                auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
+                if (!r)
+                    return Unsup(cat("an append onto a variable the walk does "
+                                     "not hold at line ",
+                                     (long long)c->line.line)), nullptr;
+                bool byteelem = r->etype->intstorage == IS_U8
+                    || r->etype->intstorage == IS_I8;
+                llvm::Value *data = nullptr, *n = nullptr;
+                if (auto *sl = Is<StrLit>(c->args[0])) {
+                    if (!byteelem)
+                        return Unsup(cat("an append of a string literal onto a "
+                                         "non-byte array at line ",
+                                         (long long)c->line.line)), nullptr;
+                    data = strlit_glob(sl->val);
+                    n = llvm::ConstantInt::get(i64(), (uint64_t)sl->val.size());
+                } else {
+                    auto *st = c->args[0]->exprtype;
+                    SliceVal sv;
+                    if ((!st || (st->kind != TY_SLICE && st->kind != TY_ARRAY))
+                        || !slice_value(c->args[0], w, sv)) {
+                        // An if arm or block tail the value path built into
+                        // the { data, len } pair.
+                        auto *v = st && is_slice_of_int(st)
+                            ? GenExpr(c->args[0], w) : nullptr;
+                        if (!v || v->getType() != slice_ll_ty())
+                            return Unsup(cat("an append source the walk does "
+                                             "not build at line ",
+                                             (long long)c->line.line)), nullptr;
+                        sv.data = b.CreateExtractValue(v, 0, "apd");
+                        sv.len = b.CreateExtractValue(v, 1, "apn");
+                    }
+                    data = sv.data;
+                    n = sv.len;
+                }
+                auto *basev = b.CreateLoad(i8ptr(), r->base, "rzbase");
+                auto *lenv = b.CreateLoad(i64(), r->len, "rzlen");
+                auto *et = int_ll_ty(r->etype);
+                auto *esz = llvm::ConstantInt::get(
+                    i64(), (uint64_t)(et->getScalarSizeInBits() / 8));
+                auto *dst = b.CreateInBoundsGEP(et, basev, lenv, "apdst");
+                b.CreateMemCpy(dst, llvm::MaybeAlign(1), data, llvm::MaybeAlign(1),
+                               b.CreateMul(n, esz, "apbytes"));
+                auto *nlen = b.CreateAdd(lenv, n, "rzlen+");
+                b.CreateStore(nlen, r->len);
+                rz_sync_slot(*r, basev, nlen);
+                return nullptr;
+            }
+            // pop (memberof spelling) from a growable int array the walk
+            // holds: on empty it is the runtime's GS_E_POP abort, else the
+            // length drops by one and the element's value is read back from
+            // the slot it leaves (whose bytes nothing overwrites until the
+            // array grows again).
+            if (c->builtin == B_POP && c->args.empty()) {
+                auto *rd = Is<Dot>(c->callee);
+                auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+                auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
+                if (!r)
+                    return Unsup(cat("a pop from a variable the walk does not "
+                                     "hold at line ", (long long)c->line.line)),
+                        nullptr;
+                auto *basev = b.CreateLoad(i8ptr(), r->base, "rzbase");
+                auto *lenv = b.CreateLoad(i64(), r->len, "rzlen");
+                if (!c->nobc) {
+                    auto *okbb = llvm::BasicBlock::Create(ctx, "popok", w.fn);
+                    auto *failbb = llvm::BasicBlock::Create(ctx, "popfail", w.fn);
+                    b.CreateCondBr(
+                        b.CreateICmpSGT(lenv, llvm::ConstantInt::get(i64(), 0),
+                                        "popin"), okbb, failbb);
+                    b.SetInsertPoint(failbb);
+                    b.CreateCall(f_gs_abort, {
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 7),
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                               (uint64_t)c->line.line) });
+                    b.CreateUnreachable();
+                    b.SetInsertPoint(okbb);
+                }
+                auto *nlen = b.CreateSub(lenv, llvm::ConstantInt::get(i64(), 1),
+                                         "rzlen-1");
+                b.CreateStore(nlen, r->len);
+                rz_sync_slot(*r, basev, nlen);
+                return rz_load_elem(*r, basev, nlen, "rzpop");
+            }
             // print's line alphabet this slice covers: int values and
             // string literals, with no separator of its own, rendered into the same
             // byte cursor the C backend builds its whole line in
