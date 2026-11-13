@@ -77,6 +77,7 @@ struct CodeGenIR {
     // The print line's scratch slot: one dedicated data-stack region the
     // line cursor runs over, reset per print (emit_program_entry reserves
     // it like every other slot).
+    llvm::StructType *slice_ll_ty_ = nullptr;
     llvm::GlobalVariable *gs_pstk = nullptr;
 
     // A growable i64 array local (T[>..]): one dedicated data-stack slot
@@ -92,6 +93,7 @@ struct CodeGenIR {
           b(ctx) {
         this->specs = specs;
         this->stack_assert = stack_assert;
+        slice_ll_ty_ = llvm::StructType::get(ctx, { i8ptr(), i64() });
         emit_tls_globals();
         declare_runtime_externs();
         declare_entry_externs();
@@ -409,9 +411,7 @@ struct CodeGenIR {
         return t && t->kind == TY_SLICE && is_int_ty(t->sub);
     }
 
-    llvm::StructType *slice_ll_ty() {
-        return llvm::StructType::get(ctx, { i8ptr(), i64() });
-    }
+    llvm::StructType *slice_ll_ty() { return slice_ll_ty_; }
 
     // A reference to a growable array: the pair the C backend carries as
     // `gs_rref { gs_rhdr *hdr; gs_stack *stk; }` (codegen_types.h:510).
@@ -1220,12 +1220,12 @@ struct CodeGenIR {
             // (member is a BuiltinKind, ast.h) on an array local the walk
             // holds.
             if (dt->member == B_LEN || dt->member == B_CAP) {
+                // A member on a local: limited cap/len, fixed len, growable
+                // len, or a slice's len via slice_value.
                 auto *obj = Is<Ident>(dt->obj);
                 if (obj && obj->vdef) {
                     if (auto lit = w.limiteds.find(obj->vdef);
                         lit != w.limiteds.end()) {
-                        // A limited array's capacity is the declared
-                        // constant; its count reads out of the header.
                         if (dt->member == B_CAP)
                             return llvm::ConstantInt::get(
                                 i64(), (uint64_t)lit->second.cap);
@@ -1243,9 +1243,78 @@ struct CodeGenIR {
                                                 llvm::Twine(obj->vdef->name, ".lenv"));
                     }
                 }
+                // A slice value (local, range, strlit, block, inline, call):
+                // its .len is the view's length.
                 if (dt->member == B_LEN) {
                     SliceVal sv;
                     if (slice_value(dt->obj, w, sv)) return sv.len;
+                }
+                // A call or inlined body returning a growable: the result
+                // lives on a stack whose header holds the count. .cap is
+                // not meaningful for a growable result (the runtime region
+                // has no declared capacity), so only .len lowers here.
+                if (dt->member == B_LEN) {
+                    if (auto *c = Is<Call>(dt->obj)) {
+                        if (c->spec && c->spec->rets.size() == 1
+                            && is_growable_i64(c->spec->rets[0])) {
+                            auto *v = EmitDirectCall(c, w, nullptr);
+                            if (!v) return nullptr;
+                            // The call returns void; the growable was built
+                            // on a destination stack. For now this path is
+                            // not taken: growable results use out-pointers.
+                            // A single-result growable returned by value
+                            // would need the M3 destination-stack ABI.
+                            return nullptr;
+                        }
+                    }
+                }
+                // A struct field that is itself an array or slice: walk the
+                // field path to the leaf, then read its .len or .cap.
+                if (auto *fdt = Is<Dot>(dt->obj); fdt && fdt->IsField()) {
+                    llvm::Value *addr = nullptr;
+                    StructInst *oi = nullptr;
+                    TypeExpr *leaf = nullptr;
+                    if (field_path_addr(dt->obj, w, addr, oi, leaf)) {
+                        if (is_growable_i64(leaf) && dt->member == B_LEN) {
+                            // A growable field: its header is at the field's
+                            // address (a gs_rhdr { base, len }).
+                            auto *lenp = b.CreateInBoundsGEP(
+                                slice_ll_ty(), addr, { idx0(), fld(1) }, "fldlen");
+                            return b.CreateLoad(i64(), lenp, "fldlenv");
+                        }
+                        if (leaf->kind == TY_SLICE && is_int_ty(leaf->sub)
+                            && dt->member == B_LEN) {
+                            auto *lenp = b.CreateInBoundsGEP(
+                                slice_ll_ty(), addr, { idx0(), fld(1) }, "fldlen");
+                            return b.CreateLoad(i64(), lenp, "fldlenv");
+                        }
+                        if (leaf->kind == TY_ARRAY
+                            && leaf->arr->akind == A_FIXED
+                            && is_int_ty(leaf->arr->sub)
+                            && dt->member == B_LEN) {
+                            return llvm::ConstantInt::get(
+                                i64(), (uint64_t)leaf->arr->size);
+                        }
+                        if (leaf->kind == TY_ARRAY
+                            && leaf->arr->akind == A_LIMITED
+                            && is_int_ty(leaf->arr->sub)) {
+                            if (dt->member == B_CAP)
+                                return llvm::ConstantInt::get(
+                                    i64(), (uint64_t)leaf->arr->size);
+                            if (dt->member == B_LEN) {
+                                // Limited field: len is stored after the
+                                // element slots. The layout is
+                                // [cap x elem][i64 len].
+                                auto *et = int_ll_ty(leaf->arr->sub);
+                                auto *lenp = b.CreateInBoundsGEP(
+                                    et, addr,
+                                    { llvm::ConstantInt::get(i64(),
+                                                             (uint64_t)leaf->arr->size) },
+                                    "fldlimlen");
+                                return b.CreateLoad(i64(), lenp, "fldlimlenv");
+                            }
+                        }
+                    }
                 }
             }
             return nullptr;

@@ -212,7 +212,7 @@ a loop body reuses its slot instead of walking the native stack off its
 end. `goose llc` passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 42 of the codegen output fixtures pass through
+in the output now refuse. 43 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
