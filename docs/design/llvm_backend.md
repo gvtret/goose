@@ -222,11 +222,13 @@ whatever array type the optimizer folded it to. `move_from` on int-array
 views checks lengths match (aborting with the runtime's message when
 they do not) and memmoves the source over the destination, so
 overlapping slices like `a[1..].move_from(a[..4])` shift correctly.
-`goose llc`
+`clear()` on a growable array drops its count to zero and its stack top
+back to the element region's base; on a static-capacity limited array it
+zeroes only the count. `goose llc`
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 47 of the codegen output fixtures pass through
+in the output now refuse. 48 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

@@ -1872,6 +1872,32 @@ struct CodeGenIR {
                 }
                 return nullptr;
             }
+            // `a.clear()`: a growable drops its top back to the element
+            // region's base and zeroes the count; a limited array zeroes
+            // only the count (its slots are reserved).
+            if (c->builtin == B_CLEAR && c->args.empty()) {
+                auto *rd = Is<Dot>(c->callee);
+                auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+                if (!recv || !recv->vdef)
+                    return Unsup(cat("a clear of a variable the walk does "
+                                     "not hold at line ",
+                                     (long long)c->line.line)), nullptr;
+                auto zero = llvm::ConstantInt::get(i64(), 0);
+                if (auto *r = rz_head(w, recv->vdef)) {
+                    b.CreateStore(b.CreateLoad(i8ptr(), r->base, "clbase"),
+                                  r->slot);
+                    b.CreateStore(zero, r->len);
+                    return nullptr;
+                }
+                if (auto lit = w.limiteds.find(recv->vdef);
+                    lit != w.limiteds.end()) {
+                    b.CreateStore(zero, lit->second.len);
+                    return nullptr;
+                }
+                return Unsup(cat("a clear of a variable the walk does not "
+                                 "hold at line ",
+                                 (long long)c->line.line)), nullptr;
+            }
             // print's line alphabet this slice covers: int values and
             // string literals, with no separator of its own, rendered into the same
             // byte cursor the C backend builds its whole line in
