@@ -209,17 +209,24 @@ operand are `udiv`/`urem` (a zero divisor still aborts), and `u64`
 prints through the unsigned hook, as the C backend's does. Every local's
 storage is allocated in the function's entry block, so a declaration in
 a loop body reuses its slot instead of walking the native stack off its
-end. `goose llc` passes `-relocation-model=pic`, so a
+end. A call may hand a growable array back (the run form): the callee
+receives the caller's header and stack as its last two arguments and
+copies the returned run there, writing the count; the result then binds
+to a `let`, prints, indexes, measures its `.len`, and appends from, and
+a `let s = f()` with an inlined `f` builds it the same way. `goose llc`
+passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 43 of the codegen output fixtures pass through
+in the output now refuse. 44 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
 built by copy from other values (the runtime-capacity `T[..]` form with
-them), appends of call results, struct parameters and copies,
+them), other call results (a length-stored `T[]`, a runtime-limited
+`T[..]` without a capacity, literals and slices returned as arrays),
+struct parameters and copies,
 struct fields of slices or
-references, arrays returned by calls, and rendering of floats and structs,
+references, and rendering of floats and structs,
 plus the M4 modules. See
 `docs/superpowers/specs/2026-11-07-llvm-backend-design.md` for the
 full design and partner decisions.

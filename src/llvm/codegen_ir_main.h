@@ -193,23 +193,6 @@ struct CodeGenIR {
         // The walked body Block (only the function's own; nested blocks are
         // not top-level, so their value tails do not become rets).
         Block *body = nullptr;
-        // The inlined bodies being walked, innermost last. A return whose
-        // target is one of them branches to its merge block with the value.
-        struct InlExit {
-            SFunction *sf = nullptr;
-            FnSpec *spec = nullptr;       // The inlined specialization.
-            llvm::BasicBlock *merge = nullptr;
-            std::vector<std::pair<llvm::Value *, llvm::BasicBlock *>> incoming;
-        };
-        std::vector<InlExit> inl;
-        // The enclosing loops of the walk (innermost last); a break or
-        // continue without a value targets the innermost one.
-        struct Loop {
-            llvm::BasicBlock *condbb = nullptr;   // The loop's condition block.
-            llvm::BasicBlock *donebb = nullptr;    // The loop's exit block.
-            llvm::BasicBlock *contbb = nullptr;    // Where `continue` resumes
-                                                   // (the increment, if any).
-        };
         // Growable array locals of this walk: VarDef * -> header. base and
         // len are local allocas (their alloca'd header); the same record
         // shape also carries a global's thread-local header (storage
@@ -220,6 +203,27 @@ struct CodeGenIR {
             llvm::Value *slot = nullptr;           // The gs_stack { top } owner.
             llvm::Value *hdr = nullptr;            // The { base, len } header.
             TypeExpr *etype = nullptr;             // The element type.
+        };
+        // The inlined bodies being walked, innermost last. A return whose
+        // target is one of them branches to its merge block with the value.
+        struct InlExit {
+            SFunction *sf = nullptr;
+            FnSpec *spec = nullptr;       // The inlined specialization.
+            llvm::BasicBlock *merge = nullptr;
+            std::vector<std::pair<llvm::Value *, llvm::BasicBlock *>> incoming;
+            // A growable single result's run destination: the local the
+            // caller bound it to. Each inlined `return a` copies its run
+            // there instead of flowing a value to the merge.
+            FnWalk::RzArr *growret = nullptr;
+        };
+        std::vector<InlExit> inl;
+        // The enclosing loops of the walk (innermost last); a break or
+        // continue without a value targets the innermost one.
+        struct Loop {
+            llvm::BasicBlock *condbb = nullptr;   // The loop's condition block.
+            llvm::BasicBlock *donebb = nullptr;    // The loop's exit block.
+            llvm::BasicBlock *contbb = nullptr;    // Where `continue` resumes
+                                                   // (the increment, if any).
         };
         std::unordered_map<VarDef *, RzArr> rzarrs;
         // Reference locals and parameters to a growable array: one holder
@@ -593,13 +597,22 @@ struct CodeGenIR {
             }
             // Return protocol: ret0 is the call's value, every other
             // result an out-pointer parameter the callee writes; a single
-            // slice result comes back as the { data, len } it is.
+            // slice result comes back as the { data, len } it is; a single
+            // growable result is the run form: the callee receives the
+            // caller's header-and-stack pair to build into (dst, rl).
             bool allretint = true;
+            bool growret = sp->rets.size() == 1 && is_growable_i64(sp->rets[0]);
             for (auto *rt : sp->rets)
                 if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_flat_struct(rt))
                     allretint = false;
             llvm::Type *retty = voidty();
-            if (!sp->rets.empty()) {
+            if (growret) {
+                // The run form: no value returns, the caller's (hdr, stack)
+                // go in as the last two arguments.
+                retty = voidty();
+                argtys.push_back(i8ptr());   // dst: the caller's header base
+                argtys.push_back(i8ptr());   // rl: the caller's count
+            } else if (!sp->rets.empty()) {
                 if (sp->rets.size() == 1 && is_slice_of_int(sp->rets[0]))
                     retty = slice_ll_ty();
                 else if (sp->rets.size() == 1 && is_flat_struct(sp->rets[0]))
@@ -718,6 +731,33 @@ struct CodeGenIR {
     // ------------------------------------------------------------------
     // Body-walk definitions (minimal M3 subset, i64 values).
     // ------------------------------------------------------------------
+
+    // The run-form destination of a growable result: dst points at the
+    // caller's stack slot (its top), rl at the caller's count. The held
+    // run's elements are copied there, the top advanced past them and the
+    // count written.
+    void emit_growable_into(FnWalk::RzArr *r, llvm::Value *dst,
+                            llvm::Value *rl, FnWalk &w) {
+        auto *basev = b.CreateLoad(i8ptr(), r->base, "rrun");
+        auto *lenv = b.CreateLoad(i64(), r->len, "rrunlen");
+        auto *stk = b.CreateLoad(i8ptr(), dst, "rdst");
+        auto *et = int_ll_ty(r->etype);
+        auto esz = et->getPrimitiveSizeInBits() / 8;
+        if (esz) {
+            auto *sz = llvm::ConstantInt::get(i64(), (uint64_t)esz);
+            auto *nbytes = b.CreateMul(lenv, sz, "rbytes");
+            if (nbytes != llvm::ConstantInt::get(i64(), 0))
+                b.CreateMemCpy(stk, llvm::MaybeAlign(1), basev,
+                               llvm::MaybeAlign(1), nbytes);
+            b.CreateStore(
+                b.CreateInBoundsGEP(llvm::Type::getInt8Ty(ctx), stk, nbytes,
+                                    "rdstop"),
+                dst);
+        } else {
+            b.CreateStore(stk, dst);
+        }
+        b.CreateStore(lenv, rl);
+    }
 
     // The runtime slot's top tracks the next free byte: past the len
     // elements (GEP by the element type is the byte arithmetic).
@@ -975,7 +1015,8 @@ struct CodeGenIR {
         auto *sub = def.type->arr->sub;
         bool strinit = sl && sub
             && (sub->intstorage == IS_U8 || sub->intstorage == IS_I8);
-        if (init && !al && !strinit) return;
+        bool runinit = (init && Is<Call>(init)) || (init && Is<InlineBlock>(init));
+        if (init && !al && !strinit && !runinit) return;
         string sname = cat("gs_stk", stk_slots.size());
         auto *slot = new llvm::GlobalVariable(
             *mod, i8ptr(), /*isConstant=*/false,
@@ -996,6 +1037,30 @@ struct CodeGenIR {
         b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
         auto &r = w.rzarrs[&def];
         r = { basea, lena, slot, hdra, def.type->arr->sub };
+        // A call's growable result is built straight into this local's
+        // header and stack (the run form).
+        if (auto *rc = init ? Is<Call>(init) : nullptr) {
+            if (!rc->spec || rc->spec->rets.size() != 1
+                || !is_growable_i64(rc->spec->rets[0])) {
+                w.rzarrs.erase(&def);
+                return Unsup(cat("a growable initializer that is not a "
+                                 "literal or a call at line ",
+                                 (long long)vd->line.line));
+            }
+            EmitDirectCall(rc, w, nullptr, &r);
+            return;
+        }
+        if (auto *rib = init ? Is<InlineBlock>(init) : nullptr) {
+            if (!rib->spec || rib->spec->rets.size() != 1
+                || !is_growable_i64(rib->spec->rets[0])) {
+                w.rzarrs.erase(&def);
+                return Unsup(cat("a growable initializer that is not a "
+                                 "literal or an inlined call at line ",
+                                 (long long)vd->line.line));
+            }
+            GenInline(rib, w, &r);
+            return;
+        }
         if (strinit) {
             auto *n = llvm::ConstantInt::get(i64(), (uint64_t)sl->val.size());
             if (!sl->val.empty())
@@ -1968,11 +2033,38 @@ struct CodeGenIR {
             return true;
         }
         // An inlined call whose result is a slice: the body's PHI is the
-        // { data, len } it built.
+        // { data, len } it built. A growable result is built into a scratch
+        // run destination and read back.
         if (auto *ib = Is<InlineBlock>(n)) {
             if (!ib->spec || ib->spec->rets.size() != 1
-                || !is_slice_of_int(ib->spec->rets[0]))
+                || !is_slice_of_int(ib->spec->rets[0])) {
+                if (ib->spec && ib->spec->rets.size() == 1
+                    && is_growable_i64(ib->spec->rets[0])) {
+                    auto *slot = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        cat("gs_stk", stk_slots.size()), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(slot);
+                    auto *hdra = entry_alloca(w, slice_ll_ty(), "gscr.hdr");
+                    auto *basea = b.CreateInBoundsGEP(
+                        slice_ll_ty(), hdra, { idx0(), fld(0) }, "gscr.base");
+                    auto *lena = b.CreateInBoundsGEP(
+                        slice_ll_ty(), hdra, { idx0(), fld(1) }, "gscr.len");
+                    auto *basev = b.CreateLoad(i8ptr(), slot, "gscr.top");
+                    b.CreateStore(basev, basea);
+                    b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
+                    FnWalk::RzArr scratch { basea, lena, slot, hdra,
+                                            ib->spec->rets[0]->arr->sub };
+                    GenInline(ib, w, &scratch);
+                    out.data = b.CreateLoad(i8ptr(), basea, "svd");
+                    out.len = b.CreateLoad(i64(), lena, "svn");
+                    out.etype = ib->spec->rets[0]->arr->sub;
+                    return true;
+                }
                 return false;
+            }
             auto *v = GenInline(ib, w);
             if (!v || v->getType() != slice_ll_ty()) return false;
             out.data = b.CreateExtractValue(v, 0, "svd");
@@ -1980,11 +2072,41 @@ struct CodeGenIR {
             out.etype = ib->spec->rets[0]->sub;
             return true;
         }
-        // A call whose one result is a slice: the { data, len } it returns.
+        // A call whose one result is a slice: the { data, len } it returns;
+        // a growable result is built into a scratch run destination and
+        // read back as its { data, len }.
         if (auto *c = Is<Call>(n)) {
             if (!c->spec || c->spec->rets.size() != 1
-                || !is_slice_of_int(c->spec->rets[0]))
+                || !is_slice_of_int(c->spec->rets[0])) {
+                if (c->spec && c->spec->rets.size() == 1
+                    && is_growable_i64(c->spec->rets[0])) {
+                    // The run form: a scratch slot of the walk's own, the
+                    // call writing its run into it (see emit_growable_into).
+                    auto *slot = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        cat("gs_stk", stk_slots.size()), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(slot);
+                    auto *hdra = entry_alloca(w, slice_ll_ty(), "gscr.hdr");
+                    auto *basea = b.CreateInBoundsGEP(
+                        slice_ll_ty(), hdra, { idx0(), fld(0) }, "gscr.base");
+                    auto *lena = b.CreateInBoundsGEP(
+                        slice_ll_ty(), hdra, { idx0(), fld(1) }, "gscr.len");
+                    auto *basev = b.CreateLoad(i8ptr(), slot, "gscr.top");
+                    b.CreateStore(basev, basea);
+                    b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
+                    FnWalk::RzArr scratch { basea, lena, slot, hdra,
+                                            c->spec->rets[0]->arr->sub };
+                    if (!EmitDirectCall(c, w, nullptr, &scratch)) return false;
+                    out.data = b.CreateLoad(i8ptr(), basea, "svd");
+                    out.len = b.CreateLoad(i64(), lena, "svn");
+                    out.etype = c->spec->rets[0]->arr->sub;
+                    return true;
+                }
                 return false;
+            }
             auto *v = EmitDirectCall(c, w, nullptr);
             if (!v) return false;
             out.data = b.CreateExtractValue(v, 0, "svd");
@@ -2702,7 +2824,9 @@ struct CodeGenIR {
     // A direct call of a Goose function. Results 1.. are out-pointers the
     // callee writes (`outs[i]`, a pointer per result); result 0 is the value
     // returned. A multi-result call needs `outs`, a value context does not.
-    llvm::Value *EmitDirectCall(Call *c, FnWalk &w, const std::vector<llvm::Value *> *outs) {
+    llvm::Value *EmitDirectCall(Call *c, FnWalk &w,
+                                const std::vector<llvm::Value *> *outs,
+                                FnWalk::RzArr *growret = nullptr) {
         auto *sp = c->spec;
         if (!sp) return nullptr;
         for (auto *t : sp->argtypes)
@@ -2714,7 +2838,10 @@ struct CodeGenIR {
                          || is_flat_struct(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
-                && !is_flat_struct(rt) && !is_flat_ref(rt)) return nullptr;
+                && !is_flat_struct(rt) && !is_flat_ref(rt)
+                && !(sp->rets.size() == 1 && is_growable_i64(rt))) return nullptr;
+        bool growret_ = sp->rets.size() == 1 && is_growable_i64(sp->rets[0]);
+        if (growret_ && !growret) return nullptr;
         auto nrets = sp->rets.size();
         // A multi-result call in a value position (not bound to locals)
         // discards results 1..: it materializes their out-slots here and
@@ -2733,10 +2860,12 @@ struct CodeGenIR {
         auto *cf = mod->getFunction(callee);
         if (!cf) return nullptr;
         auto expect = c->args.size() + (nrets > 1 ? nrets - 1 : 0);
-        // A reference to a growable array crosses a call as two pointers.
+        // A reference to a growable array crosses a call as two pointers;
+        // a growable result takes the (dst, rl) pair.
         for (auto *t : sp->argtypes)
             if (t && t->kind == TY_REF && is_growable_i64(t->ref->sub))
                 expect += 1;
+        if (growret_) expect += 2;
         if (cf->getFunctionType()->getNumParams() != expect) return nullptr;
         std::vector<llvm::Value *> args;
         for (size_t ai = 0; ai < c->args.size(); ++ai) {
@@ -2812,6 +2941,10 @@ struct CodeGenIR {
             args.push_back(as_i64(av));
         }
         for (size_t i = 1; i < nrets; ++i) args.push_back((*outs)[i]);
+        if (growret_) {
+            args.push_back(growret->slot);
+            args.push_back(growret->len);
+        }
         return b.CreateCall(cf, args);
     }
 
@@ -2826,10 +2959,13 @@ struct CodeGenIR {
     // of the callee (Return above) branches here with its value; the values
     // meet in a PHI. A fallthrough with no value, or no value at all, gives
     // no result.
-    llvm::Value *GenInline(InlineBlock *ib, FnWalk &w) {
+    llvm::Value *GenInline(InlineBlock *ib, FnWalk &w,
+                           FnWalk::RzArr *growdst = nullptr) {
         auto *merge = llvm::BasicBlock::Create(ctx, "inlmerge", w.fn);
-        w.inl.push_back({ ib->sf, ib->spec, merge, {} });
+        w.inl.push_back({ ib->sf, ib->spec, merge, {}, growdst });
         size_t ei = w.inl.size() - 1;
+        bool growret = growdst && ib->spec && ib->spec->rets.size() == 1
+                    && is_growable_i64(ib->spec->rets[0]);
         bool sret = ib->spec && ib->spec->rets.size() == 1
                  && is_slice_of_int(ib->spec->rets[0]);
         bool stret = ib->spec && ib->spec->rets.size() == 1
@@ -2842,7 +2978,13 @@ struct CodeGenIR {
             // The body's tail is its value, unless its type is void: then it
             // is the last statement (a loop or a return), not a value.
             Node *tn = ib->body->tail;
-            if (tn) {
+            if (tn && growret) {
+                // The body ends in the value it returns: copy its run.
+                auto *id = Is<Ident>(tn);
+                auto *r = id && id->vdef ? rz_head(w, id->vdef) : nullptr;
+                if (r)
+                    emit_growable_into(r, growdst->slot, growdst->len, w);
+            } else if (tn) {
                 bool valueless = !tn->exprtype || tn->exprtype->kind == TY_VOID;
                 if (sret) {
                     SliceVal sv;
@@ -3471,6 +3613,19 @@ struct CodeGenIR {
                           && is_flat_struct(ispec->rets[0]);
                 bool refret = ispec && ispec->rets.size() == 1
                            && is_flat_ref(ispec->rets[0]);
+                auto *growdst = w.inl[ei].growret;
+                if (growdst && !ret->vals.empty()) {
+                    // The inlined body's growable result: copy its run into
+                    // the destination the caller bound.
+                    auto *id = Is<Ident>(ret->vals[0]);
+                    auto *r = id && id->vdef ? rz_head(w, id->vdef) : nullptr;
+                    if (r) emit_growable_into(r, growdst->slot, growdst->len,
+                                              w);
+                    b.CreateBr(w.inl[ei].merge);
+                    b.SetInsertPoint(llvm::BasicBlock::Create(
+                        ctx, "inlret.dead", w.fn));
+                    return;
+                }
                 llvm::Value *v = nullptr;
                 if (!ret->vals.empty()) {
                     if (sret) {
@@ -3522,6 +3677,26 @@ struct CodeGenIR {
                     b.CreateStore(as_i64(vals[i]),
                                   w.fn->getArg(w.outstart + i - 1));
                 b.CreateRet(as_i64(vals[0]));
+                return;
+            }
+            if (w.spec && w.spec->rets.size() == 1
+                && is_growable_i64(w.spec->rets[0])
+                && w.fn->getReturnType()->isVoidTy()
+                && ret->vals.size() == 1) {
+                // The run form: the value to return is a growable the walk
+                // holds; its elements are copied onto the caller's stack
+                // (dst, rl are the last two arguments).
+                auto *val = ret->vals[0];
+                auto *id = val ? Is<Ident>(val) : nullptr;
+                auto *r = id && id->vdef ? rz_head(w, id->vdef) : nullptr;
+                if (!r)
+                    return Unsup(cat("a growable return the walk does not "
+                                     "hold at line ",
+                                     (long long)ret->line.line));
+                auto *dst = w.fn->getArg(w.outstart);
+                auto *rl = w.fn->getArg(w.outstart + 1);
+                emit_growable_into(r, dst, rl, w);
+                b.CreateRetVoid();
                 return;
             }
             if (ret->vals.empty() && w.fn->getReturnType()->isVoidTy()) {
