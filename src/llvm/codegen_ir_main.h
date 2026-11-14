@@ -310,6 +310,16 @@ struct CodeGenIR {
         return v;
     }
 
+    // A condition as i1: a bool passes through, an optional reference's
+    // header pointer tests against null, and any other value against zero.
+    llvm::Value *as_i1(llvm::Value *v, const char *name = "cond") {
+        if (v && v->getType()->isIntegerTy(1)) return v;
+        if (v && v->getType()->isPointerTy())
+            return b.CreateICmpNE(v, llvm::ConstantPointerNull::get(i8ptr()),
+                                  name);
+        return b.CreateICmpNE(v, llvm::ConstantInt::get(i64(), 0), name);
+    }
+
     // A value stored into a variable of a narrow int type wraps at that
     // storage's width, as the C backend's store does: the low bits kept,
     // then widened back (unsigned zero, signed sign) into the walk's i64.
@@ -1204,6 +1214,8 @@ struct CodeGenIR {
                                           (uint64_t)(int64_t)(double)fl->val, true);
         if (auto *bl = Is<BoolLit>(n))
             return llvm::ConstantInt::get(i64(), bl->val ? 1 : 0, true);
+        if (Is<NullLit>(n))
+            return llvm::ConstantPointerNull::get(i8ptr());
         if (auto *un = Is<Unary>(n)) {
             // The unary minus: an i64 negation. The logical not: an i1 test
             // widened back to i64 (the minimal walk's uniform value type).
@@ -1303,6 +1315,15 @@ struct CodeGenIR {
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
+                // An optional reference to a growable array reads as its
+                // header pointer: null when unset, else the array's hdr
+                // (so `o == null`, `o != null` and `if o` test it).
+                auto zrit = w.rzrefs.find(id->vdef);
+                if (zrit != w.rzrefs.end())
+                    return b.CreateLoad(
+                        i8ptr(),
+                        b.CreateStructGEP(rzref_ll_ty(), zrit->second.holder, 0),
+                        llvm::Twine(id->vdef->name));
                 // A reference reads out the pointee's value: the pointer
                 // it names, then the int stored there.
                 auto rit = w.refs.find(id->vdef);
@@ -2019,10 +2040,7 @@ struct CodeGenIR {
             // merge (the if-expression's value).
             auto *cond = GenExpr(ifx->cond, w);
             if (!cond) return nullptr;
-            if (!cond->getType()->isIntegerTy(1)) {
-                auto *z = llvm::ConstantInt::get(i64(), 0);
-                cond = b.CreateICmpNE(cond, z, "ifcond");
-            }
+            cond = as_i1(cond, "ifcond");
             auto *fn = w.fn;
             auto *thenbb = llvm::BasicBlock::Create(ctx, "then", fn);
             auto *elsebb = ifx->elseb ? llvm::BasicBlock::Create(ctx, "else", fn) : nullptr;
@@ -2409,13 +2427,19 @@ struct CodeGenIR {
         if (is_growable_i64(ptee)) {
             // A reference to a growable array keeps the pair the C backend
             // passes: the header and the stack the array lives on. A push
-            // through it lands on the array's top and count.
+            // through it lands on the array's top and count. An optional
+            // `null` holds the pair of two null pointers.
             llvm::Value *hp = nullptr;
             llvm::Value *sp = nullptr;
-            if (!id || !id->vdef || !growable_pair(w, id->vdef, hp, sp))
+            if (init && Is<NullLit>(init)) {
+                hp = llvm::ConstantPointerNull::get(i8ptr());
+                sp = llvm::ConstantPointerNull::get(i8ptr());
+            } else if (!id || !id->vdef
+                       || !growable_pair(w, id->vdef, hp, sp)) {
                 return Unsup(cat("a reference bound to a value the walk does "
                                  "not hold at line ",
                                  (long long)vd->line.line));
+            }
             auto *holder = entry_alloca(w, rzref_ll_ty(),
                                         llvm::Twine(def.name));
             b.CreateStore(hp, b.CreateStructGEP(rzref_ll_ty(), holder, 0));
@@ -3529,10 +3553,7 @@ struct CodeGenIR {
                 w.loops.pop_back();
                 return;
             }
-            if (!cond->getType()->isIntegerTy(1)) {
-                auto *z = llvm::ConstantInt::get(i64(), 0);
-                cond = b.CreateICmpNE(cond, z, "while_test");
-            }
+            cond = as_i1(cond, "while_test");
             b.CreateCondBr(cond, bodybb, donebb);
             b.SetInsertPoint(bodybb);
             if (wh->body) GenStmt(wh->body, w);
