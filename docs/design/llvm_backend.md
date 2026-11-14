@@ -213,11 +213,16 @@ end. A call may hand a growable array back (the run form): the callee
 receives the caller's header and stack as its last two arguments and
 copies the returned run there, writing the count; the result then binds
 to a `let`, prints, indexes, measures its `.len`, and appends from, and
-a `let s = f()` with an inlined `f` builds it the same way. `goose llc`
+a `let s = f()` with an inlined `f` builds it the same way. The return
+may be a value built at the site: an empty or listed literal is written
+into the destination element by element, a string literal's bytes are
+copied (byte elements), and a slice view is copied over. A string or
+array literal in a view position resolves as its bytes or elements
+whatever array type the optimizer folded it to. `goose llc`
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 44 of the codegen output fixtures pass through
+in the output now refuse. 45 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

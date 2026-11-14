@@ -759,6 +759,64 @@ struct CodeGenIR {
         b.CreateStore(lenv, rl);
     }
 
+    // Build a growable result's value at the run destination (dst, rl):
+    // a name copies the run it holds, a literal or string literal is built
+    // in place, and a slice view is copied over. False when the walk does
+    // not build the value.
+    bool emit_growable_result(Node *val, llvm::Value *dst, llvm::Value *rl,
+                              TypeExpr *rettype, FnWalk &w) {
+        if (auto *id = Is<Ident>(val)) {
+            auto *r = id->vdef ? rz_head(w, id->vdef) : nullptr;
+            if (r) { emit_growable_into(r, dst, rl, w); return true; }
+        }
+        auto *sub = rettype->arr->sub;
+        auto *et = int_ll_ty(sub);
+        auto esz = et->getPrimitiveSizeInBits() / 8;
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        auto *stk = b.CreateLoad(i8ptr(), dst, "rdst");
+        if (auto *sl = Is<StrLit>(val)) {
+            if (sub->intstorage != IS_U8 && sub->intstorage != IS_I8)
+                return false;
+            auto n = (uint64_t)sl->val.size();
+            if (n)
+                b.CreateMemCpy(stk, llvm::MaybeAlign(1), strlit_glob(sl->val),
+                               llvm::MaybeAlign(1), n);
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, stk,
+                llvm::ConstantInt::get(i64(), n), "rdstop"), dst);
+            b.CreateStore(llvm::ConstantInt::get(i64(), n), rl);
+            return true;
+        }
+        if (auto *al = Is<ArrayLit>(val)) {
+            if (al->fillval) return false;   // A fill's count is a later cut.
+            int64_t k = 0;
+            for (auto *e : al->elems) {
+                auto *v = GenExpr(e, w);
+                if (!v) return false;
+                b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et),
+                              b.CreateInBoundsGEP(et, stk,
+                                  llvm::ConstantInt::get(i64(), (uint64_t)k),
+                                  "rlitp"));
+                k++;
+            }
+            b.CreateStore(b.CreateInBoundsGEP(et, stk,
+                llvm::ConstantInt::get(i64(), (uint64_t)k), "rdstop"), dst);
+            b.CreateStore(llvm::ConstantInt::get(i64(), (uint64_t)k), rl);
+            return true;
+        }
+        SliceVal sv;
+        if (slice_value(val, w, sv) && sv.etype) {
+            auto *nbytes = b.CreateMul(sv.len,
+                llvm::ConstantInt::get(i64(), (uint64_t)esz), "rbytes");
+            b.CreateMemCpy(stk, llvm::MaybeAlign(1), sv.data,
+                           llvm::MaybeAlign(1), nbytes);
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, stk, nbytes, "rdstop"),
+                          dst);
+            b.CreateStore(sv.len, rl);
+            return true;
+        }
+        return false;
+    }
+
     // The runtime slot's top tracks the next free byte: past the len
     // elements (GEP by the element type is the byte arithmetic).
     void rz_sync_slot(FnWalk::RzArr &r, llvm::Value *basev, llvm::Value *lenv) {
@@ -2114,17 +2172,83 @@ struct CodeGenIR {
             out.etype = c->spec->rets[0]->sub;
             return true;
         }
+        if (auto *al = Is<ArrayLit>(n)) {
+            // A literal printed or appended whole (a call folded to one):
+            // its elements land in a temporary array, the view is that
+            // array's { base, count }.
+            auto *et = n->exprtype;
+            if (!et || et->kind != TY_ARRAY || !is_int_ty(et->arr->sub))
+                return false;
+            if (al->fillval) {
+                auto *cnt = al->fillcount ? GenExpr(al->fillcount, w) : nullptr;
+                if (!cnt || !llvm::isa<llvm::ConstantInt>(cnt)) return false;
+                auto *arr = entry_alloca(
+                    w, llvm::ArrayType::get(int_ll_ty(et->arr->sub),
+                                            (uint64_t)llvm::cast<llvm::ConstantInt>(cnt)->getZExtValue()),
+                    "alit");
+                auto *fv = GenExpr(al->fillval, w);
+                if (!fv) return false;
+                auto *etl = int_ll_ty(et->arr->sub);
+                auto cnt64 = llvm::cast<llvm::ConstantInt>(cnt)->getZExtValue();
+                for (uint64_t k = 0; k < cnt64; k++)
+                    b.CreateStore(etl == i64() ? fv : b.CreateTrunc(fv, etl),
+                                  b.CreateInBoundsGEP(
+                                      arr->getAllocatedType(), arr,
+                                      { llvm::ConstantInt::get(i64(), 0),
+                                        llvm::ConstantInt::get(i64(), k) },
+                                      "alitp"));
+                out.data = b.CreateInBoundsGEP(
+                    arr->getAllocatedType(), arr,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), 0) }, "alitd");
+                out.len = llvm::ConstantInt::get(i64(), cnt64);
+                out.etype = et->arr->sub;
+                return true;
+            }
+            if (al->elems.empty()) {
+                out.data = llvm::ConstantPointerNull::get(i8ptr());
+                out.len = llvm::ConstantInt::get(i64(), 0);
+                out.etype = et->arr->sub;
+                return true;
+            }
+            auto *arr = entry_alloca(
+                w, llvm::ArrayType::get(int_ll_ty(et->arr->sub),
+                                        al->elems.size()),
+                "alit");
+            auto *etl = int_ll_ty(et->arr->sub);
+            for (size_t k = 0; k < al->elems.size(); ++k) {
+                auto *v = GenExpr(al->elems[k], w);
+                if (!v) return false;
+                b.CreateStore(etl == i64() ? v : b.CreateTrunc(v, etl),
+                              b.CreateInBoundsGEP(
+                                  arr->getAllocatedType(), arr,
+                                  { llvm::ConstantInt::get(i64(), 0),
+                                    llvm::ConstantInt::get(i64(), (uint64_t)k) },
+                                  "alitp"));
+            }
+            out.data = b.CreateInBoundsGEP(
+                arr->getAllocatedType(), arr,
+                { llvm::ConstantInt::get(i64(), 0),
+                  llvm::ConstantInt::get(i64(), 0) }, "alitd");
+            out.len = llvm::ConstantInt::get(i64(), al->elems.size());
+            out.etype = et->arr->sub;
+            return true;
+        }
         if (auto *sl = Is<StrLit>(n)) {
             // A literal's bytes are one internal constant; the view is
-            // { bytes, length }.
-            if (!n->exprtype || n->exprtype->kind != TY_SLICE) return false;
+            // { bytes, length }, whatever array type the context read it as
+            // (a slice, a u8[>..] a call was folded to, a u8[] local's
+            // initializer).
+            auto *et = n->exprtype;
+            if (!et || (et->kind != TY_SLICE && et->kind != TY_ARRAY))
+                return false;
             auto *gv = strlit_glob(sl->val);
             out.data = b.CreateInBoundsGEP(
                 gv->getValueType(), gv,
                 { llvm::ConstantInt::get(i64(), 0), llvm::ConstantInt::get(i64(), 0) },
                 "svd");
             out.len = llvm::ConstantInt::get(i64(), (uint64_t)sl->val.size());
-            out.etype = n->exprtype->sub;
+            out.etype = et->kind == TY_SLICE ? et->sub : et->arr->sub;
             return true;
         }
         if (auto *obj = Is<Ident>(n)) {
@@ -2979,11 +3103,9 @@ struct CodeGenIR {
             // is the last statement (a loop or a return), not a value.
             Node *tn = ib->body->tail;
             if (tn && growret) {
-                // The body ends in the value it returns: copy its run.
-                auto *id = Is<Ident>(tn);
-                auto *r = id && id->vdef ? rz_head(w, id->vdef) : nullptr;
-                if (r)
-                    emit_growable_into(r, growdst->slot, growdst->len, w);
+                // The body ends in the value it returns: build its run.
+                emit_growable_result(tn, growdst->slot, growdst->len,
+                                     ib->spec->rets[0], w);
             } else if (tn) {
                 bool valueless = !tn->exprtype || tn->exprtype->kind == TY_VOID;
                 if (sret) {
@@ -3615,12 +3737,10 @@ struct CodeGenIR {
                            && is_flat_ref(ispec->rets[0]);
                 auto *growdst = w.inl[ei].growret;
                 if (growdst && !ret->vals.empty()) {
-                    // The inlined body's growable result: copy its run into
+                    // The inlined body's growable result: build its run into
                     // the destination the caller bound.
-                    auto *id = Is<Ident>(ret->vals[0]);
-                    auto *r = id && id->vdef ? rz_head(w, id->vdef) : nullptr;
-                    if (r) emit_growable_into(r, growdst->slot, growdst->len,
-                                              w);
+                    emit_growable_result(ret->vals[0], growdst->slot,
+                                         growdst->len, ispec->rets[0], w);
                     b.CreateBr(w.inl[ei].merge);
                     b.SetInsertPoint(llvm::BasicBlock::Create(
                         ctx, "inlret.dead", w.fn));
@@ -3686,16 +3806,13 @@ struct CodeGenIR {
                 // The run form: the value to return is a growable the walk
                 // holds; its elements are copied onto the caller's stack
                 // (dst, rl are the last two arguments).
-                auto *val = ret->vals[0];
-                auto *id = val ? Is<Ident>(val) : nullptr;
-                auto *r = id && id->vdef ? rz_head(w, id->vdef) : nullptr;
-                if (!r)
-                    return Unsup(cat("a growable return the walk does not "
-                                     "hold at line ",
-                                     (long long)ret->line.line));
                 auto *dst = w.fn->getArg(w.outstart);
                 auto *rl = w.fn->getArg(w.outstart + 1);
-                emit_growable_into(r, dst, rl, w);
+                if (!emit_growable_result(ret->vals[0], dst, rl,
+                                          w.spec->rets[0], w))
+                    return Unsup(cat("a growable return the walk does not "
+                                     "build at line ",
+                                     (long long)ret->line.line));
                 b.CreateRetVoid();
                 return;
             }
