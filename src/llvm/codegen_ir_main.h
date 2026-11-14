@@ -69,6 +69,7 @@ struct CodeGenIR {
     llvm::Function *f_gs_divfail = nullptr;          // (ptr,i32), noreturn
     llvm::Function *f_gs_divovf = nullptr;           // (ptr,i32), noreturn
     llvm::Function *f_gs_abort = nullptr;            // (i32,ptr,i32), noreturn
+    llvm::Function *f_gs_abort_msg = nullptr;        // (ptr,i64,ptr,i32), noreturn
     llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_fmt_u64 = nullptr;          // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_fmt_bool = nullptr;         // (ptr,i64) -> i64 appended
@@ -164,6 +165,7 @@ struct CodeGenIR {
         dcl("gs_divfail", f_gs_divfail, V, { P, I32 });
         dcl("gs_divovf", f_gs_divovf, V, { P, I32 });
         dcl("gs_abort", f_gs_abort, V, { I32, P, I32 });
+        dcl("gs_abort_msg", f_gs_abort_msg, V, { P, I, P, I32 });
         dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
         dcl("gs_fmt_u64", f_gs_fmt_u64, I, { P, I });
         dcl("gs_fmt_bool", f_gs_fmt_bool, I, { P, I });
@@ -1643,6 +1645,56 @@ struct CodeGenIR {
                         return nullptr;
                     }
                 }
+            }
+            // `dst.move_from(src)`: both are views over int arrays the walk
+            // holds (a fixeds local's slice, a slice local's view, a range
+            // of either). Lengths must match, then the source's elements are
+            // moved over the destination (memmove, so overlaps are exact).
+            // The receiver is the callee's Dot obj, as for push and append.
+            if (c->builtin == B_MOVE_FROM && c->args.size() == 1) {
+                auto *rd = Is<Dot>(c->callee);
+                SliceVal dst;
+                if (!rd || !slice_value(rd->obj, w, dst) || !dst.etype)
+                    return Unsup(cat("a move_from over values the walk does "
+                                     "not hold at line ",
+                                     (long long)c->line.line)), nullptr;
+                SliceVal src;
+                if (!slice_value(c->args[0], w, src) || !src.etype)
+                    return Unsup(cat("a move_from source the walk does not "
+                                     "build at line ",
+                                     (long long)c->line.line)), nullptr;
+                auto *ne = b.CreateICmpNE(dst.len, src.len, "mf_len");
+                auto *failbb = llvm::BasicBlock::Create(ctx, "mf_fail", w.fn);
+                auto *okbb = llvm::BasicBlock::Create(ctx, "mf_ok", w.fn);
+                b.CreateCondBr(ne, failbb, okbb);
+                b.SetInsertPoint(failbb);
+                // The runtime's gs_abort_msg says the message, like the C
+                // backend's GenMoveFrom.
+                auto *msg = strlit_glob("move_from lengths differ");
+                auto *msgp = b.CreateInBoundsGEP(
+                    msg->getValueType(), msg,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), 0) }, "mfmsg");
+                b.CreateCall(f_gs_abort_msg, {
+                    msgp,
+                    llvm::ConstantInt::get(i64(), 24),
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                           (uint64_t)c->line.line) });
+                b.CreateUnreachable();
+                b.SetInsertPoint(okbb);
+                auto *et = int_ll_ty(dst.etype);
+                auto esz = et->getPrimitiveSizeInBits() / 8;
+                if (esz) {
+                    // The C backend moves with memmove: the destination
+                    // and source may overlap (a[1..].move_from(a[..4])).
+                    auto *nbytes = b.CreateMul(
+                        dst.len, llvm::ConstantInt::get(i64(), (uint64_t)esz),
+                        "mf_bytes");
+                    b.CreateMemMove(dst.data, llvm::MaybeAlign(1), src.data,
+                                    llvm::MaybeAlign(1), nbytes);
+                }
+                return nullptr;
             }
             // append (memberof spelling: the receiver is the callee's Dot
             // obj) onto a growable int array the walk holds. The source's

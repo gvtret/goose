@@ -218,11 +218,15 @@ may be a value built at the site: an empty or listed literal is written
 into the destination element by element, a string literal's bytes are
 copied (byte elements), and a slice view is copied over. A string or
 array literal in a view position resolves as its bytes or elements
-whatever array type the optimizer folded it to. `goose llc`
+whatever array type the optimizer folded it to. `move_from` on int-array
+views checks lengths match (aborting with the runtime's message when
+they do not) and memmoves the source over the destination, so
+overlapping slices like `a[1..].move_from(a[..4])` shift correctly.
+`goose llc`
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 45 of the codegen output fixtures pass through
+in the output now refuse. 47 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
