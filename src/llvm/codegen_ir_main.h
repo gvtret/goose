@@ -401,7 +401,10 @@ struct CodeGenIR {
     static bool is_flat_struct(TypeExpr *t) {
         if (!t || t->kind != TY_STRUCT || !t->struc || !t->struc->inst) return false;
         auto *in = t->struc->inst;
-        if (in->sclass != SC_FIXED || !in->flat || in->failed || !in->st) return false;
+        if (in->sclass != SC_FIXED || in->failed || !in->st) return false;
+        // A generic instantiation may not have `flat` set even when every
+        // concrete field is an int; fall through to the per-field check.
+        if (!in->flat && in->ftypes.empty()) return false;
         if (in->st->fields.empty() || in->ftypes.size() != in->st->fields.size()) return false;
         for (size_t i = 0; i < in->st->fields.size(); ++i) {
             if (in->st->fields[i].ispad) return false;
