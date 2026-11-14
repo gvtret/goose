@@ -268,6 +268,7 @@ struct CodeGenIR {
         struct RefLoc {
             llvm::AllocaInst *base = nullptr;      // The pointer holder.
             TypeExpr *ptee = nullptr;              // The pointee's type.
+            bool optional = false;                 // Nullable (T&? or T?).
         };
         std::unordered_map<VarDef *, RefLoc> refs;
         // Flat int-field struct locals: their storage and the struct's layout.
@@ -694,7 +695,8 @@ struct CodeGenIR {
                     auto *slot = b.CreateAlloca(i8ptr(), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(argidx), slot);
-                    w.refs[sp->params[i]] = { slot, pt->ref->sub };
+                    w.refs[sp->params[i]] = { slot, pt->ref->sub,
+                                              pt->ref->optional };
                     argidx += 1;
                 } else if (is_flat_struct(pt)) {
                     auto *slot = b.CreateAlloca(struct_ty(pt), nullptr,
@@ -1329,6 +1331,9 @@ struct CodeGenIR {
                 auto rit = w.refs.find(id->vdef);
                 if (rit != w.refs.end()) {
                     auto *p = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                    // An optional reference's value is the pointer itself:
+                    // `o == null`, `o != null` and a bare `if o` test it.
+                    if (rit->second.optional) return p;
                     if (is_flat_struct(rit->second.ptee))
                         return b.CreateLoad(
                             struct_ll_ty(rit->second.ptee->struc->inst), p,
@@ -2410,6 +2415,15 @@ struct CodeGenIR {
         return true;
     }
 
+    // `default<T&?>()` yields the null pointer (the C backend's
+    // EmitDefaultInto zeroes the pointer of a reference default).
+    static bool is_opt_ref_default(Node *n) {
+        auto *c = n ? Is<Call>(n) : nullptr;
+        return c && c->builtin == B_DEFAULT && c->rettypes.size() == 1
+            && c->rettypes[0] && c->rettypes[0]->kind == TY_REF
+            && c->rettypes[0]->ref->optional;
+    }
+
     // A reference binding (`let px .= n`, `var r .= n`): one pointer
     // holder whose store is the variable the initializer names. The
     // initializer must be a variable this slice holds for now; an
@@ -2450,9 +2464,14 @@ struct CodeGenIR {
         if (is_flat_struct(ptee)) {
             // A reference to a struct: the address its initializer names is
             // the body every read and write through the holder reaches. A
-            // call handing one back yields the pointer itself.
+            // call handing one back yields the pointer itself. An optional
+            // `null` holds a null pointer.
             llvm::Value *ptr = nullptr;
-            if (auto *c = init ? Is<Call>(init) : nullptr) {
+            bool sopt = def.type->ref->optional;
+            if ((init && Is<NullLit>(init) && sopt)
+                || is_opt_ref_default(init)) {
+                ptr = llvm::ConstantPointerNull::get(i8ptr());
+            } else if (auto *c = init ? Is<Call>(init) : nullptr) {
                 if (!c->spec || c->spec->rets.size() != 1
                     || !struct_ref_pointee(c->spec->rets[0]))
                     return Unsup(cat("a reference bound to a value the walk "
@@ -2475,14 +2494,20 @@ struct CodeGenIR {
                                  (long long)vd->line.line));
             auto *slot = entry_alloca(w, i8ptr(), llvm::Twine(def.name));
             b.CreateStore(ptr, slot);
-            w.refs[&def] = { slot, ptee };
+            w.refs[&def] = { slot, ptee, sopt };
             return;
         }
         llvm::Value *ptr = nullptr;
+        bool iopt = def.type->ref->optional;
+        // `let o: T&? = null` or `default<T&?>()`: the holder keeps a
+        // null pointer.
+        if ((init && Is<NullLit>(init) && iopt) || is_opt_ref_default(init)) {
+            ptr = llvm::ConstantPointerNull::get(i8ptr());
+        }
         // The initializer may be a call (or an inlined body) whose single
         // result is the reference itself: the pointer it yields is what the
         // holder keeps.
-        if (auto *c = init ? Is<Call>(init) : nullptr) {
+        else if (auto *c = init ? Is<Call>(init) : nullptr) {
             if (!c->spec || c->spec->rets.size() != 1
                 || !is_i64_ref(c->spec->rets[0]))
                 return Unsup(cat("a reference bound to a value the walk does "
@@ -2519,7 +2544,7 @@ struct CodeGenIR {
                              "not hold at line ", (long long)vd->line.line));
         auto *slot = entry_alloca(w, i8ptr(), llvm::Twine(def.name));
         b.CreateStore(ptr, slot);
-        w.refs[&def] = { slot, ptee };
+        w.refs[&def] = { slot, ptee, iopt };
     }
 
     // The address a reference-valued expression names: what a function
@@ -2843,9 +2868,13 @@ struct CodeGenIR {
                                         : w.refs.end();
             if (rit != w.refs.end() && is_flat_struct(rit->second.ptee)) {
                 // A reference to a struct: the path starts at the pointee
-                // the holder names.
+                // the holder names. The holder stores an i8*, so we cast it
+                // to the struct pointer type before GEP.
                 inst = rit->second.ptee->struc->inst;
-                addr = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                auto *raw = b.CreateLoad(i8ptr(), rit->second.base, "refp");
+                addr = b.CreatePointerCast(raw,
+                    llvm::PointerType::getUnqual(struct_ll_ty(inst)),
+                    "refcast");
             } else if (sit != w.structs.end()) {
                 inst = sit->second.inst;
                 addr = sit->second.base;
@@ -3130,7 +3159,9 @@ struct CodeGenIR {
                 continue;
             }
             if (pt->kind == TY_REF && is_flat_struct(pt->ref->sub)) {
-                auto *ptr = ref_addr(a, w);
+                auto *ptr = (a && Is<NullLit>(a) && pt->ref->optional)
+                    ? (llvm::Value *)llvm::ConstantPointerNull::get(i8ptr())
+                    : ref_addr(a, w);
                 if (!ptr) return nullptr;
                 args.push_back(ptr);
                 continue;
@@ -3144,7 +3175,11 @@ struct CodeGenIR {
                     if (u->op == T_BITAND) a2 = u->child;
                 auto *id = Is<Ident>(a2);
                 llvm::Value *ptr = nullptr;
-                if (id && id->vdef) {
+                // A null argument to an optional reference parameter passes
+                // the null pointer itself.
+                if (a2 && Is<NullLit>(a2) && pt->ref->optional)
+                    ptr = llvm::ConstantPointerNull::get(i8ptr());
+                else if (id && id->vdef) {
                     auto lit = w.locals.find(id->vdef);
                     if (lit != w.locals.end()) ptr = lit->second;
                     else {
@@ -3446,16 +3481,9 @@ struct CodeGenIR {
                     if (auto *u = Is<Unary>(rhs))
                         if (u->op == T_BITAND)
                             rhs = u->child;
-                    auto *rid = Is<Ident>(rhs);
-                    llvm::Value *nptr = nullptr;
-                    if (rid && rid->vdef) {
-                        auto lit = w.locals.find(rid->vdef);
-                        if (lit != w.locals.end()) nptr = lit->second;
-                        else {
-                            auto gvit = global_vars.find(rid->vdef);
-                            if (gvit != global_vars.end()) nptr = gvit->second.gv;
-                        }
-                    }
+                    // The new place: a variable slot, a struct local's
+                    // body, a field, or another reference's pointer.
+                    llvm::Value *nptr = ref_addr(rhs, w);
                     if (!nptr)
                         return Unsup(cat("a rebind to a value the walk does "
                                          "not hold at line ",
