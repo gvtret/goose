@@ -230,7 +230,10 @@ truthiness; `null`, `default<T&?>()` and rebind via `ref_addr` (locals,
 structs, globals, another reference) set the holder. A float value lives
 at its own width: literals, locals, `+ - * /` and their compound forms
 run in float arithmetic, print renders through the runtime's float
-hooks, and an f32 widens where it mixes with an f64. An optional reference to a growable array
+hooks, and an f32 widens where it mixes with an f64. An `extern fn`'
+call lowers straight to its C symbol: floats at their width, ints as
+i64, an `i64&` as a pointer, an int-array slice as the { data, len }
+pair. An optional reference to a growable array
 (`u8[>..]?`) holds the pair of two null pointers when null, its
 expression value reads as the header pointer (so `== null`, `!= null`
 and a bare `if o` test it), and `.=` binds it like a plain reference.

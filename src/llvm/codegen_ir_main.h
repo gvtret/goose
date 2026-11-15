@@ -606,6 +606,9 @@ struct CodeGenIR {
         // several live specializations, keeping the symbols distinct.
         vector<Shell> shells;
         for (auto *sp : specs) {
+            // An extern function's declaration goes into the extern pass
+            // below; no shell, no body walk.
+            if (sp->sf->isextern) continue;
             string name = sp->sf->cname.empty() ? string(sp->sf->name) : sp->sf->cname;
             auto suffix = name_counts[sp->sf->qname] > 1
                 ? cat("_", sp->id) : string();
@@ -669,6 +672,37 @@ struct CodeGenIR {
                                               llvm::GlobalValue::ExternalLinkage,
                                               name + suffix, mod.get());
             shells.push_back({ sp, fn, supported, suffix });
+        }
+
+        // Extern functions: one LLVM declaration per C symbol, its
+        // signature mapped (floats at their width, ints as i64).
+        for (auto *sp : specs) {
+            if (!sp->sf->isextern || !sp->live) continue;
+            string name = sp->sf->cname.empty() ? string(sp->sf->name)
+                                                : sp->sf->cname;
+            if (mod->getFunction(name)) continue;
+            std::vector<llvm::Type *> argtys;
+            bool supported = true;
+            for (auto *t : sp->argtypes) {
+                if (is_flt_ty(t)) argtys.push_back(flt_ll_ty(t));
+                else if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
+                else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
+                else if (t && t->kind == TY_REF && is_int_ty(t->ref->sub))
+                    argtys.push_back(i8ptr());
+                else supported = false;
+            }
+            llvm::Type *retty = voidty();
+            if (sp->rets.size() == 1) {
+                if (is_flt_ty(sp->rets[0])) retty = flt_ll_ty(sp->rets[0]);
+                else if (is_slice_of_int(sp->rets[0])) retty = slice_ll_ty();
+                else if (is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
+                    retty = i64ty;
+                else supported = false;
+            } else if (!sp->rets.empty()) supported = false;
+            if (!supported) continue;
+            auto *fty = llvm::FunctionType::get(retty, argtys, false);
+            llvm::Function::Create(fty, llvm::GlobalValue::ExternalLinkage,
+                                   name, mod.get());
         }
 
         // Pass 2: walk each body (now every shell exists to be called).
@@ -3130,11 +3164,65 @@ struct CodeGenIR {
     // A direct call of a Goose function. Results 1.. are out-pointers the
     // callee writes (`outs[i]`, a pointer per result); result 0 is the value
     // returned. A multi-result call needs `outs`, a value context does not.
+    // A call of an extern C function: each argument at its own width
+    // (floats as float/double, ints as i64, an int& as a pointer), the
+    // result returned as the walk's value (an i64 for ints, the float for
+    // floats). A bool result widens from i1 to i64.
+    llvm::Value *EmitExternCall(Call *c, FnWalk &w) {
+        auto *sp = c->spec;
+        string name = sp->sf->cname.empty() ? string(sp->sf->name)
+                                            : sp->sf->cname;
+        auto *cf = mod->getFunction(name);
+        if (!cf) return nullptr;
+        std::vector<llvm::Value *> args;
+        for (size_t ai = 0; ai < c->args.size(); ++ai) {
+            auto *a = c->args[ai];
+            auto *pt = ai < sp->argtypes.size() ? sp->argtypes[ai] : nullptr;
+            if (pt && is_flt_ty(pt)) {
+                auto *v = GenExpr(a, w);
+                if (!v) return nullptr;
+                auto *ty = flt_ll_ty(pt);
+                if (v->getType() != ty)
+                    v = pt->fltstorage == FS_F32
+                        ? b.CreateFPTrunc(v, ty, "fxnarrow")
+                        : b.CreateFPExt(v, ty, "fwiden");
+                args.push_back(v);
+                continue;
+            }
+            if (pt && is_slice_of_int(pt)) {
+                SliceVal sv;
+                if (!slice_value(a, w, sv)) return nullptr;
+                auto *hdr = b.CreateInsertValue(
+                    llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
+                continue;
+            }
+            if (pt && pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
+                // An int& argument passes the place it names.
+                auto *ptr = ref_addr(a, w);
+                if (!ptr) return nullptr;
+                args.push_back(ptr);
+                continue;
+            }
+            auto *v = GenExpr(a, w);
+            if (!v) return nullptr;
+            args.push_back(as_i64(v));
+        }
+        auto *r = b.CreateCall(cf, args);
+        if (sp->rets.size() == 1 && is_slice_of_int(sp->rets[0])) return r;
+        if (sp->rets.size() == 1 && is_flt_ty(sp->rets[0])) return r;
+        if (sp->rets.size() == 1 && is_bool_ty(sp->rets[0]))
+            return b.CreateZExt(r, i64(), "boolw");
+        if (r->getType()->isVoidTy()) return nullptr;
+        return r;
+    }
+
     llvm::Value *EmitDirectCall(Call *c, FnWalk &w,
                                 const std::vector<llvm::Value *> *outs,
                                 FnWalk::RzArr *growret = nullptr) {
         auto *sp = c->spec;
         if (!sp) return nullptr;
+        if (sp->sf->isextern) return EmitExternCall(c, w);
         for (auto *t : sp->argtypes)
             if (!is_int_ty(t) && !is_bool_ty(t) && !is_slice_of_int(t)
                 && !is_flat_struct(t)
