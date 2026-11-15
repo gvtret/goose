@@ -855,6 +855,38 @@ struct CodeGenIR {
             auto *r = id->vdef ? rz_head(w, id->vdef) : nullptr;
             if (r) { emit_growable_into(r, dst, rl, w); return true; }
         }
+        if (auto *ifx = Is<IfExpr>(val)) {
+            // `if c { f() } else { g() }` as a run source: the condition
+            // branches, each arm builds into the same destination, and the
+            // merge continues (no value flows out).
+            auto *cond = GenExpr(ifx->cond, w);
+            if (!cond) return false;
+            cond = as_i1(cond, "ifcond");
+            auto *fn = w.fn;
+            auto *thenbb = llvm::BasicBlock::Create(ctx, "runthen", fn);
+            auto *elsebb = ifx->elseb
+                ? llvm::BasicBlock::Create(ctx, "runelse", fn) : nullptr;
+            auto *mergebb = llvm::BasicBlock::Create(ctx, "runmerge", fn);
+            b.CreateCondBr(cond, thenbb, elsebb ? elsebb : mergebb);
+            b.SetInsertPoint(thenbb);
+            // The arm's value: its tail, or the block's last expression.
+            Node *thenn = ifx->thenb->tail;
+            if (!thenn && !ifx->thenb->stmts.empty())
+                thenn = ifx->thenb->stmts.back();
+            if (!thenn || !emit_growable_result(thenn, dst, rl, rettype, w))
+                return false;
+            b.CreateBr(mergebb);
+            if (elsebb) {
+                b.SetInsertPoint(elsebb);
+                Node *elsen = Is<Block>(ifx->elseb) && Is<Block>(ifx->elseb)->tail
+                    ? (Node *)Is<Block>(ifx->elseb)->tail : ifx->elseb;
+                if (!elsen || !emit_growable_result(elsen, dst, rl, rettype, w))
+                    return false;
+                b.CreateBr(mergebb);
+            }
+            b.SetInsertPoint(mergebb);
+            return true;
+        }
         auto *sub = rettype->arr->sub;
         auto *et = int_ll_ty(sub);
         auto esz = et->getPrimitiveSizeInBits() / 8;
@@ -1851,19 +1883,64 @@ struct CodeGenIR {
                     SliceVal sv;
                     if ((!st || (st->kind != TY_SLICE && st->kind != TY_ARRAY))
                         || !slice_value(c->args[0], w, sv)) {
-                        // An if arm or block tail the value path built into
-                        // the { data, len } pair.
-                        auto *v = st && is_slice_of_int(st)
-                            ? GenExpr(c->args[0], w) : nullptr;
-                        if (!v || v->getType() != slice_ll_ty())
-                            return Unsup(cat("an append source the walk does "
-                                             "not build at line ",
-                                             (long long)c->line.line)), nullptr;
-                        sv.data = b.CreateExtractValue(v, 0, "apd");
-                        sv.len = b.CreateExtractValue(v, 1, "apn");
+                        // A growable-returning source (a call, an inlined
+                        // body, an if of them): the run builds into a
+                        // scratch destination, then appends from it.
+                        bool growsrc = st && st->kind == TY_ARRAY
+                            && st->arr->akind == A_GROW
+                            && (is_int_ty(st->arr->sub)
+                                || is_flt_ty(st->arr->sub));
+                        if (growsrc) {
+                            auto *slot = new llvm::GlobalVariable(
+                                *mod, i8ptr(), /*isConstant=*/false,
+                                llvm::GlobalValue::InternalLinkage,
+                                llvm::ConstantPointerNull::get(i8ptr()),
+                                cat("gs_stk", stk_slots.size()), nullptr,
+                                llvm::GlobalValue::GeneralDynamicTLSModel);
+                            stk_slots.push_back(slot);
+                            auto *hdra = entry_alloca(w, slice_ll_ty(),
+                                                      "agscr.hdr");
+                            auto *basea = b.CreateInBoundsGEP(
+                                slice_ll_ty(), hdra, { idx0(), fld(0) },
+                                "agscr.base");
+                            auto *lena = b.CreateInBoundsGEP(
+                                slice_ll_ty(), hdra, { idx0(), fld(1) },
+                                "agscr.len");
+                            auto *basev = b.CreateLoad(i8ptr(), slot,
+                                                       "agscr.top");
+                            b.CreateStore(basev, basea);
+                            b.CreateStore(llvm::ConstantInt::get(i64(), 0),
+                                          lena);
+                            FnWalk::RzArr scratch { basea, lena, slot, hdra,
+                                                    st->arr->sub };
+                            if (!emit_growable_result(c->args[0],
+                                                      scratch.slot,
+                                                      scratch.len, st, w))
+                                return Unsup(cat("an append source the walk "
+                                                 "does not build at line ",
+                                                 (long long)c->line.line)),
+                                       nullptr;
+                            data = b.CreateLoad(i8ptr(), basea, "apd");
+                            n = b.CreateLoad(i64(), lena, "apn");
+                        } else {
+                            // An if arm or block tail the value path built
+                            // into the { data, len } pair.
+                            auto *v = st && is_slice_of_int(st)
+                                ? GenExpr(c->args[0], w) : nullptr;
+                            if (!v || v->getType() != slice_ll_ty())
+                                return Unsup(cat("an append source the walk "
+                                                 "does not build at line ",
+                                                 (long long)c->line.line)),
+                                       nullptr;
+                            sv.data = b.CreateExtractValue(v, 0, "apd");
+                            sv.len = b.CreateExtractValue(v, 1, "apn");
+                            data = sv.data;
+                            n = sv.len;
+                        }
+                    } else {
+                        data = sv.data;
+                        n = sv.len;
                     }
-                    data = sv.data;
-                    n = sv.len;
                 }
                 auto *et = int_ll_ty(r ? r->etype : lit->second.etype);
                 auto *esz = llvm::ConstantInt::get(

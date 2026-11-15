@@ -233,7 +233,9 @@ run in float arithmetic, print renders through the runtime's float
 hooks, and an f32 widens where it mixes with an f64. A growable array
 of float elements (`f64[>..]`, `f32[>..]`) works like one of ints:
 literals, push, index, `.len`, a `for` binder at its own width, and
-print through the float hooks. An `extern fn`'
+print through the float hooks. An append's source may be a run built at
+the site: a growable-returning call, and an if of them, builds onto a
+scratch destination before its elements join the receiver. An `extern fn`'
 call lowers straight to its C symbol: floats at their width, ints as
 i64, an `i64&` as a pointer, an int-array slice as the { data, len }
 pair. An optional reference to a growable array
