@@ -1,0 +1,3 @@
+Named { "abc", Inner { 5 }, 42 }
+ P2 { 1, 2.5 }
+ Named { "", Inner { 0 }, 0 }

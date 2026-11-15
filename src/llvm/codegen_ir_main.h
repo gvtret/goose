@@ -2349,6 +2349,16 @@ struct CodeGenIR {
                             return nullptr;
                         continue;
                     }
+                    if (an->exprtype && is_flat_struct(an->exprtype)) {
+                        // A struct renders through the default hook: the
+                        // type's name, `{ field, field }`.
+                        if (!emit_print_struct(an, an->exprtype, cura, w))
+                            return Unsup(cat("a print of a struct the walk "
+                                             "does not hold at line ",
+                                             (long long)an->line.line)),
+                                   nullptr;
+                        continue;
+                    }
                     if (an->exprtype && an->exprtype->kind == TY_FLT) {
                         // A float renders through the runtime's float hook
                         // at its own width, as the C backend's does.
@@ -3042,6 +3052,197 @@ struct CodeGenIR {
 
     // Appends an int array or slice's text form at the print cursor: raw
     // bytes for u8 elements, `[a, b, c]` otherwise (codegen_render.h).
+    // Renders a flat struct value at the print cursor: the type's name,
+    // `{ field, field }` with strings quoted, nested structs and slices
+    // recursively. The value must be the walk's struct-shaped value.
+    bool emit_print_struct(Node *an, TypeExpr *t, llvm::Value *cura, FnWalk &w) {
+        if (!t || !is_flat_struct(t)) return false;
+        auto *inst = t->struc->inst;
+        llvm::Value *v = nullptr;
+        StructInst *si = nullptr;
+        if (!struct_value(an, w, v, si) || si != inst) return false;
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        // The type's name.
+        std::string tn(inst->st->name);
+        emit_print_bytes(cura, tn);
+        emit_print_bytes(cura, " { ");
+        for (size_t f = 0; f < inst->ftypes.size(); ++f) {
+            if (f) emit_print_bytes(cura, ", ");
+            auto *ft = inst->ftypes[f];
+            auto *fv = b.CreateExtractValue(v, (unsigned)f, "pf");
+            auto *p = b.CreateStructGEP(struct_ll_ty(inst), cura, 0); // unused
+            (void)p;
+            if (is_flat_struct(ft)) {
+                // A nested struct: re-render through a temporary alloca.
+                auto *tmp = entry_alloca(w, struct_ll_ty(inst), "pfs");
+                (void)tmp;
+                // Render recursively by building the value into a temp
+                // struct value: emit via the same hook on a synthetic
+                // field load. Simplest: recurse with a nested helper.
+                if (!emit_print_struct_value(fv, ft, cura, w)) return false;
+                continue;
+            }
+            if (is_slice_of(ft)) {
+                // A slice field renders as its bytes (u8) or a list.
+                auto *data = b.CreateExtractValue(fv, 0, "pfd");
+                auto *len = b.CreateExtractValue(fv, 1, "pfn");
+                if (!emit_print_slice_bytes(cura, data, len, ft->sub, w,
+                                            true))
+                    return false;
+                continue;
+            }
+            if (is_flt_ty(ft)) {
+                auto *cur = b.CreateLoad(i8ptr(), cura);
+                auto *hook = ft->fltstorage == FS_F32
+                    ? f_gs_fmt_f32 : f_gs_fmt_f64;
+                auto *n = b.CreateCall(hook, { cur, fv });
+                b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+                continue;
+            }
+            if (is_bool_ty(ft)) {
+                auto *cur = b.CreateLoad(i8ptr(), cura);
+                auto *n = b.CreateCall(f_gs_fmt_bool,
+                                       { cur, b.CreateZExt(fv, i64()) });
+                b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+                continue;
+            }
+            // An int field at its storage width.
+            auto *et = int_ll_ty(ft);
+            auto *ev = fv;
+            if (et != i64())
+                ev = is_uint_ty(ft) ? b.CreateZExt(fv, i64())
+                                    : b.CreateSExt(fv, i64());
+            auto *cur = b.CreateLoad(i8ptr(), cura);
+            auto *hook = ft->intstorage == IS_U64 ? f_gs_fmt_u64 : f_gs_fmt_i64;
+            auto *n = b.CreateCall(hook, { cur, ev });
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+        }
+        emit_print_bytes(cura, " }");
+        return true;
+    }
+
+    // The recursive part of a struct render: a value already extracted.
+    bool emit_print_struct_value(llvm::Value *v, TypeExpr *t,
+                                 llvm::Value *cura, FnWalk &w) {
+        if (!t || !is_flat_struct(t)) return false;
+        auto *inst = t->struc->inst;
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        std::string tn(inst->st->name);
+        emit_print_bytes(cura, tn);
+        emit_print_bytes(cura, " { ");
+        for (size_t f = 0; f < inst->ftypes.size(); ++f) {
+            if (f) emit_print_bytes(cura, ", ");
+            auto *ft = inst->ftypes[f];
+            auto *fv = b.CreateExtractValue(v, (unsigned)f, "pff");
+            if (is_flat_struct(ft)) {
+                if (!emit_print_struct_value(fv, ft, cura, w)) return false;
+                continue;
+            }
+            if (is_slice_of(ft)) {
+                auto *data = b.CreateExtractValue(fv, 0, "pfdd");
+                auto *len = b.CreateExtractValue(fv, 1, "pfnn");
+                if (!emit_print_slice_bytes(cura, data, len, ft->sub, w,
+                                            true))
+                    return false;
+                continue;
+            }
+            if (is_flt_ty(ft)) {
+                auto *cur = b.CreateLoad(i8ptr(), cura);
+                auto *hook = ft->fltstorage == FS_F32
+                    ? f_gs_fmt_f32 : f_gs_fmt_f64;
+                auto *n = b.CreateCall(hook, { cur, fv });
+                b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+                continue;
+            }
+            if (is_bool_ty(ft)) {
+                auto *cur = b.CreateLoad(i8ptr(), cura);
+                auto *n = b.CreateCall(f_gs_fmt_bool,
+                                       { cur, b.CreateZExt(fv, i64()) });
+                b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+                continue;
+            }
+            auto *et = int_ll_ty(ft);
+            auto *ev = fv;
+            if (et != i64())
+                ev = is_uint_ty(ft) ? b.CreateZExt(fv, i64())
+                                    : b.CreateSExt(fv, i64());
+            auto *cur = b.CreateLoad(i8ptr(), cura);
+            auto *hook = ft->intstorage == IS_U64 ? f_gs_fmt_u64 : f_gs_fmt_i64;
+            auto *n = b.CreateCall(hook, { cur, ev });
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+        }
+        emit_print_bytes(cura, " }");
+        return true;
+    }
+
+    // Renders a slice's elements at the cursor: raw bytes for u8/i8 (a
+    // string field), `[a, b, c]` for other ints and floats.
+    bool emit_print_slice_bytes(llvm::Value *cura, llvm::Value *data,
+                                llvm::Value *len, TypeExpr *etype,
+                                FnWalk &w, bool quote = false) {
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        if (etype->intstorage == IS_U8 || etype->intstorage == IS_I8) {
+            // Inside a struct a string field prints in quotes; a bare one
+            // prints raw (the same call the top-level view uses).
+            if (quote) emit_print_bytes(cura, "\"");
+            auto *cur = b.CreateLoad(i8ptr(), cura);
+            b.CreateMemMove(cur, llvm::MaybeAlign(1), data,
+                            llvm::MaybeAlign(1), len);
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, len, "pcur+"), cura);
+            if (quote) emit_print_bytes(cura, "\"");
+            return true;
+        }
+        auto *zero = llvm::ConstantInt::get(i64(), 0);
+        auto *pre = b.GetInsertBlock();
+        auto *condbb = llvm::BasicBlock::Create(ctx, "psf_cond", w.fn);
+        auto *bodybb = llvm::BasicBlock::Create(ctx, "psf_body", w.fn);
+        auto *donebb = llvm::BasicBlock::Create(ctx, "psf_done", w.fn);
+        auto *startcur = b.CreateLoad(i8ptr(), cura);
+        b.CreateStore(llvm::ConstantInt::get(i8ty, '['), startcur);
+        b.CreateStore(b.CreateInBoundsGEP(
+            i8ty, startcur, llvm::ConstantInt::get(i64(), 1)), cura);
+        b.CreateBr(condbb);
+        b.SetInsertPoint(condbb);
+        auto *iv = b.CreatePHI(i64(), 2, "psf_i");
+        iv->addIncoming(zero, pre);
+        b.CreateCondBr(b.CreateICmpSLT(iv, len, "psf_test"), bodybb, donebb);
+        b.SetInsertPoint(bodybb);
+        auto *sepbb = llvm::BasicBlock::Create(ctx, "psf_sep", w.fn);
+        auto *elbb = llvm::BasicBlock::Create(ctx, "psf_el", w.fn);
+        b.CreateCondBr(b.CreateICmpEQ(iv, zero), elbb, sepbb);
+        b.SetInsertPoint(sepbb);
+        emit_print_bytes(cura, ", ");
+        b.CreateBr(elbb);
+        b.SetInsertPoint(elbb);
+        auto *et = elem_ll_ty(etype);
+        auto *ev = b.CreateLoad(et, b.CreateInBoundsGEP(et, data, iv), "psf_v");
+        auto *cur2 = b.CreateLoad(i8ptr(), cura);
+        llvm::Value *n = nullptr;
+        if (is_flt_ty(etype)) {
+            auto *hook = etype->fltstorage == FS_F32
+                ? f_gs_fmt_f32 : f_gs_fmt_f64;
+            n = b.CreateCall(hook, { cur2, ev });
+        } else {
+            auto *ev64 = et == i64() ? ev
+                : is_uint_ty(etype) ? b.CreateZExt(ev, i64())
+                                    : b.CreateSExt(ev, i64());
+            auto *hook = etype->intstorage == IS_U64
+                ? f_gs_fmt_u64 : f_gs_fmt_i64;
+            n = b.CreateCall(hook, { cur2, ev64 });
+        }
+        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur2, n), cura);
+        auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1),
+                                 "psf_next");
+        iv->addIncoming(next, b.GetInsertBlock());
+        b.CreateBr(condbb);
+        b.SetInsertPoint(donebb);
+        auto *endcur = b.CreateLoad(i8ptr(), cura);
+        b.CreateStore(llvm::ConstantInt::get(i8ty, ']'), endcur);
+        b.CreateStore(b.CreateInBoundsGEP(
+            i8ty, endcur, llvm::ConstantInt::get(i64(), 1)), cura);
+        return true;
+    }
+
     bool emit_print_view(Node *an, TypeExpr *t, llvm::Value *cura, FnWalk &w) {
         TypeExpr *etype = nullptr;
         SliceVal sv;
@@ -3211,8 +3412,11 @@ struct CodeGenIR {
         if (auto *sl = Is<StructLit>(n)) {
             if (!sl->exprtype || !is_flat_struct(sl->exprtype)) return false;
             inst = sl->exprtype->struc->inst;
-            if (sl->defaultall || sl->implicit
-                || sl->inits.size() != inst->st->fields.size())
+            // A folded `default<T>()` is an implicit literal with `..`:
+            // the given fields build, the rest stay the zero.
+            if ((sl->implicit && !sl->defaultall)
+                || (!sl->defaultall
+                    && sl->inits.size() != inst->st->fields.size()))
                 return false;
             std::vector<int> at;
             for (size_t k = 0; k < sl->inits.size(); ++k) {
@@ -3222,6 +3426,14 @@ struct CodeGenIR {
                 at.push_back(f);
             }
             auto *slot = entry_alloca(w, struct_ll_ty(inst), "sttmp");
+            // The defaultall form leaves fields out: zero the temporary
+            // first, so they keep their zero (null slice pair, 0, +0.0).
+            if (sl->defaultall && inst->ftypes.size()) {
+                auto sz = mod->getDataLayout().getTypeAllocSize(
+                    struct_ll_ty(inst));
+                b.CreateMemSet(slot, (llvm::Value *)b.getInt8(0), sz,
+                               llvm::Align(8));
+            }
             for (size_t k = 0; k < sl->inits.size(); ++k) {
                 auto f = (unsigned)at[k];
                 auto *p = b.CreateStructGEP(struct_ll_ty(inst), slot, f);
@@ -3358,6 +3570,20 @@ struct CodeGenIR {
         for (size_t k = 0; k < sl->inits.size(); ++k) {
             auto f = (unsigned)at[k];
             auto *p = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
+            if (is_flat_struct(in->ftypes[f])) {
+                // A nested struct field: the value its literal builds
+                // (a defaulted nested one keeps the zero, so a refusal
+                // here only means a shape the walk does not hold).
+                llvm::Value *fv = nullptr;
+                StructInst *fi = nullptr;
+                if (!struct_value(sl->inits[k].val, w, fv, fi) || fi != in->ftypes[f]->struc->inst)
+                    return Unsup(cat("a struct value of type ",
+                                     in->ftypes[f]->struc->st->name,
+                                     " the walk does not build at line ",
+                                     (long long)vd->line.line));
+                b.CreateStore(fv, p);
+                continue;
+            }
             if (is_slice_of(in->ftypes[f])) {
                 SliceVal sv;
                 if (!slice_value(sl->inits[k].val, w, sv)) return;
