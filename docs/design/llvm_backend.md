@@ -230,7 +230,10 @@ truthiness; `null`, `default<T&?>()` and rebind via `ref_addr` (locals,
 structs, globals, another reference) set the holder. A float value lives
 at its own width: literals, locals, `+ - * /` and their compound forms
 run in float arithmetic, print renders through the runtime's float
-hooks, and an f32 widens where it mixes with an f64. An `extern fn`'
+hooks, and an f32 widens where it mixes with an f64. A growable array
+of float elements (`f64[>..]`, `f32[>..]`) works like one of ints:
+literals, push, index, `.len`, a `for` binder at its own width, and
+print through the float hooks. An `extern fn`'
 call lowers straight to its C symbol: floats at their width, ints as
 i64, an `i64&` as a pointer, an int-array slice as the { data, len }
 pair. An optional reference to a growable array
@@ -241,7 +244,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 52 of the codegen output fixtures pass through
+in the output now refuse. 53 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

@@ -381,6 +381,17 @@ struct CodeGenIR {
             && is_int_ty(t->arr->sub);
     }
 
+    // A growable array of a walkable element (int or float).
+    static bool is_growable(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && t->arr->akind == A_GROW
+            && (is_int_ty(t->arr->sub) || is_flt_ty(t->arr->sub));
+    }
+
+    // The element storage type of a growable array's element type.
+    llvm::Type *elem_ll_ty(TypeExpr *et) {
+        return is_flt_ty(et) ? flt_ll_ty(et) : int_ll_ty(et);
+    }
+
     // A type's name for a refusal message.
     static string type_label(TypeExpr *t) {
         if (!t) return "an unknown type";
@@ -447,6 +458,12 @@ struct CodeGenIR {
 
     static bool is_slice_of_int(TypeExpr *t) {
         return t && t->kind == TY_SLICE && is_int_ty(t->sub);
+    }
+
+    // A slice of a walkable element (int or float).
+    static bool is_slice_of(TypeExpr *t) {
+        return t && t->kind == TY_SLICE
+            && (is_int_ty(t->sub) || is_flt_ty(t->sub));
     }
 
     llvm::StructType *slice_ll_ty() { return slice_ll_ty_; }
@@ -889,26 +906,38 @@ struct CodeGenIR {
     // The runtime slot's top tracks the next free byte: past the len
     // elements (GEP by the element type is the byte arithmetic).
     void rz_sync_slot(FnWalk::RzArr &r, llvm::Value *basev, llvm::Value *lenv) {
-        auto *et = int_ll_ty(r.etype);
+        auto *et = elem_ll_ty(r.etype);
         b.CreateStore(b.CreateInBoundsGEP(et, basev, lenv, "rztop"), r.slot);
     }
 
-    // An i64-walked value into an element slot, narrowed to the element's
-    // storage (a u8 push's 300 arrives as 44, the int conversion mod 2^8).
+    // A walked value into an element slot: narrowed to the element's
+    // storage (a u8 push's 300 arrives as 44), a float truncated/extented
+    // to its own width.
     void rz_store_elem(FnWalk::RzArr &r, llvm::Value *basev, llvm::Value *idx,
                        llvm::Value *v) {
-        auto *et = int_ll_ty(r.etype);
-        auto *ev = et == i64() ? v : b.CreateTrunc(v, et);
+        auto *et = elem_ll_ty(r.etype);
+        llvm::Value *ev = v;
+        if (et == i64()) {
+            ev = as_i64(v);
+        } else if (is_flt_ty(r.etype)) {
+            if (v->getType() != et)
+                ev = r.etype->fltstorage == FS_F32
+                    ? b.CreateFPTrunc(v, et, "fxnarrow")
+                    : b.CreateFPExt(v, et, "fwiden");
+        } else {
+            ev = b.CreateTrunc(as_i64(v), et);
+        }
         b.CreateStore(ev, b.CreateInBoundsGEP(et, basev, idx));
     }
 
-    // An element read widened back to the walk's i64 values: unsigned
-    // element storage zero-extends, signed sign-extends.
+    // An element read widened back to the walk's value type: unsigned
+    // element storage zero-extends, signed sign-extends; a float reads at
+    // its own width.
     llvm::Value *rz_load_elem(FnWalk::RzArr &r, llvm::Value *basev,
                               llvm::Value *idx, const llvm::Twine &name) {
-        auto *et = int_ll_ty(r.etype);
+        auto *et = elem_ll_ty(r.etype);
         auto *v = b.CreateLoad(et, b.CreateInBoundsGEP(et, basev, idx), name);
-        if (et == i64()) return v;
+        if (et == i64() || is_flt_ty(r.etype)) return v;
         return is_uint_ty(r.etype) ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
     }
 
@@ -2268,7 +2297,7 @@ struct CodeGenIR {
     // view. False when the walk does not hold the subject.
     bool slice_value(Node *n, FnWalk &w, SliceVal &out) {
         if (auto *bk = Is<Block>(n)) {
-            if (!n->exprtype || !is_slice_of_int(n->exprtype)) return false;
+            if (!n->exprtype || !is_slice_of(n->exprtype)) return false;
             auto *v = GenExpr(n, w);
             if (!v || v->getType() != slice_ll_ty()) return false;
             out.data = b.CreateExtractValue(v, 0, "svd");
@@ -2482,7 +2511,7 @@ struct CodeGenIR {
         if (!se) return false;
         SliceVal base;
         if (!slice_value(se->obj, w, base)) return false;
-        if (!is_int_ty(base.etype)) return false;
+        if (!is_int_ty(base.etype) && !is_flt_ty(base.etype)) return false;
         auto *lenv = base.len;
         auto bound = [&](Node *bn, bool fromend, llvm::Value *dflt) -> llvm::Value * {
             if (!bn) return dflt;
@@ -2704,6 +2733,49 @@ struct CodeGenIR {
             return false;
         }
         auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        if (is_flt_ty(etype)) {
+            // A float array prints element by element through the runtime's
+            // float hooks ([a, b, c]).
+            auto *zero = llvm::ConstantInt::get(i64(), 0);
+            auto *pre = b.GetInsertBlock();
+            auto *condbb = llvm::BasicBlock::Create(ctx, "pf_cond", w.fn);
+            auto *bodybb = llvm::BasicBlock::Create(ctx, "pf_body", w.fn);
+            auto *donebb = llvm::BasicBlock::Create(ctx, "pf_done", w.fn);
+            auto *startcur = b.CreateLoad(i8ptr(), cura);
+            b.CreateStore(llvm::ConstantInt::get(i8ty, '['), startcur);
+            b.CreateStore(b.CreateInBoundsGEP(
+                i8ty, startcur, llvm::ConstantInt::get(i64(), 1)), cura);
+            b.CreateBr(condbb);
+            b.SetInsertPoint(condbb);
+            auto *iv = b.CreatePHI(i64(), 2, "pf_i");
+            iv->addIncoming(zero, pre);
+            b.CreateCondBr(b.CreateICmpSLT(iv, lenv, "pf_test"), bodybb, donebb);
+            b.SetInsertPoint(bodybb);
+            auto *sepbb = llvm::BasicBlock::Create(ctx, "pf_sep", w.fn);
+            auto *elbb = llvm::BasicBlock::Create(ctx, "pf_el", w.fn);
+            b.CreateCondBr(b.CreateICmpEQ(iv, zero, "pf_first"), elbb, sepbb);
+            b.SetInsertPoint(sepbb);
+            emit_print_bytes(cura, ", ");
+            b.CreateBr(elbb);
+            b.SetInsertPoint(elbb);
+            auto *et = flt_ll_ty(etype);
+            auto *ev = b.CreateLoad(et,
+                b.CreateInBoundsGEP(et, sv.data, iv, "pf_p"), "pf_v");
+            auto *cur2 = b.CreateLoad(i8ptr(), cura);
+            auto *hook = etype->fltstorage == FS_F32
+                ? f_gs_fmt_f32 : f_gs_fmt_f64;
+            auto *n = b.CreateCall(hook, { cur2, ev });
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, cur2, n), cura);
+            auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1), "pf_next");
+            iv->addIncoming(next, b.GetInsertBlock());
+            b.CreateBr(condbb);
+            b.SetInsertPoint(donebb);
+            auto *endcur = b.CreateLoad(i8ptr(), cura);
+            b.CreateStore(llvm::ConstantInt::get(i8ty, ']'), endcur);
+            b.CreateStore(b.CreateInBoundsGEP(
+                i8ty, endcur, llvm::ConstantInt::get(i64(), 1)), cura);
+            return true;
+        }
         if (!is_int_ty(etype)) return Unsup("a print of an array element the walk does not render"), false;
         if (etype->intstorage == IS_U8 || etype->intstorage == IS_I8) {
             auto *cur = b.CreateLoad(i8ptr(), cura);
@@ -3505,7 +3577,7 @@ struct CodeGenIR {
                 auto *vddef = vd->defs[i];
                 if (!vddef) continue;
                 if (vd->isglobal) continue;
-                if (is_growable_i64(vddef->type)) {
+                if (is_growable(vddef->type)) {
                     emit_growable_decl(vd, i, *vddef, w);
                     continue;
                 }
@@ -3901,7 +3973,9 @@ struct CodeGenIR {
                     b.CreateStore(ep, slot);
                     w.refs[fl->vdef] = { slot, etype };
                 } else if (fl->vdef) {
-                    auto *slot = entry_alloca(w, i64(),
+                    // A float-element binder stores at its own width.
+                    bool bf = is_flt_ty(etype);
+                    auto *slot = entry_alloca(w, bf ? flt_ll_ty(etype) : i64(),
                                               llvm::Twine(fl->vdef->name));
                     // A zero-count array has no alloca: its body never runs,
                     // and the binder's value is a typed zero.
@@ -3923,11 +3997,17 @@ struct CodeGenIR {
                              : b.CreateLoad(et,
                                  b.CreateInBoundsGEP(et, sv.data, iv, "for_ip"),
                                  "for_ev");
-                    b.CreateStore(et == i64() ? ev
-                        : is_uint_ty(etype)
-                            ? b.CreateZExt(ev, i64())
-                            : b.CreateSExt(ev, i64()), slot);
-                    w.locals[fl->vdef] = slot;
+                    if (bf) {
+                        b.CreateStore(ev, slot);
+                        w.floats[fl->vdef] = { slot,
+                                               etype->fltstorage == FS_F32 };
+                    } else {
+                        b.CreateStore(et == i64() ? ev
+                            : is_uint_ty(etype)
+                                ? b.CreateZExt(ev, i64())
+                                : b.CreateSExt(ev, i64()), slot);
+                        w.locals[fl->vdef] = slot;
+                    }
                 }
                 if (fl->idxdef) {
                     auto *slot = entry_alloca(w, i64(),
