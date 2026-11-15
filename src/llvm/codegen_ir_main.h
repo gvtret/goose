@@ -1405,10 +1405,14 @@ struct CodeGenIR {
                 return slice_struct(llvm::ConstantPointerNull::get(i8ptr()),
                                     llvm::ConstantInt::get(i64(), 0));
             if (rt->kind == TY_ARRAY && rt->arr->akind == A_FIXED
-                && (is_int_ty(rt->arr->sub) || is_flt_ty(rt->arr->sub))) {
-                // A fixed array of zeros: a temporary array, the view its
-                // { base, count }.
-                auto *et = elem_ll_ty(rt->arr->sub);
+                && (is_int_ty(rt->arr->sub) || is_flt_ty(rt->arr->sub)
+                    || is_flat_struct(rt->arr->sub))) {
+                // A fixed array of zeros (ints, floats, or flat structs
+                // with slice fields as null pairs): a temporary array, the
+                // view its { base, count }.
+                auto *et = is_flat_struct(rt->arr->sub)
+                    ? struct_ll_ty(rt->arr->sub->struc->inst)
+                    : elem_ll_ty(rt->arr->sub);
                 auto *arr = entry_alloca(
                     w, llvm::ArrayType::get(et, (uint64_t)rt->arr->size),
                     "dflt");
@@ -2707,9 +2711,12 @@ struct CodeGenIR {
         if (auto *al = Is<ArrayLit>(n)) {
             // A literal printed or appended whole (a call folded to one):
             // its elements land in a temporary array, the view is that
-            // array's { base, count }.
+            // array's { base, count }. Elements may be ints, floats, or
+            // flat structs.
             auto *et = n->exprtype;
-            if (!et || et->kind != TY_ARRAY || !is_int_ty(et->arr->sub))
+            if (!et || et->kind != TY_ARRAY
+                || (!is_int_ty(et->arr->sub) && !is_flt_ty(et->arr->sub)
+                    && !is_flat_struct(et->arr->sub)))
                 return false;
             if (al->fillval) {
                 auto *cnt = al->fillcount ? GenExpr(al->fillcount, w) : nullptr;
@@ -2744,19 +2751,30 @@ struct CodeGenIR {
                 return true;
             }
             auto *arr = entry_alloca(
-                w, llvm::ArrayType::get(int_ll_ty(et->arr->sub),
+                w, llvm::ArrayType::get(field_ll_ty(et->arr->sub),
                                         al->elems.size()),
                 "alit");
-            auto *etl = int_ll_ty(et->arr->sub);
+            auto *etl = field_ll_ty(et->arr->sub);
             for (size_t k = 0; k < al->elems.size(); ++k) {
+                auto *p = b.CreateInBoundsGEP(
+                    arr->getAllocatedType(), arr,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), (uint64_t)k) }, "alitp");
+                if (is_flat_struct(et->arr->sub)) {
+                    // A struct element: the whole value its literal builds.
+                    llvm::Value *fv = nullptr;
+                    StructInst *fi = nullptr;
+                    if (!struct_value(al->elems[k], w, fv, fi)) return false;
+                    b.CreateStore(fv, p);
+                    continue;
+                }
                 auto *v = GenExpr(al->elems[k], w);
                 if (!v) return false;
-                b.CreateStore(etl == i64() ? v : b.CreateTrunc(v, etl),
-                              b.CreateInBoundsGEP(
-                                  arr->getAllocatedType(), arr,
-                                  { llvm::ConstantInt::get(i64(), 0),
-                                    llvm::ConstantInt::get(i64(), (uint64_t)k) },
-                                  "alitp"));
+                b.CreateStore(etl == i64() ? v
+                              : is_flt_ty(et->arr->sub)
+                                  ? field_store_value(et->arr->sub, v)
+                                  : b.CreateTrunc(v, etl),
+                              p);
             }
             out.data = b.CreateInBoundsGEP(
                 arr->getAllocatedType(), arr,
@@ -3266,6 +3284,45 @@ struct CodeGenIR {
             return false;
         }
         auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        if (is_flat_struct(etype)) {
+            // A struct-array prints `[T { ... }, T { ... }]`: each element
+            // through the struct renderer.
+            emit_print_bytes(cura, "[");
+            auto *zero = llvm::ConstantInt::get(i64(), 0);
+            auto *pre = b.GetInsertBlock();
+            auto *condbb = llvm::BasicBlock::Create(ctx, "psa_cond", w.fn);
+            auto *bodybb = llvm::BasicBlock::Create(ctx, "psa_body", w.fn);
+            auto *donebb = llvm::BasicBlock::Create(ctx, "psa_done", w.fn);
+            b.CreateBr(condbb);
+            b.SetInsertPoint(condbb);
+            auto *iv = b.CreatePHI(i64(), 2, "psa_i");
+            iv->addIncoming(zero, pre);
+            b.CreateCondBr(b.CreateICmpSLT(iv, lenv, "psa_test"), bodybb,
+                           donebb);
+            b.SetInsertPoint(bodybb);
+            auto *sepbb = llvm::BasicBlock::Create(ctx, "psa_sep", w.fn);
+            auto *elbb = llvm::BasicBlock::Create(ctx, "psa_el", w.fn);
+            b.CreateCondBr(b.CreateICmpEQ(iv, zero), elbb, sepbb);
+            b.SetInsertPoint(sepbb);
+            emit_print_bytes(cura, ", ");
+            b.CreateBr(elbb);
+            b.SetInsertPoint(elbb);
+            auto *et = struct_ll_ty(etype->struc->inst);
+            auto *ev = b.CreateLoad(et,
+                b.CreateInBoundsGEP(et, sv.data, iv, "psa_p"), "psa_v");
+            if (!emit_print_struct_value(ev, etype, cura, w))
+                return Unsup("a print of an array element the walk does not render"), false;
+            auto *next = b.CreateAdd(iv, llvm::ConstantInt::get(i64(), 1),
+                                     "psa_next");
+            iv->addIncoming(next, b.GetInsertBlock());
+            b.CreateBr(condbb);
+            b.SetInsertPoint(donebb);
+            auto *endcur = b.CreateLoad(i8ptr(), cura);
+            b.CreateStore(llvm::ConstantInt::get(i8ty, ']'), endcur);
+            b.CreateStore(b.CreateInBoundsGEP(
+                i8ty, endcur, llvm::ConstantInt::get(i64(), 1)), cura);
+            return true;
+        }
         if (is_flt_ty(etype)) {
             // A float array prints element by element through the runtime's
             // float hooks ([a, b, c]).

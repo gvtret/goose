@@ -246,7 +246,10 @@ pointer of an optional reference, the null pair of a slice, and for a
 flat struct the folded literal whose given fields build and whose rest
 keep their zero. print renders a struct through the default hook: the
 type's name, `{ field, field }`, string fields in quotes, nested
-structs recursively, and float fields through the float hooks. An append's source may be a run built at
+structs recursively, and float fields through the float hooks; an array
+of flat structs prints `[T { ... }, T { ... }]`, and a multi-result call
+binds result 0 from the call's value and results 1.. through
+out-pointers. An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a
@@ -265,7 +268,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 59 of the codegen output fixtures pass through
+in the output now refuse. 61 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
