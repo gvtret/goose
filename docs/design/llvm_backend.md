@@ -236,7 +236,12 @@ literals, push, index, `.len`, a `for` binder at its own width, and
 print through the float hooks. A flat struct may hold float fields at
 their own width: literals narrow, reads load as floats, stores and
 compound forms run in float arithmetic, and equality compares floats
-(float pairs with FCmp, a struct field bit-exact). An append's source may be a run built at
+(float pairs with FCmp, a struct field bit-exact). A flat struct may
+also hold a slice field (`const u8[:]`, `i32[:]`): its { data, len }
+pair lands in the struct body, a literal builds it from a string
+literal or a view, field paths read it as a view (print and .len work
+through them), a copy moves the whole value, and a plain assignment
+re-points it. An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a
@@ -255,7 +260,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 56 of the codegen output fixtures pass through
+in the output now refuse. 57 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

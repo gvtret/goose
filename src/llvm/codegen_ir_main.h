@@ -438,7 +438,8 @@ struct CodeGenIR {
         for (size_t i = 0; i < in->st->fields.size(); ++i) {
             if (in->st->fields[i].ispad) return false;
             auto *ft = in->ftypes[i];
-            if (!is_int_ty(ft) && !is_flt_ty(ft) && !is_flat_struct(ft))
+            if (!is_int_ty(ft) && !is_flt_ty(ft) && !is_flat_struct(ft)
+                && !is_slice_of(ft))
                 return false;
         }
         return true;
@@ -449,6 +450,7 @@ struct CodeGenIR {
     // A walked value narrowed to a field's storage: an int truncates, a
     // float truncates or extends to its own width.
     llvm::Value *field_store_value(TypeExpr *ft, llvm::Value *v) {
+        if (is_slice_of(ft)) return v;   // Already the { data, len } pair.
         if (is_flt_ty(ft)) {
             auto *ty = flt_ll_ty(ft);
             if (v->getType() == ty) return v;
@@ -463,6 +465,7 @@ struct CodeGenIR {
 
     llvm::Type *field_ll_ty(TypeExpr *ft) {
         if (is_flt_ty(ft)) return flt_ll_ty(ft);
+        if (is_slice_of(ft)) return slice_ll_ty();
         return is_int_ty(ft) ? int_ll_ty(ft) : struct_ll_ty(ft->struc->inst);
     }
 
@@ -2787,6 +2790,21 @@ struct CodeGenIR {
             }
             return false;
         }
+        // A field path whose leaf is a slice: the { data, len } the struct
+        // field holds (d.name, p.inner.list).
+        if (auto *dt = Is<Dot>(n); dt && dt->IsField()) {
+            llvm::Value *addr = nullptr;
+            StructInst *oi = nullptr;
+            TypeExpr *leaf = nullptr;
+            if (field_path_addr(dt, w, addr, oi, leaf)
+                && is_slice_of(leaf) && addr) {
+                auto *hdr = b.CreateLoad(slice_ll_ty(), addr, "svh");
+                out.data = b.CreateExtractValue(hdr, 0, "svd");
+                out.len = b.CreateExtractValue(hdr, 1, "svn");
+                out.etype = leaf->sub;
+                return true;
+            }
+        }
         auto *se = Is<SliceExpr>(n);
         if (!se) return false;
         SliceVal base;
@@ -3181,6 +3199,16 @@ struct CodeGenIR {
                     b.CreateStore(fv, p);
                     continue;
                 }
+                if (is_slice_of(inst->ftypes[f])) {
+                    // A slice field takes the view its value names (a
+                    // string literal's bytes, a range, a call's result).
+                    SliceVal sv;
+                    if (!slice_value(sl->inits[k].val, w, sv)) return false;
+                    auto *hdr = b.CreateInsertValue(
+                        llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                    b.CreateStore(b.CreateInsertValue(hdr, sv.len, 1), p);
+                    continue;
+                }
                 auto *v = GenExpr(sl->inits[k].val, w);
                 if (!v) return false;
                 b.CreateStore(field_store_value(inst->ftypes[f], v), p);
@@ -3278,10 +3306,18 @@ struct CodeGenIR {
         }
         auto *slot = entry_alloca(w, struct_ll_ty(in), llvm::Twine(def.name));
         for (size_t k = 0; k < sl->inits.size(); ++k) {
-            auto *v = GenExpr(sl->inits[k].val, w);
-            if (!v) return;
             auto f = (unsigned)at[k];
             auto *p = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
+            if (is_slice_of(in->ftypes[f])) {
+                SliceVal sv;
+                if (!slice_value(sl->inits[k].val, w, sv)) return;
+                auto *hdr = b.CreateInsertValue(
+                    llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                b.CreateStore(b.CreateInsertValue(hdr, sv.len, 1), p);
+                continue;
+            }
+            auto *v = GenExpr(sl->inits[k].val, w);
+            if (!v) return;
             b.CreateStore(field_store_value(in->ftypes[f], v), p);
         }
         w.structs[&def] = { slot, in };
@@ -3370,6 +3406,8 @@ struct CodeGenIR {
         if (!field_path_addr(dt, w, addr, inst, leaf)) return nullptr;
         if (is_flat_struct(leaf))
             return b.CreateLoad(struct_ll_ty(leaf->struc->inst), addr, "stfld");
+        if (is_slice_of(leaf))
+            return b.CreateLoad(slice_ll_ty(), addr, "svfld");
         if (is_flt_ty(leaf))
             return b.CreateLoad(flt_ll_ty(leaf), addr, "fld");
         auto *et = int_ll_ty(leaf);
@@ -3392,6 +3430,17 @@ struct CodeGenIR {
             if (!struct_value(as->rhs, w, sv, si))
                 return Unsup("a struct value the walk does not build");
             b.CreateStore(sv, addr);
+            return;
+        }
+        if (is_slice_of(leaf)) {
+            if (as->op != T_ASSIGN)
+                return Unsup("a compound assignment to a slice field");
+            SliceVal sv;
+            if (!slice_value(as->rhs, w, sv))
+                return Unsup("a slice value the walk does not build");
+            auto *hdr = b.CreateInsertValue(
+                llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+            b.CreateStore(b.CreateInsertValue(hdr, sv.len, 1), addr);
             return;
         }
         if (is_flt_ty(leaf)) {
