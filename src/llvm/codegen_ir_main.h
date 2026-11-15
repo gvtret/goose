@@ -1391,6 +1391,40 @@ struct CodeGenIR {
             return llvm::ConstantInt::get(i64(), bl->val ? 1 : 0, true);
         if (Is<NullLit>(n))
             return llvm::ConstantPointerNull::get(i8ptr());
+        if (auto *dc = Is<Call>(n); dc && dc->builtin == B_DEFAULT
+            && !dc->rettypes.empty()) {
+            // `default<T>()`: the type's zero (0, +0.0, false, null).
+            auto *rt = dc->rettypes[0];
+            if (is_int_ty(rt) || is_bool_ty(rt))
+                return llvm::ConstantInt::get(i64(), 0);
+            if (is_flt_ty(rt))
+                return llvm::ConstantFP::get(flt_ll_ty(rt), 0.0);
+            if (rt->kind == TY_REF && rt->ref->optional)
+                return llvm::ConstantPointerNull::get(i8ptr());
+            if (rt->kind == TY_SLICE)
+                return slice_struct(llvm::ConstantPointerNull::get(i8ptr()),
+                                    llvm::ConstantInt::get(i64(), 0));
+            if (rt->kind == TY_ARRAY && rt->arr->akind == A_FIXED
+                && (is_int_ty(rt->arr->sub) || is_flt_ty(rt->arr->sub))) {
+                // A fixed array of zeros: a temporary array, the view its
+                // { base, count }.
+                auto *et = elem_ll_ty(rt->arr->sub);
+                auto *arr = entry_alloca(
+                    w, llvm::ArrayType::get(et, (uint64_t)rt->arr->size),
+                    "dflt");
+                if (et->getPrimitiveSizeInBits() % 8 == 0)
+                    b.CreateMemSet(arr, (llvm::Value *)b.getInt8(0),
+                                   (uint64_t)rt->arr->size
+                                       * (et->getPrimitiveSizeInBits() / 8),
+                                   llvm::Align(8));
+                return slice_struct(
+                    b.CreateInBoundsGEP(
+                        arr->getAllocatedType(), arr,
+                        { llvm::ConstantInt::get(i64(), 0),
+                          llvm::ConstantInt::get(i64(), 0) }, "dfltd"),
+                    llvm::ConstantInt::get(i64(), (uint64_t)rt->arr->size));
+            }
+        }
         if (auto *un = Is<Unary>(n)) {
             // The unary minus: an i64 negation. The logical not: an i1 test
             // widened back to i64 (the minimal walk's uniform value type).
@@ -3217,6 +3251,14 @@ struct CodeGenIR {
             return true;
         }
         if (auto *c = Is<Call>(n)) {
+            // `default<T>()` for a flat struct: a zeroed value (slices
+            // become null pairs, floats +0, ints 0).
+            if (c->builtin == B_DEFAULT && !c->rettypes.empty()
+                && is_flat_struct(c->rettypes[0])) {
+                inst = c->rettypes[0]->struc->inst;
+                out = llvm::Constant::getNullValue(struct_ll_ty(inst));
+                return true;
+            }
             if (!c->spec || c->spec->rets.size() != 1
                 || !is_flat_struct(c->spec->rets[0])) return false;
             auto *v = EmitDirectCall(c, w, nullptr);
@@ -3294,7 +3336,13 @@ struct CodeGenIR {
             w.structs[&def] = { slot, in };
             return;
         }
-        if (sl->defaultall || sl->implicit || sl->inits.size() != in->st->fields.size())
+        // `default<T>()` folds to a literal with `..`: the fields given
+        // build, the rest keep their zero (a null slice pair, 0, +0.0).
+        // An implicit literal with `..` is the folded `default<T>()`: its
+        // given fields build, the rest keep their zero. A plain implicit
+        // one (no defaultall) stays refused.
+        if ((sl->implicit && !sl->defaultall)
+            || (!sl->defaultall && sl->inits.size() != in->st->fields.size()))
             return Unsup(cat("a struct value of type ", def.type->struc->st->name,
                              " the walk does not build at line ", (long long)vd->line.line));
         std::vector<int> at;
@@ -3305,6 +3353,8 @@ struct CodeGenIR {
             at.push_back(f);
         }
         auto *slot = entry_alloca(w, struct_ll_ty(in), llvm::Twine(def.name));
+        // Every field starts zeroed, so a defaulted slice field is already
+        // its null pair and a defaulted int/float field is 0.
         for (size_t k = 0; k < sl->inits.size(); ++k) {
             auto f = (unsigned)at[k];
             auto *p = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
