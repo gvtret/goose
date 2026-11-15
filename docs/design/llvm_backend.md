@@ -238,7 +238,10 @@ the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a
 fixed array into a temporary), and a growable global's literal
-initializer lands on its region when the program starts. An `extern fn`'
+initializer lands on its region when the program starts. A fixed
+int-array global holds its elements in thread-local storage: its literal
+initializer (listed or a string literal's bytes) lands there in
+`gs_globals_init`, and print, index, `.len` and `copy` see the run. An `extern fn`'
 call lowers straight to its C symbol: floats at their width, ints as
 i64, an `i64&` as a pointer, an int-array slice as the { data, len }
 pair. An optional reference to a growable array
@@ -249,7 +252,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 54 of the codegen output fixtures pass through
+in the output now refuse. 55 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

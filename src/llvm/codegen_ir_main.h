@@ -513,6 +513,14 @@ struct CodeGenIR {
     // reserves before calling it). A global pushed from any body and cast
     // checks against its count read it.
     std::unordered_map<VarDef *, FnWalk::RzArr> global_rzs;
+    // Fixed int-array globals: their element storage (thread-local global
+    // of [count x elem], initialized in gs_globals_init) and the count.
+    struct GlobalFixed {
+        llvm::GlobalVariable *base = nullptr;
+        int64_t count = -1;
+        TypeExpr *etype = nullptr;
+    };
+    std::unordered_map<VarDef *, GlobalFixed> global_fixeds;
 
     // A string literal's constant bytes: one internal constant global per
     // distinct literal, no terminator (the length travels beside it).
@@ -1539,6 +1547,10 @@ struct CodeGenIR {
                         fit != w.fixeds.end() && dt->member == B_LEN)
                         return llvm::ConstantInt::get(i64(),
                                                       (uint64_t)fit->second.count);
+                    if (auto gfit = global_fixeds.find(obj->vdef);
+                        gfit != global_fixeds.end() && dt->member == B_LEN)
+                        return llvm::ConstantInt::get(
+                            i64(), (uint64_t)gfit->second.count);
                     if (dt->member == B_LEN) {
                         if (auto *r = rz_head(w, obj->vdef))
                             return b.CreateLoad(i64(), r->len,
@@ -1687,6 +1699,36 @@ struct CodeGenIR {
                     if (et == i64()) return v;
                     return is_uint_ty(lm.etype) ? b.CreateZExt(v, i64())
                                                 : b.CreateSExt(v, i64());
+                }
+                if (auto gfit = global_fixeds.find(obj->vdef);
+                    gfit != global_fixeds.end()) {
+                    auto &gf = gfit->second;
+                    auto *idxv = GenExpr(ix->idx, w);
+                    if (!idxv) return nullptr;
+                    if (!ix->nobc) {
+                        auto *okbb = llvm::BasicBlock::Create(ctx, "gfxok", w.fn);
+                        auto *failbb = llvm::BasicBlock::Create(ctx, "gfxfail", w.fn);
+                        b.CreateCondBr(b.CreateICmpULT(idxv,
+                            llvm::ConstantInt::get(i64(), (uint64_t)gf.count),
+                            "gfxok"), okbb, failbb);
+                        b.SetInsertPoint(failbb);
+                        b.CreateCall(f_gs_idxfail, {
+                            idxv,
+                            llvm::ConstantInt::get(i64(), (uint64_t)gf.count),
+                            llvm::ConstantPointerNull::get(i8ptr()),
+                            llvm::ConstantInt::get(
+                                llvm::Type::getInt32Ty(ctx), 0) });
+                        b.CreateUnreachable();
+                        b.SetInsertPoint(okbb);
+                    }
+                    auto *et = int_ll_ty(gf.etype);
+                    auto *v = b.CreateLoad(et, b.CreateInBoundsGEP(
+                        gf.base->getValueType(), gf.base,
+                        { llvm::ConstantInt::get(i64(), 0), idxv }, "gfxip"),
+                        "gfxval");
+                    if (et == i64()) return v;
+                    return is_uint_ty(gf.etype)
+                        ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
                 }
                 if (auto *r = rz_head(w, obj->vdef)) {
                     auto *idxv = GenExpr(ix->idx, w);
@@ -2682,6 +2724,16 @@ struct CodeGenIR {
                                llvm::ConstantInt::get(i64(), 0) }, "svd");
                 out.len = b.CreateLoad(i64(), lm.len, "svn");
                 out.etype = lm.etype;
+                return true;
+            }
+            if (auto git = global_fixeds.find(obj->vdef);
+                git != global_fixeds.end()) {
+                auto &gf = git->second;
+                out.data = b.CreateInBoundsGEP(gf.base->getValueType(), gf.base,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), 0) }, "svd");
+                out.len = llvm::ConstantInt::get(i64(), (uint64_t)gf.count);
+                out.etype = gf.etype;
                 return true;
             }
             if (auto *r = rz_head(w, obj->vdef)) {
@@ -4497,6 +4549,8 @@ struct CodeGenIR {
         auto i64ty = i64();
         vector<pair<VarDef *, Node *>> inits;
         vector<pair<VarDef *, Node *>> grow_inits;
+        vector<pair<VarDef *, Node *>> fixed_inits;
+        vector<pair<VarDef *, Node *>> fixed_strinits;
         for (auto *g : ast.globals) {
             for (size_t di = 0; di < g->defs.size(); ++di) {
                 auto *d = g->defs[di];
@@ -4540,6 +4594,42 @@ struct CodeGenIR {
                     }
                     continue;
                 }
+                if (d->type->kind == TY_ARRAY
+                    && (d->type->arr->akind == A_FIXED
+                        || d->type->arr->akind == A_VAR)
+                    && is_int_ty(d->type->arr->sub)) {
+                    // A fixed int-array global: its own thread-local
+                    // storage; a literal initializer's elements land there
+                    // in gs_globals_init (via gw, the walk of the init).
+                    int64_t count = d->type->arr->size;
+                    auto *al = di < g->inits.size() ? Is<ArrayLit>(g->inits[di])
+                                                    : nullptr;
+                    bool strobj = di < g->inits.size()
+                        && Is<StrLit>(g->inits[di])
+                        && (d->type->arr->sub->intstorage == IS_U8
+                            || d->type->arr->sub->intstorage == IS_I8);
+                    if (d->type->arr->akind == A_VAR) {
+                        if (al && !al->fillval) count = (int64_t)al->elems.size();
+                        else if (strobj)
+                            count = (int64_t)Is<StrLit>(g->inits[di])->val.size();
+                        else continue;
+                    }
+                    if (count < 0) continue;
+                    auto *et = int_ll_ty(d->type->arr->sub);
+                    auto *gv = new llvm::GlobalVariable(
+                        *mod, llvm::ArrayType::get(et, (uint64_t)count),
+                        false, llvm::GlobalValue::InternalLinkage,
+                        llvm::Constant::getNullValue(
+                            llvm::ArrayType::get(et, (uint64_t)count)),
+                        cat(d->name, ".arr"), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    global_fixeds[d] = { gv, count, d->type->arr->sub };
+                    if (al && !al->fillval && (int64_t)al->elems.size() == count)
+                        fixed_inits.push_back({ d, g->inits[di] });
+                    else if (strobj && count)
+                        fixed_strinits.push_back({ d, g->inits[di] });
+                    continue;
+                }
                 if (!is_int_ty(d->type)) continue;
                 // A string_view's .data() is not null-terminated, so the name
                 // must be copied into a std::string (passing .data() directly
@@ -4556,7 +4646,8 @@ struct CodeGenIR {
                     inits.push_back({ d, g->inits[di] });
             }
         }
-        if (inits.empty() && global_rzs.empty()) return;
+        if (inits.empty() && global_rzs.empty() && fixed_inits.empty()
+            && fixed_strinits.empty()) return;
         // Reuse the extern declaration from declare_entry_externs() and give
         // it a body. A second Function::Create with the same name would be
         // renamed gs_globals_init.1, leaving the extern undefined at link.
@@ -4574,6 +4665,34 @@ struct CodeGenIR {
         for (auto &[d, r] : global_rzs) {
             b.CreateStore(b.CreateLoad(i8ptr(), r.slot, "gbase"), r.base);
             b.CreateStore(llvm::ConstantInt::get(i64(), 0), r.len);
+        }
+        // A fixed global's literal elements: stored into its array.
+        for (auto &[d, ninit] : fixed_inits) {
+            auto &gf = global_fixeds[d];
+            auto *et = int_ll_ty(gf.etype);
+            auto *al = Is<ArrayLit>(ninit);
+            for (size_t k = 0; k < al->elems.size(); ++k) {
+                auto *v = GenExpr(al->elems[k], gw);
+                if (!v) continue;
+                b.CreateStore(
+                    et == i64() ? as_i64(v) : b.CreateTrunc(as_i64(v), et),
+                    b.CreateInBoundsGEP(gf.base->getValueType(), gf.base,
+                        { llvm::ConstantInt::get(i64(), 0),
+                          llvm::ConstantInt::get(i64(), (uint64_t)k) },
+                        "gfip"));
+            }
+        }
+        for (auto &[d, ninit] : fixed_strinits) {
+            auto &gf = global_fixeds[d];
+            auto *sl = Is<StrLit>(ninit);
+            auto n = (uint64_t)sl->val.size();
+            if (n)
+                b.CreateMemCpy(
+                    b.CreateInBoundsGEP(gf.base->getValueType(), gf.base,
+                        { llvm::ConstantInt::get(i64(), 0),
+                          llvm::ConstantInt::get(i64(), 0) }, "gfd"),
+                    llvm::MaybeAlign(1), strlit_glob(sl->val),
+                    llvm::MaybeAlign(1), n);
         }
         for (auto &[d, ninit] : grow_inits) {
             auto &r = global_rzs[d];
