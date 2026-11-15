@@ -72,6 +72,8 @@ struct CodeGenIR {
     llvm::Function *f_gs_abort_msg = nullptr;        // (ptr,i64,ptr,i32), noreturn
     llvm::Function *f_gs_fmt_i64 = nullptr;          // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_fmt_u64 = nullptr;          // (ptr,i64) -> i64 appended
+    llvm::Function *f_gs_fmt_f64 = nullptr;          // (ptr,double) -> i64 appended
+    llvm::Function *f_gs_fmt_f32 = nullptr;          // (ptr,float) -> i64 appended
     llvm::Function *f_gs_fmt_bool = nullptr;         // (ptr,i64) -> i64 appended
     llvm::Function *f_gs_out_bytes = nullptr;        // (ptr,i64)
 
@@ -168,6 +170,8 @@ struct CodeGenIR {
         dcl("gs_abort_msg", f_gs_abort_msg, V, { P, I, P, I32 });
         dcl("gs_fmt_i64", f_gs_fmt_i64, I, { P, I });
         dcl("gs_fmt_u64", f_gs_fmt_u64, I, { P, I });
+        dcl("gs_fmt_f64", f_gs_fmt_f64, I, { P, llvm::Type::getDoubleTy(ctx) });
+        dcl("gs_fmt_f32", f_gs_fmt_f32, I, { P, llvm::Type::getFloatTy(ctx) });
         dcl("gs_fmt_bool", f_gs_fmt_bool, I, { P, I });
         dcl("gs_out_bytes", f_gs_out_bytes, V, { P, I });
     }
@@ -271,6 +275,13 @@ struct CodeGenIR {
             bool optional = false;                 // Nullable (T&? or T?).
         };
         std::unordered_map<VarDef *, RefLoc> refs;
+        // Float locals (f32/f64): their own alloca at the storage width,
+        // read and written as floats (the walk's ints stay in i64 slots).
+        struct FltLoc {
+            llvm::AllocaInst *base = nullptr;      // The float storage.
+            bool f32 = false;                      // f32 vs f64.
+        };
+        std::unordered_map<VarDef *, FltLoc> floats;
         // Flat int-field struct locals: their storage and the struct's layout.
         struct StructLoc {
             llvm::AllocaInst *base = nullptr;
@@ -353,6 +364,13 @@ struct CodeGenIR {
     bool is_flat_ref(TypeExpr *t) {
         return t && t->kind == TY_REF
             && (is_i64_ref(t) || is_flat_struct(t->ref->sub));
+    }
+
+    static bool is_flt_ty(TypeExpr *t) { return t && t->kind == TY_FLT; }
+
+    llvm::Type *flt_ll_ty(TypeExpr *t) {
+        return t->fltstorage == FS_F32
+            ? llvm::Type::getFloatTy(ctx) : llvm::Type::getDoubleTy(ctx);
     }
 
     // A growable array of an int-walkable element: the data-stack slice's
@@ -1214,9 +1232,18 @@ struct CodeGenIR {
         }
         if (auto *il = Is<IntLit>(n))
             return llvm::ConstantInt::get(i64(), (uint64_t)il->val, true);
-        if (auto *fl = Is<FltLit>(n))
+        if (auto *fl = Is<FltLit>(n)) {
+            // A float literal carries its type: f32 narrows the value.
+            if (n->exprtype && n->exprtype->kind == TY_FLT) {
+                if (n->exprtype->fltstorage == FS_F32)
+                    return llvm::ConstantFP::get(llvm::Type::getFloatTy(ctx),
+                                                 (float)fl->val);
+                return llvm::ConstantFP::get(llvm::Type::getDoubleTy(ctx),
+                                             fl->val);
+            }
             return llvm::ConstantInt::get(i64(),
                                           (uint64_t)(int64_t)(double)fl->val, true);
+        }
         if (auto *bl = Is<BoolLit>(n))
             return llvm::ConstantInt::get(i64(), bl->val ? 1 : 0, true);
         if (Is<NullLit>(n))
@@ -1320,6 +1347,12 @@ struct CodeGenIR {
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
+                // A float local loads at its own width.
+                auto fit2 = w.floats.find(id->vdef);
+                if (fit2 != w.floats.end())
+                    return b.CreateLoad(flt_ll_ty(id->vdef->type),
+                                        fit2->second.base,
+                                        llvm::Twine(id->vdef->name));
                 // An optional reference to a growable array reads as its
                 // header pointer: null when unset, else the array's hdr
                 // (so `o == null`, `o != null` and `if o` test it).
@@ -1957,6 +1990,21 @@ struct CodeGenIR {
                             || an->exprtype->kind == TY_SLICE)) {
                         if (!emit_print_view(an, an->exprtype, cura, w))
                             return nullptr;
+                        continue;
+                    }
+                    if (an->exprtype && an->exprtype->kind == TY_FLT) {
+                        // A float renders through the runtime's float hook
+                        // at its own width, as the C backend's does.
+                        auto *x = GenExpr(an, w);
+                        if (!x)
+                            return Unsup(cat("a print argument at line ",
+                                             (long long)an->line.line)), nullptr;
+                        auto *cur = b.CreateLoad(i8ptr(), cura);
+                        auto *hook = an->exprtype->fltstorage == FS_F32
+                            ? f_gs_fmt_f32 : f_gs_fmt_f64;
+                        auto *n = b.CreateCall(hook, { cur, x });
+                        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
+                                      cura);
                         continue;
                     }
                     if (!an->exprtype
@@ -3400,6 +3448,19 @@ struct CodeGenIR {
                     emit_ref_decl(vd, i, *vddef, w);
                     continue;
                 }
+                if (is_flt_ty(vddef->type)) {
+                    // A float local: its own storage at its width, the
+                    // initializer evaluated as a float.
+                    auto *fa = entry_alloca(w, flt_ll_ty(vddef->type),
+                                            llvm::Twine(vddef->name));
+                    if (i < vd->inits.size() && vd->inits[i]) {
+                        auto *initv = GenExpr(vd->inits[i], w);
+                        if (initv) b.CreateStore(initv, fa);
+                    }
+                    w.floats[vddef] = { fa,
+                                        vddef->type->fltstorage == FS_F32 };
+                    continue;
+                }
                 if (!is_int_ty(vddef->type) && !is_bool_ty(vddef->type))
                     return Unsup(cat("a local of ", type_label(vddef->type),
                                      " at line ", (long long)vd->line.line));
@@ -3426,6 +3487,28 @@ struct CodeGenIR {
             // i64 assignment to a local.
             auto *lv = Is<Ident>(as->lval);
             if (!lv || !lv->vdef) return Unsup("an assignment to a place the walk does not model");
+            // A float local: stored at its own width, compound forms in
+            // float arithmetic.
+            if (auto flt = w.floats.find(lv->vdef); flt != w.floats.end()) {
+                auto *ty = flt_ll_ty(lv->vdef->type);
+                auto *rhs = GenExpr(as->rhs, w);
+                if (!rhs) return;
+                if (rhs->getType() != ty)
+                    rhs = b.CreateFPExt(rhs, ty, "fwiden");
+                if (as->op != T_ASSIGN) {
+                    auto *cur = b.CreateLoad(ty, flt->second.base, "fcur");
+                    switch (as->op) {
+                        case T_PLUSEQ:  rhs = b.CreateFAdd(cur, rhs, "fpluseq"); break;
+                        case T_MINUSEQ: rhs = b.CreateFSub(cur, rhs, "fminuseq"); break;
+                        case T_MULEQ:   rhs = b.CreateFMul(cur, rhs, "fmuleq"); break;
+                        case T_DIVEQ:   rhs = b.CreateFDiv(cur, rhs, "fdiveq"); break;
+                        default:
+                            return Unsup("a compound assignment of this operator");
+                    }
+                }
+                b.CreateStore(rhs, flt->second.base);
+                return;
+            }
             // Copying a flat int struct local: the whole value.
             if (auto stit = w.structs.find(lv->vdef); stit != w.structs.end()) {
                 if (as->op != T_ASSIGN)

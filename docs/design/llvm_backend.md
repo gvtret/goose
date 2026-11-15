@@ -227,7 +227,10 @@ back to the element region's base; on a static-capacity limited array it
 zeroes only the count. An optional reference (`T&?`, int or flat struct)
 reads as its pointer (null when unset) for `== null`, `!= null` and bare
 truthiness; `null`, `default<T&?>()` and rebind via `ref_addr` (locals,
-structs, globals, another reference) set the holder. An optional reference to a growable array
+structs, globals, another reference) set the holder. A float value lives
+at its own width: literals, locals, `+ - * /` and their compound forms
+run in float arithmetic, print renders through the runtime's float
+hooks, and an f32 widens where it mixes with an f64. An optional reference to a growable array
 (`u8[>..]?`) holds the pair of two null pointers when null, its
 expression value reads as the header pointer (so `== null`, `!= null`
 and a bare `if o` test it), and `.=` binds it like a plain reference.
@@ -235,7 +238,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 50 of the codegen output fixtures pass through
+in the output now refuse. 52 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
