@@ -1114,12 +1114,14 @@ struct CodeGenIR {
             else return;
         }
         if (count < 0) return;
-        auto *et = int_ll_ty(tal->sub);
+        bool strel = is_flat_struct(tal->sub);
+        auto *et = strel ? struct_ll_ty(tal->sub->struc->inst)
+                         : int_ll_ty(tal->sub);
         auto *a = count
             ? entry_alloca(w, llvm::ArrayType::get(et, (uint64_t)count),
                            llvm::Twine(def.name))
             : nullptr;
-        if (a && et->getScalarSizeInBits() % 8 == 0) {
+        if (a && !strel && et->getScalarSizeInBits() % 8 == 0) {
             b.CreateMemSet(a, (llvm::Value *)b.getInt8(0),
                            (uint64_t)count * (et->getScalarSizeInBits() / 8),
                            llvm::Align(8));
@@ -1133,11 +1135,18 @@ struct CodeGenIR {
         }
         if (init && !al) return;      // Literal construction only here.
         if (!al) return;
+        // An element store: an int narrows to its storage, a float fits
+        // its width, a struct takes the whole value its literal builds.
         auto elem = [&](int64_t k, llvm::Value *v) {
-            auto *ev = et == i64() ? v : b.CreateTrunc(v, et);
-            b.CreateStore(ev, b.CreateInBoundsGEP(a->getAllocatedType(), a,
+            auto *p = b.CreateInBoundsGEP(a->getAllocatedType(), a,
                 { llvm::ConstantInt::get(i64(), 0),
-                  llvm::ConstantInt::get(i64(), k) }, "fkp"));
+                  llvm::ConstantInt::get(i64(), k) }, "fkp");
+            if (strel) {
+                b.CreateStore(v, p);
+                return;
+            }
+            auto *ev = et == i64() ? v : b.CreateTrunc(v, et);
+            b.CreateStore(ev, p);
         };
         if (al->fillval) {
             auto *v = GenExpr(al->fillval, w);
@@ -1145,6 +1154,14 @@ struct CodeGenIR {
             for (int64_t k = 0; k < count; k++) elem(k, v);
         } else if (count) {
             for (size_t k = 0; k < (size_t)count && k < al->elems.size(); k++) {
+                if (strel) {
+                    // A struct element: the whole value its literal builds.
+                    llvm::Value *fv = nullptr;
+                    StructInst *fi = nullptr;
+                    if (!struct_value(al->elems[k], w, fv, fi)) return;
+                    elem((int64_t)k, fv);
+                    continue;
+                }
                 auto *v = GenExpr(al->elems[k], w);
                 if (!v) return;
                 elem((int64_t)k, v);
@@ -3690,6 +3707,40 @@ struct CodeGenIR {
                 addr = b.CreatePointerCast(raw,
                     llvm::PointerType::getUnqual(struct_ll_ty(inst)),
                     "refcast");
+            } else if (auto *pix = Is<Index>(dt->obj); pix
+                       && is_flat_struct(pix->exprtype)) {
+                // An element of a fixed array of structs: the element's
+                // address is the path's base (pair[1].name).
+                auto *obj = Is<Ident>(pix->obj);
+                auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef)
+                                            : w.fixeds.end();
+                if (fit == w.fixeds.end() || !fit->second.base) return false;
+                auto *idxv = GenExpr(pix->idx, w);
+                if (!idxv) return false;
+                if (!pix->nobc) {
+                    auto *okbb = llvm::BasicBlock::Create(ctx, "fxsok", w.fn);
+                    auto *failbb = llvm::BasicBlock::Create(ctx, "fxsfail", w.fn);
+                    b.CreateCondBr(b.CreateICmpULT(idxv,
+                        llvm::ConstantInt::get(i64(),
+                            (uint64_t)fit->second.count), "fxsok"),
+                        okbb, failbb);
+                    b.SetInsertPoint(failbb);
+                    b.CreateCall(f_gs_idxfail, {
+                        idxv,
+                        llvm::ConstantInt::get(i64(),
+                            (uint64_t)fit->second.count),
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        llvm::ConstantInt::get(
+                            llvm::Type::getInt32Ty(ctx), 0) });
+                    b.CreateUnreachable();
+                    b.SetInsertPoint(okbb);
+                }
+                auto *ety = fit->second.etype;
+                auto *esty = struct_ll_ty(ety->struc->inst);
+                inst = ety->struc->inst;
+                addr = b.CreateInBoundsGEP(fit->second.base->getAllocatedType(),
+                    fit->second.base,
+                    { llvm::ConstantInt::get(i64(), 0), idxv }, "fxsp");
             } else if (sit != w.structs.end()) {
                 inst = sit->second.inst;
                 addr = sit->second.base;
@@ -4279,7 +4330,9 @@ struct CodeGenIR {
                 }
                 if (vddef->type->kind == TY_ARRAY
                     && (vddef->type->arr->akind == A_FIXED || vddef->type->arr->akind == A_VAR)
-                    && is_int_ty(vddef->type->arr->sub)) {
+                    && (is_int_ty(vddef->type->arr->sub)
+                        || is_flt_ty(vddef->type->arr->sub)
+                        || is_flat_struct(vddef->type->arr->sub))) {
                     emit_fixed_decl(vd, i, *vddef, w);
                     continue;
                 }
@@ -4668,6 +4721,30 @@ struct CodeGenIR {
                                               llvm::Twine(fl->vdef->name));
                     b.CreateStore(ep, slot);
                     w.refs[fl->vdef] = { slot, etype };
+                } else if (fl->vdef && is_flat_struct(etype)) {
+                    // A struct-element binder: its slot is the element's
+                    // address cast into the struct's own storage, and the
+                    // walk reads it as a struct local.
+                    llvm::Value *ep = fa
+                        ? (fa->base
+                            ? (llvm::Value *)b.CreateInBoundsGEP(
+                                fa->base->getAllocatedType(), fa->base,
+                                { llvm::ConstantInt::get(i64(), 0), iv },
+                                "for_sp")
+                            : (llvm::Value *)llvm::ConstantPointerNull::get(
+                                i8ptr()))
+                        : la ? (llvm::Value *)b.CreateInBoundsGEP(
+                            la->base->getAllocatedType(), la->base,
+                            { llvm::ConstantInt::get(i64(), 0), iv }, "for_sp")
+                             : (llvm::Value *)b.CreateInBoundsGEP(et, sv.data,
+                                                                  iv, "for_sp");
+                    auto *slot = entry_alloca(
+                        w, struct_ll_ty(etype->struc->inst),
+                        llvm::Twine(fl->vdef->name));
+                    // The element lives in the array: alias it, no copy.
+                    b.CreateStore(b.CreateLoad(
+                        struct_ll_ty(etype->struc->inst), ep, "for_se"), slot);
+                    w.structs[fl->vdef] = { slot, etype->struc->inst };
                 } else if (fl->vdef) {
                     // A float-element binder stores at its own width.
                     bool bf = is_flt_ty(etype);

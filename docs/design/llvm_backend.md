@@ -249,7 +249,9 @@ type's name, `{ field, field }`, string fields in quotes, nested
 structs recursively, and float fields through the float hooks; an array
 of flat structs prints `[T { ... }, T { ... }]`, and a multi-result call
 binds result 0 from the call's value and results 1.. through
-out-pointers. An append's source may be a run built at
+out-pointers. A fixed array of flat structs builds its literal in place:
+a field path reaches through an element (`pair[1].name`), a `for` binds
+each element as a struct, and print renders the whole run. An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a

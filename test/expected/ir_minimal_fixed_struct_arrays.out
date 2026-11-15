@@ -1,0 +1,4 @@
+[Named { "a", 1 }, Named { "bb", 2 }] 2 1 bb
+Named { "a", 1 }
+Named { "bb", 2 }
+ 10 1
