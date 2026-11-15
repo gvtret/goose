@@ -437,7 +437,8 @@ struct CodeGenIR {
         if (in->st->fields.empty() || in->ftypes.size() != in->st->fields.size()) return false;
         for (size_t i = 0; i < in->st->fields.size(); ++i) {
             if (in->st->fields[i].ispad) return false;
-            if (!is_int_ty(in->ftypes[i]) && !is_flat_struct(in->ftypes[i]))
+            auto *ft = in->ftypes[i];
+            if (!is_int_ty(ft) && !is_flt_ty(ft) && !is_flat_struct(ft))
                 return false;
         }
         return true;
@@ -445,7 +446,23 @@ struct CodeGenIR {
 
     // A field's LLVM type: an int at its storage width, or a nested struct's
     // own record.
+    // A walked value narrowed to a field's storage: an int truncates, a
+    // float truncates or extends to its own width.
+    llvm::Value *field_store_value(TypeExpr *ft, llvm::Value *v) {
+        if (is_flt_ty(ft)) {
+            auto *ty = flt_ll_ty(ft);
+            if (v->getType() == ty) return v;
+            return ft->fltstorage == FS_F32
+                ? b.CreateFPTrunc(v, ty, "ffxnarrow")
+                : b.CreateFPExt(v, ty, "ffwiden");
+        }
+        auto *et = int_ll_ty(ft);
+        if (et == i64() || v->getType() != i64()) return v;
+        return b.CreateTrunc(v, et, "fnarrow");
+    }
+
     llvm::Type *field_ll_ty(TypeExpr *ft) {
+        if (is_flt_ty(ft)) return flt_ll_ty(ft);
         return is_int_ty(ft) ? int_ll_ty(ft) : struct_ll_ty(ft->struc->inst);
     }
 
@@ -1426,6 +1443,26 @@ struct CodeGenIR {
             auto *l = GenExpr(bin->left, w);
             auto *r = GenExpr(bin->right, w);
             if (!l || !r) return nullptr;
+            if (bin->exprtype && is_flt_ty(bin->exprtype)) {
+                // A float pair runs in float arithmetic; an f32 widens to
+                // f64 where the other operand is one.
+                auto *ty = flt_ll_ty(bin->exprtype);
+                if (l->getType() != ty)
+                    l = b.CreateFPExt(l, ty, "fwiden");
+                if (r->getType() != ty)
+                    r = b.CreateFPExt(r, ty, "fwiden");
+                switch (bin->op) {
+                    case T_PLUS:  return b.CreateFAdd(l, r, "fadd");
+                    case T_MINUS: return b.CreateFSub(l, r, "fsub");
+                    case T_MUL:   return b.CreateFMul(l, r, "fmul");
+                    case T_DIV:   return b.CreateFDiv(l, r, "fdiv");
+                    case T_LT:    return b.CreateFCmpOLT(l, r, "flt");
+                    case T_GT:    return b.CreateFCmpOGT(l, r, "fgt");
+                    case T_LTEQ:  return b.CreateFCmpOLE(l, r, "fle");
+                    case T_GTEQ:  return b.CreateFCmpOGE(l, r, "fge");
+                    default: break;
+                }
+            }
             switch (bin->op) {
                 case T_PLUS:  return b.CreateAdd(l, r, "add");
                 case T_MINUS: return b.CreateSub(l, r, "sub");
@@ -1447,9 +1484,15 @@ struct CodeGenIR {
                 case T_EQ:
                 case T_NEQ: {
                     auto *lt = bin->left->exprtype;
+                    // A struct compares field by field (floats bit-exact).
                     if (lt && is_flat_struct(lt))
                         return struct_eq(l, r, lt->struc->inst,
                                          bin->op == T_NEQ);
+                    // A float pair compares as floats.
+                    if (lt && is_flt_ty(lt))
+                        return bin->op == T_EQ
+                            ? b.CreateFCmpOEQ(l, r, "feq")
+                            : b.CreateFCmpUNE(l, r, "fne");
                     return bin->op == T_EQ ? b.CreateICmpEQ(l, r, "eq")
                                            : b.CreateICmpNE(l, r, "ne");
                 }
@@ -3140,8 +3183,7 @@ struct CodeGenIR {
                 }
                 auto *v = GenExpr(sl->inits[k].val, w);
                 if (!v) return false;
-                auto *et = int_ll_ty(inst->ftypes[f]);
-                b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et), p);
+                b.CreateStore(field_store_value(inst->ftypes[f], v), p);
             }
             out = b.CreateLoad(struct_ll_ty(inst), slot, "stv");
             return true;
@@ -3173,9 +3215,20 @@ struct CodeGenIR {
         auto *i1 = llvm::Type::getInt1Ty(ctx);
         llvm::Value *eq = llvm::ConstantInt::getTrue(i1);
         for (size_t f = 0; f < in->ftypes.size(); ++f) {
+            auto *ft = in->ftypes[f];
             auto *a = b.CreateExtractValue(l, (unsigned)f, "sef");
             auto *c = b.CreateExtractValue(r, (unsigned)f, "ser");
-            eq = b.CreateAnd(eq, b.CreateICmpEQ(a, c, "seq"), "seqand");
+            // A float field compares bit-exact: its bits as integers are
+            // equal exactly when the floats are (so -0.0 differs from 0.0).
+            if (is_flt_ty(ft)) {
+                auto *ib = llvm::Type::getIntNTy(
+                    ctx, (unsigned)flt_ll_ty(ft)->getPrimitiveSizeInBits());
+                auto *ab = b.CreateBitCast(a, ib);
+                auto *cb = b.CreateBitCast(c, ib);
+                eq = b.CreateAnd(eq, b.CreateICmpEQ(ab, cb));
+            } else {
+                eq = b.CreateAnd(eq, b.CreateICmpEQ(a, c));
+            }
         }
         return ne ? b.CreateNot(eq, "sne") : eq;
     }
@@ -3228,9 +3281,8 @@ struct CodeGenIR {
             auto *v = GenExpr(sl->inits[k].val, w);
             if (!v) return;
             auto f = (unsigned)at[k];
-            auto *et = int_ll_ty(in->ftypes[f]);
             auto *p = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
-            b.CreateStore(et == i64() ? v : b.CreateTrunc(v, et), p);
+            b.CreateStore(field_store_value(in->ftypes[f], v), p);
         }
         w.structs[&def] = { slot, in };
     }
@@ -3318,6 +3370,8 @@ struct CodeGenIR {
         if (!field_path_addr(dt, w, addr, inst, leaf)) return nullptr;
         if (is_flat_struct(leaf))
             return b.CreateLoad(struct_ll_ty(leaf->struc->inst), addr, "stfld");
+        if (is_flt_ty(leaf))
+            return b.CreateLoad(flt_ll_ty(leaf), addr, "fld");
         auto *et = int_ll_ty(leaf);
         auto *v = b.CreateLoad(et, addr, "fld");
         if (et == i64()) return v;
@@ -3338,6 +3392,29 @@ struct CodeGenIR {
             if (!struct_value(as->rhs, w, sv, si))
                 return Unsup("a struct value the walk does not build");
             b.CreateStore(sv, addr);
+            return;
+        }
+        if (is_flt_ty(leaf)) {
+            // A float field: compound forms in float arithmetic.
+            auto *ty = flt_ll_ty(leaf);
+            auto *rhs = GenExpr(as->rhs, w);
+            if (!rhs) return;
+            if (rhs->getType() != ty)
+                rhs = leaf->fltstorage == FS_F32
+                    ? b.CreateFPTrunc(rhs, ty, "ffxnarrow")
+                    : b.CreateFPExt(rhs, ty, "ffwiden");
+            if (as->op != T_ASSIGN) {
+                auto *cur = b.CreateLoad(ty, addr, "fcur");
+                switch (as->op) {
+                    case T_PLUSEQ:  rhs = b.CreateFAdd(cur, rhs, "ffpluseq"); break;
+                    case T_MINUSEQ: rhs = b.CreateFSub(cur, rhs, "ffminuseq"); break;
+                    case T_MULEQ:   rhs = b.CreateFMul(cur, rhs, "ffmuleq"); break;
+                    case T_DIVEQ:   rhs = b.CreateFDiv(cur, rhs, "ffdiveq"); break;
+                    default:
+                        return Unsup("a compound field assignment of this operator");
+                }
+            }
+            b.CreateStore(rhs, addr);
             return;
         }
         auto *rhs = GenExpr(as->rhs, w);
