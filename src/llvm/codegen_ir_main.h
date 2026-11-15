@@ -1228,6 +1228,26 @@ struct CodeGenIR {
         // A call's growable result is built straight into this local's
         // header and stack (the run form).
         if (auto *rc = init ? Is<Call>(init) : nullptr) {
+            if (rc->builtin == B_COPY) {
+                // `var x = copy(a)`: a fresh copy of the run.
+                SliceVal sv;
+                if (!slice_value(rc->args[0], w, sv) || !sv.etype) {
+                    w.rzarrs.erase(&def);
+                    return Unsup(cat("a copy the walk does not hold at line ",
+                                     (long long)vd->line.line));
+                }
+                auto *et = elem_ll_ty(sub);
+                auto esz = et->getPrimitiveSizeInBits() / 8;
+                auto *nbytes = b.CreateMul(
+                    sv.len, llvm::ConstantInt::get(i64(), (uint64_t)esz),
+                    "cpbytes");
+                auto *top = b.CreateLoad(i8ptr(), slot, "cpscr.top");
+                b.CreateMemCpy(top, llvm::MaybeAlign(1), sv.data,
+                               llvm::MaybeAlign(1), nbytes);
+                b.CreateStore(sv.len, lena);
+                rz_sync_slot(r, top, sv.len);
+                return;
+            }
             if (!rc->spec || rc->spec->rets.size() != 1
                 || !is_growable_i64(rc->spec->rets[0])) {
                 w.rzarrs.erase(&def);
@@ -1802,6 +1822,81 @@ struct CodeGenIR {
                         return nullptr;
                     }
                 }
+            }
+            // `copy(x)`: a fresh copy of an array value: the elements
+            // land in a temporary whose view the result is. A growable
+            // builds through a scratch run destination, a fixed or a view
+            // copies its elements into a temporary array.
+            if (c->builtin == B_COPY && c->args.size() == 1) {
+                auto *st = c->args[0]->exprtype;
+                TypeExpr *sub = nullptr;
+                int64_t count = -1;
+                if (st && st->kind == TY_ARRAY) sub = st->arr->sub;
+                else if (st && st->kind == TY_SLICE) sub = st->sub;
+                if (!sub || (!is_int_ty(sub) && !is_flt_ty(sub)))
+                    return Unsup(cat("a copy of a value the walk does not "
+                                     "hold at line ",
+                                     (long long)c->line.line)), nullptr;
+                SliceVal sv;
+                if (!slice_value(c->args[0], w, sv) || !sv.etype)
+                    return Unsup(cat("a copy of a value the walk does not "
+                                     "hold at line ",
+                                     (long long)c->line.line)), nullptr;
+                // The count: a fixed array's constant, or the live length.
+                if (st->kind == TY_ARRAY && st->arr->akind == A_FIXED)
+                    count = st->arr->size;
+                auto *et = elem_ll_ty(sub);
+                auto esz = et->getPrimitiveSizeInBits() / 8;
+                if (count >= 0) {
+                    // A fixed copy: one temporary of the constant length.
+                    auto *arr = entry_alloca(
+                        w, llvm::ArrayType::get(et, (uint64_t)count),
+                        "cparr");
+                    if (count) {
+                        auto *nbytes = llvm::ConstantInt::get(
+                            i64(), (uint64_t)(count * esz));
+                        auto *dst = b.CreateInBoundsGEP(
+                            arr->getAllocatedType(), arr,
+                            { llvm::ConstantInt::get(i64(), 0),
+                              llvm::ConstantInt::get(i64(), 0) }, "cpd");
+                        b.CreateMemCpy(dst, llvm::MaybeAlign(1), sv.data,
+                                       llvm::MaybeAlign(1), nbytes);
+                    }
+                    SliceVal out { b.CreateInBoundsGEP(
+                        arr->getAllocatedType(), arr,
+                        { llvm::ConstantInt::get(i64(), 0),
+                          llvm::ConstantInt::get(i64(), 0) }, "cpd"),
+                        llvm::ConstantInt::get(i64(), (uint64_t)count), sub };
+                    return slice_struct(out.data, out.len);
+                }
+                // A growable (or a live view) copy: a temporary array big
+                // enough is unknown at compile time, so the fresh copy
+                // stays the run of a scratch growable.
+                auto *slot = new llvm::GlobalVariable(
+                    *mod, i8ptr(), /*isConstant=*/false,
+                    llvm::GlobalValue::InternalLinkage,
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    cat("gs_stk", stk_slots.size()), nullptr,
+                    llvm::GlobalValue::GeneralDynamicTLSModel);
+                stk_slots.push_back(slot);
+                auto *hdra = entry_alloca(w, slice_ll_ty(), "cpscr.hdr");
+                auto *basea = b.CreateInBoundsGEP(
+                    slice_ll_ty(), hdra, { idx0(), fld(0) }, "cpscr.base");
+                auto *lena = b.CreateInBoundsGEP(
+                    slice_ll_ty(), hdra, { idx0(), fld(1) }, "cpscr.len");
+                auto *basev = b.CreateLoad(i8ptr(), slot, "cpscr.top");
+                b.CreateStore(basev, basea);
+                b.CreateStore(llvm::ConstantInt::get(i64(), 0), lena);
+                auto *nbytes = b.CreateMul(
+                    sv.len, llvm::ConstantInt::get(i64(), (uint64_t)esz),
+                    "cpbytes");
+                b.CreateMemCpy(basev, llvm::MaybeAlign(1), sv.data,
+                               llvm::MaybeAlign(1), nbytes);
+                b.CreateStore(b.CreateInBoundsGEP(
+                    llvm::Type::getInt8Ty(ctx), basev, nbytes, "cpscr.top"),
+                    slot);
+                b.CreateStore(sv.len, lena);
+                return slice_struct(basev, sv.len);
             }
             // `dst.move_from(src)`: both are views over int arrays the walk
             // holds (a fixeds local's slice, a slice local's view, a range
@@ -2453,6 +2548,19 @@ struct CodeGenIR {
                     out.data = b.CreateLoad(i8ptr(), basea, "svd");
                     out.len = b.CreateLoad(i64(), lena, "svn");
                     out.etype = c->spec->rets[0]->arr->sub;
+                    return true;
+                }
+                // A builtin (copy) whose result is a fresh view: the value
+                // path builds it.
+                if (!c->spec && c->builtin >= 0
+                    && (c->exprtype->kind == TY_SLICE
+                        || c->exprtype->kind == TY_ARRAY)) {
+                    auto *v = GenExpr(c, w);
+                    if (!v || v->getType() != slice_ll_ty()) return false;
+                    out.data = b.CreateExtractValue(v, 0, "svd");
+                    out.len = b.CreateExtractValue(v, 1, "svn");
+                    out.etype = c->exprtype->kind == TY_SLICE
+                        ? c->exprtype->sub : c->exprtype->arr->sub;
                     return true;
                 }
                 return false;
@@ -4388,6 +4496,7 @@ struct CodeGenIR {
     void emit_globals() {
         auto i64ty = i64();
         vector<pair<VarDef *, Node *>> inits;
+        vector<pair<VarDef *, Node *>> grow_inits;
         for (auto *g : ast.globals) {
             for (size_t di = 0; di < g->defs.size(); ++di) {
                 auto *d = g->defs[di];
@@ -4421,6 +4530,14 @@ struct CodeGenIR {
                             slice_ll_ty(), hdrgv, lidx);
                     global_rzs[d] = { basegv, lengv, slot, hdrgv,
                                       d->type->arr->sub };
+                    if (di < g->inits.size() && g->inits[di]) {
+                        auto *al = Is<ArrayLit>(g->inits[di]);
+                        bool strobj = Is<StrLit>(g->inits[di])
+                            && (d->type->arr->sub->intstorage == IS_U8
+                                || d->type->arr->sub->intstorage == IS_I8);
+                        if ((al && !al->fillval && !al->elems.empty()) || strobj)
+                            grow_inits.push_back({ d, g->inits[di] });
+                    }
                     continue;
                 }
                 if (!is_int_ty(d->type)) continue;
@@ -4453,11 +4570,44 @@ struct CodeGenIR {
             if (initv) b.CreateStore(initv, global_vars[d].gv);
         }
         // A growable global's header: base from its reserved region, count
-        // zero. The initializer this slice takes is [] only, whose contents
-        // are nothing to store.
+        // zero, then a literal initializer's elements land on the region.
         for (auto &[d, r] : global_rzs) {
             b.CreateStore(b.CreateLoad(i8ptr(), r.slot, "gbase"), r.base);
             b.CreateStore(llvm::ConstantInt::get(i64(), 0), r.len);
+        }
+        for (auto &[d, ninit] : grow_inits) {
+            auto &r = global_rzs[d];
+            auto *et = elem_ll_ty(r.etype);
+            auto esz = et->getPrimitiveSizeInBits() / 8;
+            if (auto *al = Is<ArrayLit>(ninit)) {
+                int64_t k = 0;
+                for (auto *e : al->elems) {
+                    auto *v = GenExpr(e, gw);
+                    if (!v) continue;
+                    b.CreateStore(
+                        et == i64() ? as_i64(v)
+                                    : b.CreateTrunc(as_i64(v), et),
+                        b.CreateInBoundsGEP(et,
+                            b.CreateLoad(i8ptr(), r.base, "gbase"),
+                            llvm::ConstantInt::get(i64(), (uint64_t)k),
+                            "gip"));
+                    k++;
+                }
+                b.CreateStore(llvm::ConstantInt::get(i64(), (uint64_t)k),
+                              r.len);
+                rz_sync_slot(r, b.CreateLoad(i8ptr(), r.base),
+                             b.CreateLoad(i64(), r.len));
+            } else if (auto *sl = Is<StrLit>(ninit)) {
+                auto n = (uint64_t)sl->val.size();
+                if (n)
+                    b.CreateMemCpy(
+                        b.CreateLoad(i8ptr(), r.base, "gbase"),
+                        llvm::MaybeAlign(1), strlit_glob(sl->val),
+                        llvm::MaybeAlign(1), n);
+                b.CreateStore(llvm::ConstantInt::get(i64(), n), r.len);
+                rz_sync_slot(r, b.CreateLoad(i8ptr(), r.base),
+                             b.CreateLoad(i64(), r.len));
+            }
         }
         b.CreateRetVoid();
     }
