@@ -251,7 +251,11 @@ of flat structs prints `[T { ... }, T { ... }]`, and a multi-result call
 binds result 0 from the call's value and results 1.. through
 out-pointers. A fixed array of flat structs builds its literal in place:
 a field path reaches through an element (`pair[1].name`), a `for` binds
-each element as a struct, and print renders the whole run. An append's source may be a run built at
+each element as a struct, and print renders the whole run. A fixed array crosses a
+call by value (the C backend's `a2_i64`): a parameter copies into the
+body's own storage, a result returns the whole array (an inlined
+callee's parameter binding copies the named run), and a fixed local
+reads as its array value where a value is wanted. An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a
@@ -270,7 +274,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 61 of the codegen output fixtures pass through
+in the output now refuse. 62 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

@@ -392,6 +392,18 @@ struct CodeGenIR {
         return is_flt_ty(et) ? flt_ll_ty(et) : int_ll_ty(et);
     }
 
+    // A fixed array of walkable elements as a first-class value (the C
+    // backend returns one as a by-value struct `a2_i64`).
+    static bool is_fixed_val(TypeExpr *t) {
+        return t && t->kind == TY_ARRAY && t->arr->akind == A_FIXED
+            && (is_int_ty(t->arr->sub) || is_flt_ty(t->arr->sub));
+    }
+
+    llvm::ArrayType *fixed_ll_ty(TypeExpr *t) {
+        return llvm::ArrayType::get(elem_ll_ty(t->arr->sub),
+                                    (uint64_t)t->arr->size);
+    }
+
     // A type's name for a refusal message.
     static string type_label(TypeExpr *t) {
         if (!t) return "an unknown type";
@@ -667,6 +679,7 @@ struct CodeGenIR {
                     argtys.push_back(i8ptr());
                 else if (t->kind == TY_REF && is_flat_struct(t->ref->sub))
                     argtys.push_back(i8ptr());
+                else if (is_fixed_val(t)) argtys.push_back(fixed_ll_ty(t));
                 else if (t->kind == TY_REF && is_growable_i64(t->ref->sub)) {
                     // A reference to a growable array: the C backend's
                     // (gs_rhdr *, gs_stack *) pair, two pointers.
@@ -699,6 +712,8 @@ struct CodeGenIR {
                     retty = slice_ll_ty();
                 else if (sp->rets.size() == 1 && is_flat_struct(sp->rets[0]))
                     retty = struct_ty(sp->rets[0]);
+                else if (sp->rets.size() == 1 && is_fixed_val(sp->rets[0]))
+                    retty = fixed_ll_ty(sp->rets[0]);
                 else if (sp->rets.size() == 1 && is_flat_ref(sp->rets[0]))
                     retty = i8ptr();
                 else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
@@ -803,6 +818,16 @@ struct CodeGenIR {
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(argidx), slot);
                     w.structs[sp->params[i]] = { slot, pt->struc->inst };
+                    argidx += 1;
+                } else if (is_fixed_val(pt)) {
+                    // A fixed array parameter: the by-value array copies
+                    // into the body's own alloca (the walk reads elements
+                    // through it).
+                    auto *slot = b.CreateAlloca(fixed_ll_ty(pt), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(argidx), slot);
+                    w.fixeds[sp->params[i]] = { slot, pt->arr->size,
+                                                pt->arr->sub };
                     argidx += 1;
                 } else if (!pt || is_int_ty(pt) || is_bool_ty(pt)) {
                     // An int parameter lives in a slot of the body's own from
@@ -1133,7 +1158,25 @@ struct CodeGenIR {
                                llvm::MaybeAlign(1), (uint64_t)count);
             return;
         }
-        if (init && !al) return;      // Literal construction only here.
+        if (init && !al) {
+            // A copy of another fixed array (the inline parameter binding
+            // `let a = w`): the elements copy from the named run.
+            SliceVal sv;
+            if (!slice_value(init, w, sv) || !sv.etype) return;
+            auto *etl = elem_ll_ty(tal->sub);
+            auto esz = (uint64_t)etl->getPrimitiveSizeInBits() / 8;
+            auto *nbytes = b.CreateMul(
+                sv.len, llvm::ConstantInt::get(i64(), esz), "cabytes");
+            if (a) {
+                auto *dst = b.CreateInBoundsGEP(
+                    a->getAllocatedType(), a,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), 0) }, "cad");
+                b.CreateMemCpy(dst, llvm::MaybeAlign(1), sv.data,
+                               llvm::MaybeAlign(1), nbytes);
+            }
+            return;
+        }
         if (!al) return;
         // An element store: an int narrows to its storage, a float fits
         // its width, a struct takes the whole value its literal builds.
@@ -1571,6 +1614,14 @@ struct CodeGenIR {
                 auto lit = w.locals.find(id->vdef);
                 if (lit != w.locals.end())
                     return b.CreateLoad(i64(), lit->second, llvm::Twine(id->vdef->name));
+                // A fixed array local read as its array value (the tail
+                // of an inlined body returning one).
+                auto fxvit = w.fixeds.find(id->vdef);
+                if (fxvit != w.fixeds.end() && fxvit->second.base
+                    && is_fixed_val(id->vdef->type))
+                    return b.CreateLoad(
+                        fixed_ll_ty(id->vdef->type), fxvit->second.base,
+                        llvm::Twine(id->vdef->name));
                 // A float local loads at its own width.
                 auto fit2 = w.floats.find(id->vdef);
                 if (fit2 != w.floats.end())
@@ -2634,6 +2685,24 @@ struct CodeGenIR {
         // { data, len } it built. A growable result is built into a scratch
         // run destination and read back.
         if (auto *ib = Is<InlineBlock>(n)) {
+            if (ib->spec && ib->spec->rets.size() == 1
+                && is_fixed_val(ib->spec->rets[0])) {
+                // A fixed-array result of an inlined call: the body's value
+                // is the array, materialized into a temporary.
+                auto *v = GenInline(ib, w);
+                if (!v || !v->getType()->isArrayTy()) return false;
+                auto *ty = fixed_ll_ty(ib->spec->rets[0]);
+                auto *tmp = entry_alloca(w, ty, "fxres");
+                b.CreateStore(v, tmp);
+                out.data = b.CreateInBoundsGEP(
+                    ty, tmp,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), 0) }, "svd");
+                out.len = llvm::ConstantInt::get(
+                    i64(), (uint64_t)ib->spec->rets[0]->arr->size);
+                out.etype = ib->spec->rets[0]->arr->sub;
+                return true;
+            }
             if (!ib->spec || ib->spec->rets.size() != 1
                 || !is_slice_of_int(ib->spec->rets[0])) {
                 if (ib->spec && ib->spec->rets.size() == 1
@@ -2672,8 +2741,25 @@ struct CodeGenIR {
         }
         // A call whose one result is a slice: the { data, len } it returns;
         // a growable result is built into a scratch run destination and
-        // read back as its { data, len }.
+        // read back as its { data, len }; a fixed-array result lands in a
+        // temporary whose view is the value.
         if (auto *c = Is<Call>(n)) {
+            if (c->spec && c->spec->rets.size() == 1
+                && is_fixed_val(c->spec->rets[0])) {
+                auto *v = EmitDirectCall(c, w, nullptr);
+                if (!v) return false;
+                auto *ty = fixed_ll_ty(c->spec->rets[0]);
+                auto *tmp = entry_alloca(w, ty, "fxres");
+                b.CreateStore(v, tmp);
+                out.data = b.CreateInBoundsGEP(
+                    ty, tmp,
+                    { llvm::ConstantInt::get(i64(), 0),
+                      llvm::ConstantInt::get(i64(), 0) }, "svd");
+                out.len = llvm::ConstantInt::get(i64(),
+                                                 (uint64_t)c->spec->rets[0]->arr->size);
+                out.etype = c->spec->rets[0]->arr->sub;
+                return true;
+            }
             if (!c->spec || c->spec->rets.size() != 1
                 || !is_slice_of_int(c->spec->rets[0])) {
                 if (c->spec && c->spec->rets.size() == 1
@@ -4044,14 +4130,14 @@ struct CodeGenIR {
         if (sp->sf->isextern) return EmitExternCall(c, w);
         for (auto *t : sp->argtypes)
             if (!is_int_ty(t) && !is_bool_ty(t) && !is_slice_of_int(t)
-                && !is_flat_struct(t)
+                && !is_flat_struct(t) && !is_fixed_val(t)
                 && !(t && t->kind == TY_REF
                      && (is_int_ty(t->ref->sub)
                          || is_growable_i64(t->ref->sub)
                          || is_flat_struct(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
-                && !is_flat_struct(rt) && !is_flat_ref(rt)
+                && !is_flat_struct(rt) && !is_flat_ref(rt) && !is_fixed_val(rt)
                 && !(sp->rets.size() == 1 && is_growable_i64(rt))) return nullptr;
         bool growret_ = sp->rets.size() == 1 && is_growable_i64(sp->rets[0]);
         if (growret_ && !growret) return nullptr;
@@ -4098,6 +4184,21 @@ struct CodeGenIR {
                 if (!struct_value(a, w, sv, si) || si != pt->struc->inst)
                     return nullptr;
                 args.push_back(sv);
+                continue;
+            }
+            if (pt && is_fixed_val(pt)) {
+                SliceVal sv;
+                if (!slice_value(a, w, sv)) return nullptr;
+                auto *ty = fixed_ll_ty(pt);
+                auto *tmp = entry_alloca(w, ty, "fxarg");
+                auto esz = (uint64_t)ty->getArrayElementType()
+                    ->getPrimitiveSizeInBits() / 8;
+                b.CreateMemCpy(tmp, llvm::MaybeAlign(1), sv.data,
+                               llvm::MaybeAlign(1),
+                               b.CreateMul(sv.len,
+                                   llvm::ConstantInt::get(i64(),
+                                       (uint64_t)esz), "fxbytes"));
+                args.push_back(b.CreateLoad(ty, tmp, "fxv"));
                 continue;
             }
             if (pt && pt->kind == TY_REF && is_growable_i64(pt->ref->sub)) {
@@ -4214,6 +4315,10 @@ struct CodeGenIR {
                     // An inlined body returning a reference: its tail names
                     // the address the call would have handed back.
                     tv = ref_addr(tn, w);
+                } else if (ib->spec && ib->spec->rets.size() == 1
+                           && is_fixed_val(ib->spec->rets[0])) {
+                    // A fixed-array result: the tail value is the array.
+                    tv = GenExpr(tn, w);
                 } else if (valueless || Is<Return>(tn)) {
                     GenStmt(tn, w);
                 } else {
@@ -4323,18 +4428,24 @@ struct CodeGenIR {
             for (size_t i = 0; i < vd->defs.size(); ++i) {
                 auto *vddef = vd->defs[i];
                 if (!vddef) continue;
-                if (vd->isglobal) continue;
-                if (is_growable(vddef->type)) {
+                if (vd->isglobal) continue;                if (is_growable(vddef->type)) {
                     emit_growable_decl(vd, i, *vddef, w);
                     continue;
                 }
-                if (vddef->type->kind == TY_ARRAY
+                if (vddef->type && vddef->type->kind == TY_ARRAY
                     && (vddef->type->arr->akind == A_FIXED || vddef->type->arr->akind == A_VAR)
                     && (is_int_ty(vddef->type->arr->sub)
                         || is_flt_ty(vddef->type->arr->sub)
                         || is_flat_struct(vddef->type->arr->sub))) {
                     emit_fixed_decl(vd, i, *vddef, w);
                     continue;
+                }
+                if (vddef->type && vddef->type->kind == TY_ARRAY
+                    && vddef->type->arr->akind != A_LIMITED) {
+                    return Unsup(cat("a local of a fixed array of ",
+                                     type_label(vddef->type->arr->sub),
+                                     " at line ",
+                                     (long long)vd->line.line));
                 }
                 if (vddef->type->kind == TY_ARRAY
                     && vddef->type->arr->akind == A_LIMITED
@@ -4988,6 +5099,25 @@ struct CodeGenIR {
                     StructInst *si = nullptr;
                     if (!struct_value(ret->vals[0], w, sv, si)) return;
                     b.CreateRet(sv);
+                    return;
+                }
+                if (w.spec && w.spec->rets.size() == 1
+                    && is_fixed_val(w.spec->rets[0])
+                    && w.fn->getReturnType()->isArrayTy()) {
+                    // A fixed-array result: the value is a copy of the run
+                    // (memcpy into a temporary, loaded as the array).
+                    SliceVal sv;
+                    if (!slice_value(ret->vals[0], w, sv)) return;
+                    auto *ty = w.fn->getReturnType();
+                    auto esz = (uint64_t)ty->getArrayElementType()
+                        ->getPrimitiveSizeInBits() / 8;
+                    auto *tmp = entry_alloca(w, ty, "fxret");
+                    b.CreateMemCpy(tmp, llvm::MaybeAlign(1), sv.data,
+                                   llvm::MaybeAlign(1),
+                                   b.CreateMul(sv.len,
+                                       llvm::ConstantInt::get(i64(),
+                                           (uint64_t)esz), "fxbytes"));
+                    b.CreateRet(b.CreateLoad(ty, tmp, "fxrv"));
                     return;
                 }
                 if (w.fn->getReturnType()->isPointerTy() && w.spec
