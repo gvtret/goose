@@ -255,7 +255,9 @@ each element as a struct, and print renders the whole run. A fixed array crosses
 call by value (the C backend's `a2_i64`): a parameter copies into the
 body's own storage, a result returns the whole array (an inlined
 callee's parameter binding copies the named run), and a fixed local
-reads as its array value where a value is wanted. An append's source may be a run built at
+reads as its array value where a value is wanted. A reference may bind
+an array element's storage (`let r .= a[i]`): its address is the element's
+slot, so a write through the reference reaches the array. An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a
@@ -274,7 +276,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 62 of the codegen output fixtures pass through
+in the output now refuse. 63 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

@@ -3115,6 +3115,12 @@ struct CodeGenIR {
                 ptr = addr;
                 ptee = leaf;
             }
+        } else {
+            // Any other place the walk can name: an array element
+            // (`let r .= a[i]`), a slice element, a nested field path.
+            ptr = ref_addr(init, w);
+            if (ptr && init && init->exprtype && is_int_ty(init->exprtype))
+                ptee = init->exprtype;
         }
         if (!ptr)
             return Unsup(cat("a reference bound to a value the walk does "
@@ -3151,6 +3157,36 @@ struct CodeGenIR {
             if (is_flat_struct(leaf)) return addr;
             if (is_int_ty(leaf) && int_ll_ty(leaf) == i64()) return addr;
             return nullptr;
+        }
+        if (auto *ix = Is<Index>(n)) {
+            // An element's address, for a reference binding: GEP into the
+            // array's storage (a fixed local, a global, or a view).
+            auto *obj = Is<Ident>(ix->obj);
+            auto *idxv = GenExpr(ix->idx, w);
+            if (!idxv) return nullptr;
+            if (obj && obj->vdef) {
+                auto fit = w.fixeds.find(obj->vdef);
+                if (fit != w.fixeds.end() && fit->second.base) {
+                    auto *et = fit->second.base->getAllocatedType()
+                                   ->getArrayElementType();
+                    return b.CreateInBoundsGEP(et, fit->second.base, idxv,
+                                               "elref");
+                }
+                auto gfit = global_fixeds.find(obj->vdef);
+                if (gfit != global_fixeds.end()) {
+                    auto *et = gfit->second.base->getValueType()
+                                   ->getArrayElementType();
+                    return b.CreateInBoundsGEP(et, gfit->second.base, idxv,
+                                               "elref");
+                }
+            }
+            SliceVal sv;
+            if (slice_value(ix->obj, w, sv) && sv.etype) {
+                auto *et = elem_ll_ty(sv.etype);
+                if (is_flat_struct(sv.etype))
+                    et = struct_ll_ty(sv.etype->struc->inst);
+                return b.CreateInBoundsGEP(et, sv.data, idxv, "elref");
+            }
         }
         return nullptr;
     }
