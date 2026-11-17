@@ -2389,6 +2389,67 @@ struct CodeGenIR {
                                  "hold at line ",
                                  (long long)c->line.line)), nullptr;
             }
+            // `str(a, b, ...)`: render into a fresh growable buffer and
+            // return its view. `format(out, a, ...)`: render into the
+            // receiver's buffer. Neither writes a trailing newline.
+            if ((c->builtin == B_STR && !c->args.empty())
+                || (c->builtin == B_FORMAT && c->args.size() >= 1)) {
+                size_t first = c->builtin == B_STR ? 0 : 1;
+                llvm::Value *dstslot = nullptr;
+                llvm::Value *dstbase = nullptr;
+                llvm::Value *dstlen = nullptr;
+                if (c->builtin == B_FORMAT) {
+                    auto *recv = Is<Ident>(c->args[0]);
+                    if (!recv) {
+                        auto *rd = Is<Dot>(c->args[0]);
+                        if (rd) recv = Is<Ident>(rd->obj);
+                    }
+                    auto *r = recv && recv->vdef
+                        ? rz_head(w, recv->vdef) : nullptr;
+                    if (!r)
+                        return Unsup(cat("a format onto a variable the walk "
+                                         "does not hold at line ",
+                                         (long long)c->line.line)), nullptr;
+                    dstslot = r->slot;
+                    dstbase = r->base;
+                    dstlen = r->len;
+                } else {
+                    auto *slot = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        cat("gs_stk", stk_slots.size()), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(slot);
+                    auto *hdra = entry_alloca(w, slice_ll_ty(), "str.hdr");
+                    dstbase = b.CreateInBoundsGEP(
+                        slice_ll_ty(), hdra, { idx0(), fld(0) }, "str.base");
+                    dstlen = b.CreateInBoundsGEP(
+                        slice_ll_ty(), hdra, { idx0(), fld(1) }, "str.len");
+                    auto *top = b.CreateLoad(i8ptr(), slot, "str.top");
+                    b.CreateStore(top, dstbase);
+                    b.CreateStore(llvm::ConstantInt::get(i64(), 0), dstlen);
+                    dstslot = slot;
+                }
+                auto *startv = b.CreateLoad(i8ptr(), dstslot, "str.start");
+                auto *cura = entry_alloca(w, i8ptr(), "str.cur");
+                b.CreateStore(startv, cura);
+                if (!emit_render_args(c->args, first, cura, w, c))
+                    return Unsup(cat("a str/format argument the walk does "
+                                     "not render at line ",
+                                     (long long)c->line.line)), nullptr;
+                auto *endv = b.CreateLoad(i8ptr(), cura);
+                auto *nbytes = b.CreateSub(
+                    b.CreatePtrToInt(endv, i64()),
+                    b.CreatePtrToInt(startv, i64()), "str.n");
+                b.CreateStore(endv, dstslot);
+                llvm::Value *nlen = b.CreateLoad(i64(), dstlen, "str.nlen");
+                nlen = b.CreateAdd(nlen, nbytes, "str.len+");
+                b.CreateStore(nlen, dstlen);
+                if (c->builtin == B_STR)
+                    return slice_struct(startv, nlen);
+                return nullptr;   // format is a statement
+            }
             // print's line alphabet this slice covers: int values and
             // string literals, with no separator of its own, rendered into the same
             // byte cursor the C backend builds its whole line in
@@ -2396,6 +2457,12 @@ struct CodeGenIR {
             // runs in a dedicated reserved scratch slot; every print
             // starts it at the base again and resets it after.
             if (c->builtin == B_PRINT) {
+                // A user format hook is a later cut.
+                for (size_t k = 0; k < c->args.size(); ++k)
+                    if (k < c->fmtcontexts.size() && c->fmtcontexts[k]
+                        && !c->fmtcontexts[k]->fmtspecs.empty())
+                        return Unsup(cat("a print with a format hook at line ",
+                                         (long long)c->line.line)), nullptr;
                 if (!gs_pstk) {
                     gs_pstk = new llvm::GlobalVariable(
                         *mod, i8ptr(), /*isConstant=*/false,
@@ -2407,64 +2474,8 @@ struct CodeGenIR {
                 auto *basev = b.CreateLoad(i8ptr(), gs_pstk, "pline");
                 auto *cura = entry_alloca(w, i8ptr(), "pcur");
                 b.CreateStore(basev, cura);
-                auto *i8ty = llvm::Type::getInt8Ty(ctx);
-                for (size_t ai = 0; ai < c->args.size(); ++ai) {
-                    auto *an = c->args[ai];
-                    if (auto *sl = Is<StrLit>(an)) {
-                        emit_print_bytes(cura, sl->val);
-                        continue;
-                    }
-                    if (an->exprtype
-                        && (an->exprtype->kind == TY_ARRAY
-                            || an->exprtype->kind == TY_SLICE)) {
-                        if (!emit_print_view(an, an->exprtype, cura, w))
-                            return nullptr;
-                        continue;
-                    }
-                    if (an->exprtype && is_flat_struct(an->exprtype)) {
-                        // A struct renders through the default hook: the
-                        // type's name, `{ field, field }`.
-                        if (!emit_print_struct(an, an->exprtype, cura, w))
-                            return Unsup(cat("a print of a struct the walk "
-                                             "does not hold at line ",
-                                             (long long)an->line.line)),
-                                   nullptr;
-                        continue;
-                    }
-                    if (an->exprtype && an->exprtype->kind == TY_FLT) {
-                        // A float renders through the runtime's float hook
-                        // at its own width, as the C backend's does.
-                        auto *x = GenExpr(an, w);
-                        if (!x)
-                            return Unsup(cat("a print argument at line ",
-                                             (long long)an->line.line)), nullptr;
-                        auto *cur = b.CreateLoad(i8ptr(), cura);
-                        auto *hook = an->exprtype->fltstorage == FS_F32
-                            ? f_gs_fmt_f32 : f_gs_fmt_f64;
-                        auto *n = b.CreateCall(hook, { cur, x });
-                        b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
-                                      cura);
-                        continue;
-                    }
-                    if (!an->exprtype
-                        || (!is_int_ty(an->exprtype)
-                            && !is_bool_ty(an->exprtype)))
-                        return Unsup("a print of a value that is not an int, a bool or a string literal"), nullptr;
-                    auto *x = GenExpr(an, w);
-                    if (!x)
-                        return Unsup(cat("a print argument at line ",
-                                         (long long)an->line.line)), nullptr;
-                    auto *cur = b.CreateLoad(i8ptr(), cura);
-                    // u64 renders unsigned, as the C backend's hook does;
-                    // every narrower int widens to an i64 that fits.
-                    auto *hook = is_bool_ty(an->exprtype) ? f_gs_fmt_bool
-                        : (an->exprtype->kind == TY_INT
-                           && an->exprtype->intstorage == IS_U64)
-                            ? f_gs_fmt_u64 : f_gs_fmt_i64;
-                    auto *n = b.CreateCall(hook, { cur, as_i64(x) });
-                    b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
-                                  cura);
-                }
+                if (!emit_render_args(c->args, 0, cura, w, c))
+                    return nullptr;
                 emit_print_bytes(cura, "\n");
                 auto *cur = b.CreateLoad(i8ptr(), cura);
                 auto *endv = cur;
@@ -3397,6 +3408,62 @@ struct CodeGenIR {
         b.CreateStore(llvm::ConstantInt::get(i8ty, ']'), endcur);
         b.CreateStore(b.CreateInBoundsGEP(
             i8ty, endcur, llvm::ConstantInt::get(i64(), 1)), cura);
+        return true;
+    }
+
+    // Renders a list of values at the print cursor (everything print
+    // knows how to render), shared by print, str and format.
+    bool emit_render_args(const std::vector<Node *> &args, size_t start,
+                          llvm::Value *cura, FnWalk &w, Call *outer = nullptr) {
+        auto *i8ty = llvm::Type::getInt8Ty(ctx);
+        for (size_t ai = start; ai < args.size(); ++ai) {
+            auto *an = args[ai];
+            // A user format hook for this type is a later cut; refuse it
+            // rather than render the value with the default hook.
+            if (outer && ai >= start && ai - start < outer->fmtcontexts.size()) {
+                auto *ctxc = outer->fmtcontexts[ai - start];
+                if (ctxc && !ctxc->fmtspecs.empty()) return false;
+            }
+            if (auto *sl = Is<StrLit>(an)) {
+                emit_print_bytes(cura, sl->val);
+                continue;
+            }
+            if (an->exprtype
+                && (an->exprtype->kind == TY_ARRAY
+                    || an->exprtype->kind == TY_SLICE)) {
+                if (!emit_print_view(an, an->exprtype, cura, w))
+                    return false;
+                continue;
+            }
+            if (an->exprtype && is_flat_struct(an->exprtype)) {
+                if (!emit_print_struct(an, an->exprtype, cura, w))
+                    return false;
+                continue;
+            }
+            if (an->exprtype && an->exprtype->kind == TY_FLT) {
+                auto *x = GenExpr(an, w);
+                if (!x) return false;
+                auto *cur = b.CreateLoad(i8ptr(), cura);
+                auto *hook = an->exprtype->fltstorage == FS_F32
+                    ? f_gs_fmt_f32 : f_gs_fmt_f64;
+                auto *n = b.CreateCall(hook, { cur, x });
+                b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"),
+                              cura);
+                continue;
+            }
+            if (!an->exprtype
+                || (!is_int_ty(an->exprtype) && !is_bool_ty(an->exprtype)))
+                return false;
+            auto *x = GenExpr(an, w);
+            if (!x) return false;
+            auto *cur = b.CreateLoad(i8ptr(), cura);
+            auto *hook = is_bool_ty(an->exprtype) ? f_gs_fmt_bool
+                : (an->exprtype->kind == TY_INT
+                   && an->exprtype->intstorage == IS_U64)
+                    ? f_gs_fmt_u64 : f_gs_fmt_i64;
+            auto *n = b.CreateCall(hook, { cur, as_i64(x) });
+            b.CreateStore(b.CreateInBoundsGEP(i8ty, cur, n, "pcur+"), cura);
+        }
         return true;
     }
 
