@@ -263,6 +263,8 @@ renders values into a fresh growable buffer and returns its view;
 renderer, write no newline, and refuse a user format hook (a later cut).
 An `as` cast changes a value's width: an int widens to a float, a float
 changes width, and `as!` narrows a float to an int (truncating toward zero).
+A zero-length fixed array (`i64[0]`) is a `[0 x T]` value with no storage:
+it crosses a call and reads its `.len` as zero.
 An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
@@ -282,7 +284,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 66 of the codegen output fixtures pass through
+in the output now refuse. 67 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

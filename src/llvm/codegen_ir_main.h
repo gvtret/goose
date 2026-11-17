@@ -1647,11 +1647,16 @@ struct CodeGenIR {
                 // A fixed array local read as its array value (the tail
                 // of an inlined body returning one).
                 auto fxvit = w.fixeds.find(id->vdef);
-                if (fxvit != w.fixeds.end() && fxvit->second.base
-                    && is_fixed_val(id->vdef->type))
-                    return b.CreateLoad(
-                        fixed_ll_ty(id->vdef->type), fxvit->second.base,
-                        llvm::Twine(id->vdef->name));
+                if (fxvit != w.fixeds.end() && is_fixed_val(id->vdef->type)) {
+                    llvm::Value *fv = fxvit->second.base
+                        ? (llvm::Value *)b.CreateLoad(
+                              fixed_ll_ty(id->vdef->type),
+                              fxvit->second.base,
+                              llvm::Twine(id->vdef->name))
+                        : (llvm::Value *)llvm::Constant::getNullValue(
+                              fixed_ll_ty(id->vdef->type));
+                    return fv;
+                }
                 // A float local loads at its own width.
                 auto fit2 = w.floats.find(id->vdef);
                 if (fit2 != w.floats.end())
