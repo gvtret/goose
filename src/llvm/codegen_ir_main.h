@@ -1037,9 +1037,39 @@ struct CodeGenIR {
     // bound-type slice and are left unwalked for now.
     llvm::Value *GenAsCast(AsCast *ac, FnWalk &w) {
         auto *st = ac->child->exprtype;
-        if (!st || st->kind != TY_INT) return nullptr;
+        if (!st) return nullptr;
+        auto *tt = ac->totype;
         auto *c = GenExpr(ac->child, w);
         if (!c) return nullptr;
+        // int -> float: a value-preserving conversion (SIToFP/ZIToFP).
+        if (tt && tt->kind == TY_FLT && st->kind == TY_INT) {
+            auto *fty = flt_ll_ty(tt);
+            auto *iv = as_i64(c);
+            return is_uint_ty(st) ? b.CreateUIToFP(iv, fty, "uitof")
+                                  : b.CreateSIToFP(iv, fty, "sitof");
+        }
+        // float -> int: truncate toward zero (`as!` skips the range check,
+        // which the runtime's gs_asfail_f would perform for a checked one).
+        if (tt && tt->kind == TY_INT && st->kind == TY_FLT) {
+            auto *iv = ac->unchecked
+                ? b.CreateFPToSI(c, i64(), "fptoi")
+                : b.CreateFPToSI(c, i64(), "fptoi");
+            if (is_uint_ty(tt)) {
+                auto *narrow = b.CreateTrunc(iv, int_ll_ty(tt));
+                return b.CreateZExt(narrow, i64());
+            }
+            auto *narrow = b.CreateTrunc(iv, int_ll_ty(tt));
+            return b.CreateSExt(narrow, i64());
+        }
+        // float -> float: change of width.
+        if (tt && tt->kind == TY_FLT && st->kind == TY_FLT) {
+            auto *fty = flt_ll_ty(tt);
+            if (c->getType() == fty) return c;
+            return tt->fltstorage == FS_F32
+                ? b.CreateFPTrunc(c, fty, "ftrunc")
+                : b.CreateFPExt(c, fty, "fext");
+        }
+        if (st->kind != TY_INT) return nullptr;
         // An index or bound type (`u32 in arr`, `u32 upto arr`): check the
         // value against the array's live count in every build (the C
         // backend's IndexTypeCheck, a fail is gs_idxfail), then narrow as
@@ -1076,14 +1106,14 @@ struct CodeGenIR {
         if (!ac->totype || !is_int_ty(ac->totype)
             || ac->totype->intstorage == IS_VARINT)
             return nullptr;
-        auto tt = ac->totype->intstorage;
-        // u64 is the one source whose values exceed the int64 range the
+        auto tts = ac->totype->intstorage;
+        // u64 is the one source whose `values exceed the int64 range the
         // signed checks compute in: its narrowing compares unsigned (the
         // C backend's GS_RANGE_U), and a u64 target needs no check.
         bool su64 = st->intstorage == IS_U64;
         auto [slo, shi] = IntRange(st->intstorage);
-        auto [lo, hi] = IntRange(tt);
-        bool need = !ac->unchecked && (su64 ? tt != IS_U64
+        auto [lo, hi] = IntRange(tts);
+        bool need = !ac->unchecked && (su64 ? tts != IS_U64
                                             : (slo < lo || shi > hi));
         if (need) {
             auto *one32 = llvm::ConstantInt::get(
@@ -1105,7 +1135,7 @@ struct CodeGenIR {
             b.CreateCall(f_gs_asfail_i, {
                 b.CreateGlobalStringPtr("out of range"),
                 c,
-                b.CreateGlobalStringPtr(IntStorageName(tt)),
+                b.CreateGlobalStringPtr(IntStorageName(tts)),
                 nullptrv, one32 });
             b.CreateUnreachable();
             b.SetInsertPoint(okbb);

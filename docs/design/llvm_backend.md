@@ -260,7 +260,10 @@ an array element's storage (`let r .= a[i]`): its address is the element's
 slot, so a write through the reference reaches the array. `str(a, b, ...)`
 renders values into a fresh growable buffer and returns its view;
 `format(out, a, ...)` renders into an existing growable. Both share print's
-renderer, write no newline, and refuse a user format hook (a later cut). An append's source may be a run built at
+renderer, write no newline, and refuse a user format hook (a later cut).
+An `as` cast changes a value's width: an int widens to a float, a float
+changes width, and `as!` narrows a float to an int (truncating toward zero).
+An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
 makes a fresh copy of an array value (a growable onto a scratch run, a
@@ -279,7 +282,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 65 of the codegen output fixtures pass through
+in the output now refuse. 66 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
