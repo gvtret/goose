@@ -275,8 +275,10 @@ int-array global holds its elements in thread-local storage: its literal
 initializer (listed or a string literal's bytes) lands there in
 `gs_globals_init`, and print, index, `.len` and `copy` see the run. An `extern fn`'
 call lowers straight to its C symbol: floats at their width, ints as
-i64, an `i64&` as a pointer, an int-array slice as the { data, len }
-pair. An optional reference to a growable array
+i64, an int or float reference as a pointer (a float local's own
+storage), an int-array slice as the { data, len } pair; float
+comparisons (`<`, `>`, `<=`, `>=` and equality) run as FCmp on the
+operands' float type. An optional reference to a growable array
 (`u8[>..]?`) holds the pair of two null pointers when null, its
 expression value reads as the header pointer (so `== null`, `!= null`
 and a bare `if o` test it), and `.=` binds it like a plain reference.
@@ -284,7 +286,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 67 of the codegen output fixtures pass through
+in the output now refuse. 68 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

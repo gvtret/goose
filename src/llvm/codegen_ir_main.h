@@ -744,10 +744,12 @@ struct CodeGenIR {
             std::vector<llvm::Type *> argtys;
             bool supported = true;
             for (auto *t : sp->argtypes) {
+                if (!t) { supported = false; continue; }
                 if (is_flt_ty(t)) argtys.push_back(flt_ll_ty(t));
                 else if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
-                else if (t && t->kind == TY_REF && is_int_ty(t->ref->sub))
+                else if (t && t->kind == TY_REF && t->ref && t->ref->sub
+                         && (is_int_ty(t->ref->sub) || is_flt_ty(t->ref->sub)))
                     argtys.push_back(i8ptr());
                 else supported = false;
             }
@@ -1574,10 +1576,16 @@ struct CodeGenIR {
             auto *l = GenExpr(bin->left, w);
             auto *r = GenExpr(bin->right, w);
             if (!l || !r) return nullptr;
-            if (bin->exprtype && is_flt_ty(bin->exprtype)) {
-                // A float pair runs in float arithmetic; an f32 widens to
-                // f64 where the other operand is one.
-                auto *ty = flt_ll_ty(bin->exprtype);
+            // A float pair runs in float arithmetic and float comparison.
+            // The result of a comparison is a bool, so test the operands'
+            // type rather than the expression's.
+            TypeExpr *flt = nullptr;
+            if (bin->left->exprtype && is_flt_ty(bin->left->exprtype))
+                flt = bin->left->exprtype;
+            else if (bin->right->exprtype && is_flt_ty(bin->right->exprtype))
+                flt = bin->right->exprtype;
+            if (flt) {
+                auto *ty = flt_ll_ty(flt);
                 if (l->getType() != ty)
                     l = b.CreateFPExt(l, ty, "fwiden");
                 if (r->getType() != ty)
@@ -3189,6 +3197,9 @@ struct CodeGenIR {
                 return b.CreateLoad(i8ptr(), rit->second.base, "refp");
             auto lit = w.locals.find(id->vdef);
             if (lit != w.locals.end()) return lit->second;
+            // A float local's own storage (an f64& extern argument).
+            auto flt = w.floats.find(id->vdef);
+            if (flt != w.floats.end()) return flt->second.base;
             auto sit = w.structs.find(id->vdef);
             if (sit != w.structs.end()) return sit->second.base;
             auto git = global_vars.find(id->vdef);
@@ -4240,8 +4251,9 @@ struct CodeGenIR {
                 args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
                 continue;
             }
-            if (pt && pt->kind == TY_REF && is_int_ty(pt->ref->sub)) {
-                // An int& argument passes the place it names.
+            if (pt && pt->kind == TY_REF && pt->ref && pt->ref->sub
+                && (is_int_ty(pt->ref->sub) || is_flt_ty(pt->ref->sub))) {
+                // An int& or f64& argument passes the place it names.
                 auto *ptr = ref_addr(a, w);
                 if (!ptr) return nullptr;
                 args.push_back(ptr);
