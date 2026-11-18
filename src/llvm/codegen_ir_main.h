@@ -559,6 +559,12 @@ struct CodeGenIR {
         TypeExpr *etype = nullptr;
     };
     std::unordered_map<VarDef *, GlobalFixed> global_fixeds;
+    // Flat-struct globals: their thread-local record and layout.
+    struct GlobalStruct {
+        llvm::GlobalVariable *base = nullptr;
+        StructInst *inst = nullptr;
+    };
+    std::unordered_map<VarDef *, GlobalStruct> global_structs;
 
     // A string literal's constant bytes: one internal constant global per
     // distinct literal, no terminator (the length travels beside it).
@@ -592,6 +598,16 @@ struct CodeGenIR {
         TypeExpr *leaf = nullptr;
         if (!field_path_addr(path, w, addr, oi, leaf) || !addr) return nullptr;
         if (!is_growable(leaf)) return nullptr;
+        // A growable field of a global struct shares its stack with every
+        // alias of the struct (the root classes, section 5.2), which this
+        // walk does not track yet: refuse until that lands.
+        {
+            Node *root = path;
+            while (auto *rdt = Is<Dot>(root)) root = rdt->obj;
+            if (auto *rid = Is<Ident>(root); rid && rid->vdef
+                && global_structs.count(rid->vdef))
+                return nullptr;
+        }
         FnWalk::RzArr v;
         v.hdr = addr;
         v.slot = nullptr;   // No stack slot of its own here.
@@ -3071,6 +3087,13 @@ struct CodeGenIR {
                     return true;
                 }
                 if (is_growable(leaf)) {
+                    // A growable field of a global struct shares its stack
+                    // with every alias (the root classes): a later cut.
+                    Node *root = dt;
+                    while (auto *rdt = Is<Dot>(root)) root = rdt->obj;
+                    if (auto *rid = Is<Ident>(root); rid && rid->vdef
+                        && global_structs.count(rid->vdef))
+                        return false;
                     // A growable field: its header's base and count are the
                     // view (read at print time, so a push is seen).
                     out.data = b.CreateLoad(i8ptr(),
@@ -3804,6 +3827,25 @@ struct CodeGenIR {
             for (size_t k = 0; k < sl->inits.size(); ++k) {
                 auto f = (unsigned)at[k];
                 auto *p = b.CreateStructGEP(struct_ll_ty(inst), slot, f);
+                if (is_growable(inst->ftypes[f])) {
+                    // A growable field: its own stack slot, top written to
+                    // the header's base (the empty run the literal gives).
+                    auto *gslot = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        cat("gs_stk", stk_slots.size()), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(gslot);
+                    auto *top = b.CreateLoad(i8ptr(), gslot, "gf.top");
+                    b.CreateStore(top, b.CreateStructGEP(
+                        slot->getAllocatedType(), p, 0, "gf.base"));
+                    b.CreateStore(llvm::ConstantInt::get(i64(), 0),
+                                  b.CreateStructGEP(
+                                      slot->getAllocatedType(), p, 1,
+                                      "gf.len"));
+                    continue;
+                }
                 if (is_flat_struct(inst->ftypes[f])) {
                     // A nested struct field takes the whole value it built.
                     llvm::Value *fv = nullptr;
@@ -4062,6 +4104,15 @@ struct CodeGenIR {
             } else if (sit != w.structs.end()) {
                 inst = sit->second.inst;
                 addr = sit->second.base;
+            } else if (obj && obj->vdef
+                       && global_structs.count(obj->vdef)) {
+                // A flat-struct global: the path starts at its record. A
+                // growable leaf on this path shares its stack with every
+                // alias of the struct (the root classes), which the walk
+                // does not track yet: a later cut.
+                auto &gstr = global_structs[obj->vdef];
+                inst = gstr.inst;
+                addr = gstr.base;
             } else if (auto *cr = Is<Call>(dt->obj); cr && cr->spec
                        && cr->spec->rets.size() == 1
                        && struct_ref_pointee(cr->spec->rets[0])) {
@@ -5453,6 +5504,7 @@ struct CodeGenIR {
         vector<pair<VarDef *, Node *>> grow_inits;
         vector<pair<VarDef *, Node *>> fixed_inits;
         vector<pair<VarDef *, Node *>> fixed_strinits;
+        vector<pair<VarDef *, Node *>> struct_inits;
         for (auto *g : ast.globals) {
             for (size_t di = 0; di < g->defs.size(); ++di) {
                 auto *d = g->defs[di];
@@ -5532,6 +5584,23 @@ struct CodeGenIR {
                         fixed_strinits.push_back({ d, g->inits[di] });
                     continue;
                 }
+                if (is_flat_struct(d->type)) {
+                    // A flat-struct global: its record in thread-local
+                    // storage; a literal initializer's fields land there
+                    // in gs_globals_init (through the same field logic as
+                    // a local's).
+                    auto *in = d->type->struc->inst;
+                    auto *gv = new llvm::GlobalVariable(
+                        *mod, struct_ll_ty(in), false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::Constant::getNullValue(struct_ll_ty(in)),
+                        cat(d->name, ".rec"), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    global_structs[d] = { gv, in };
+                    if (di < g->inits.size() && g->inits[di])
+                        struct_inits.push_back({ d, g->inits[di] });
+                    continue;
+                }
                 if (!is_int_ty(d->type)) continue;
                 // A string_view's .data() is not null-terminated, so the name
                 // must be copied into a std::string (passing .data() directly
@@ -5549,7 +5618,7 @@ struct CodeGenIR {
             }
         }
         if (inits.empty() && global_rzs.empty() && fixed_inits.empty()
-            && fixed_strinits.empty()) return;
+            && fixed_strinits.empty() && struct_inits.empty()) return;
         // Reuse the extern declaration from declare_entry_externs() and give
         // it a body. A second Function::Create with the same name would be
         // renamed gs_globals_init.1, leaving the extern undefined at link.
@@ -5561,6 +5630,64 @@ struct CodeGenIR {
         for (auto &[d, ninit] : inits) {
             auto *initv = GenExpr(ninit, gw);
             if (initv) b.CreateStore(initv, global_vars[d].gv);
+        }
+        // A flat-struct global's literal: the fields build at their
+        // places (ints/floats narrowed, slices as views, nested structs
+        // recursively).
+        for (auto &[d, ninit] : struct_inits) {
+            auto &gstr = global_structs[d];
+            auto *sl = Is<StructLit>(ninit);
+            if (!sl) continue;
+            auto *in = gstr.inst;
+            for (size_t k = 0; k < sl->inits.size(); ++k) {
+                int f = k < sl->inits.size()
+                    ? field_of_init(in, sl->inits[k], k) : -1;
+                if (f < 0) continue;
+                auto *p = b.CreateStructGEP(gstr.base->getValueType(),
+                                            gstr.base, (unsigned)f);
+                if (is_growable(in->ftypes[f])) {
+                    // A growable field: its own stack slot, top written to
+                    // the header's base.
+                    auto *gslot = new llvm::GlobalVariable(
+                        *mod, i8ptr(), /*isConstant=*/false,
+                        llvm::GlobalValue::InternalLinkage,
+                        llvm::ConstantPointerNull::get(i8ptr()),
+                        cat("gs_stk", stk_slots.size()), nullptr,
+                        llvm::GlobalValue::GeneralDynamicTLSModel);
+                    stk_slots.push_back(gslot);
+                    auto *top = b.CreateLoad(i8ptr(), gslot, "gs.top");
+                    b.CreateStore(top, b.CreateStructGEP(
+                        gstr.base->getValueType(),
+                        b.CreateStructGEP(gstr.base->getValueType(),
+                                          gstr.base, (unsigned)f),
+                        0, "gs.base"));
+                    b.CreateStore(llvm::ConstantInt::get(i64(), 0),
+                                  b.CreateStructGEP(
+                                      gstr.base->getValueType(),
+                                      b.CreateStructGEP(gstr.base->getValueType(),
+                                                        gstr.base, (unsigned)f),
+                                      1, "gs.len"));
+                    continue;
+                }
+                if (is_flat_struct(in->ftypes[f])) {
+                    llvm::Value *fv = nullptr;
+                    StructInst *fi = nullptr;
+                    if (struct_value(sl->inits[k].val, gw, fv, fi))
+                        b.CreateStore(fv, p);
+                    continue;
+                }
+                if (is_slice_of(in->ftypes[f])) {
+                    SliceVal sv;
+                    if (slice_value(sl->inits[k].val, gw, sv)) {
+                        auto *hdr = b.CreateInsertValue(
+                            llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                        b.CreateStore(b.CreateInsertValue(hdr, sv.len, 1), p);
+                    }
+                    continue;
+                }
+                auto *v = GenExpr(sl->inits[k].val, gw);
+                if (v) b.CreateStore(field_store_value(in->ftypes[f], v), p);
+            }
         }
         // A growable global's header: base from its reserved region, count
         // zero, then a literal initializer's elements land on the region.

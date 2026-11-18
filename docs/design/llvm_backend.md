@@ -268,7 +268,9 @@ it crosses a call and reads its `.len` as zero. A flat struct may hold a
 growable field (the C.2 resizable tail laid last): its `{ base, count }`
 header lives in the struct body, push, pop, append, `.len`, index and
 print reach it through a field path, and it binds as a fat-reference
-argument (`b.items`).
+argument (`b.items`). A growable field of a flat-struct global stays a
+later cut: its stack is shared with every alias of the struct (the root
+classes), which the walk does not track yet.
 An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
