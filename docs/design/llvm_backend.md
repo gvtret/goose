@@ -264,7 +264,11 @@ renderer, write no newline, and refuse a user format hook (a later cut).
 An `as` cast changes a value's width: an int widens to a float, a float
 changes width, and `as!` narrows a float to an int (truncating toward zero).
 A zero-length fixed array (`i64[0]`) is a `[0 x T]` value with no storage:
-it crosses a call and reads its `.len` as zero.
+it crosses a call and reads its `.len` as zero. A flat struct may hold a
+growable field (the C.2 resizable tail laid last): its `{ base, count }`
+header lives in the struct body, push, pop, append, `.len`, index and
+print reach it through a field path, and it binds as a fat-reference
+argument (`b.items`).
 An append's source may be a run built at
 the site: a growable-returning call, and an if of them, builds onto a
 scratch destination before its elements join the receiver. `copy(x)`
@@ -286,7 +290,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 68 of the codegen output fixtures pass through
+in the output now refuse. 69 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

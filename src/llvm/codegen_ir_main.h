@@ -442,7 +442,11 @@ struct CodeGenIR {
     static bool is_flat_struct(TypeExpr *t) {
         if (!t || t->kind != TY_STRUCT || !t->struc || !t->struc->inst) return false;
         auto *in = t->struc->inst;
-        if (in->sclass != SC_FIXED || in->failed || !in->st) return false;
+        // A struct with one resizable field laid last (the C.2 tail) is
+        // still a plain record: the field's own { base, count } header is
+        // its storage, and nothing grows into the struct's bytes.
+        if (in->sclass != SC_FIXED && in->sclass != SC_RESIZABLE) return false;
+        if (in->failed || !in->st) return false;
         // A generic instantiation may not have `flat` set even when every
         // concrete field is an int; fall through to the per-field check.
         if (!in->flat && in->ftypes.empty()) return false;
@@ -451,7 +455,7 @@ struct CodeGenIR {
             if (in->st->fields[i].ispad) return false;
             auto *ft = in->ftypes[i];
             if (!is_int_ty(ft) && !is_flt_ty(ft) && !is_flat_struct(ft)
-                && !is_slice_of(ft))
+                && !is_slice_of(ft) && !is_growable(ft))
                 return false;
         }
         return true;
@@ -478,6 +482,8 @@ struct CodeGenIR {
     llvm::Type *field_ll_ty(TypeExpr *ft) {
         if (is_flt_ty(ft)) return flt_ll_ty(ft);
         if (is_slice_of(ft)) return slice_ll_ty();
+        // A growable field's body is its gs_rhdr { base, count }.
+        if (is_growable(ft)) return slice_ll_ty();
         return is_int_ty(ft) ? int_ll_ty(ft) : struct_ll_ty(ft->struc->inst);
     }
 
@@ -573,6 +579,31 @@ struct CodeGenIR {
     // A growable array's header by name holder: a local of this walk, a
     // program global, or a reference (whose view is materialized here, the
     // pair loaded fresh so a rebind is seen). Null where the name is none.
+    // A growable field's RzArr from a field path (`b.items`): its header
+    // { base, count } lives in the struct body at the path's address. The
+    // returned view is held for the site that asked (rzviews).
+    FnWalk::RzArr *rz_head_field(FnWalk &w, Node *dot) {
+        auto *dt = Is<Dot>(dot);
+        if (!dt) return nullptr;
+        // A member callee (`b.items.push`): the path is its object.
+        Node *path = dt->IsField() ? (Node *)dt : (Node *)dt->obj;
+        llvm::Value *addr = nullptr;
+        StructInst *oi = nullptr;
+        TypeExpr *leaf = nullptr;
+        if (!field_path_addr(path, w, addr, oi, leaf) || !addr) return nullptr;
+        if (!is_growable(leaf)) return nullptr;
+        FnWalk::RzArr v;
+        v.hdr = addr;
+        v.slot = nullptr;   // No stack slot of its own here.
+        v.etype = leaf->arr->sub;
+        v.base = b.CreateInBoundsGEP(slice_ll_ty(), addr,
+                                     { idx0(), fld(0) }, "rzf.base");
+        v.len = b.CreateInBoundsGEP(slice_ll_ty(), addr,
+                                    { idx0(), fld(1) }, "rzf.len");
+        w.rzviews.push_back(v);
+        return &w.rzviews.back();
+    }
+
     FnWalk::RzArr *rz_head(FnWalk &w, VarDef *d) {
         auto lit = w.rzarrs.find(d);
         if (lit != w.rzarrs.end()) return &lit->second;
@@ -993,6 +1024,7 @@ struct CodeGenIR {
     // The runtime slot's top tracks the next free byte: past the len
     // elements (GEP by the element type is the byte arithmetic).
     void rz_sync_slot(FnWalk::RzArr &r, llvm::Value *basev, llvm::Value *lenv) {
+        if (!r.slot) return;   // A field's top lives in its own stack slot.
         auto *et = elem_ll_ty(r.etype);
         b.CreateStore(b.CreateInBoundsGEP(et, basev, lenv, "rztop"), r.slot);
     }
@@ -2008,6 +2040,18 @@ struct CodeGenIR {
             if (c->builtin == B_PUSH && c->args.size() == 1) {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+                auto *rfld = rd ? rz_head_field(w, rd) : nullptr;
+                if (rfld) {
+                    auto *v = GenExpr(c->args[0], w);
+                    if (!v) return nullptr;
+                    auto *basev = b.CreateLoad(i8ptr(), rfld->base, "rzbase");
+                    auto *lenv = b.CreateLoad(i64(), rfld->len, "rzlen");
+                    rz_store_elem(*rfld, basev, lenv, v);
+                    auto *nlen = b.CreateAdd(
+                        lenv, llvm::ConstantInt::get(i64(), 1), "rzlen+1");
+                    b.CreateStore(nlen, rfld->len);
+                    return nullptr;
+                }
                 if (recv && recv->vdef) {
                     auto *rit = rz_head(w, recv->vdef);
                     if (rit) {
@@ -2192,7 +2236,8 @@ struct CodeGenIR {
             if (c->builtin == B_APPEND && c->args.size() == 1) {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
-                auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
+                auto *r = recv && recv->vdef
+                    ? rz_head(w, recv->vdef) : rz_head_field(w, rd);
                 auto lit = recv && recv->vdef
                     ? w.limiteds.find(recv->vdef) : w.limiteds.end();
                 if (!r && lit == w.limiteds.end())
@@ -2327,7 +2372,8 @@ struct CodeGenIR {
             if (c->builtin == B_POP && c->args.empty()) {
                 auto *rd = Is<Dot>(c->callee);
                 auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
-                auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : nullptr;
+                auto *r = recv && recv->vdef
+                    ? rz_head(w, recv->vdef) : rz_head_field(w, rd);
                 auto lit = recv && recv->vdef
                     ? w.limiteds.find(recv->vdef) : w.limiteds.end();
                 if (!r && lit == w.limiteds.end())
@@ -3009,19 +3055,31 @@ struct CodeGenIR {
             }
             return false;
         }
-        // A field path whose leaf is a slice: the { data, len } the struct
-        // field holds (d.name, p.inner.list).
+        // A field path whose leaf is a slice or a growable array: the
+        // { data, len } the struct field holds (d.name, p.inner.list,
+        // b.items).
         if (auto *dt = Is<Dot>(n); dt && dt->IsField()) {
             llvm::Value *addr = nullptr;
             StructInst *oi = nullptr;
             TypeExpr *leaf = nullptr;
-            if (field_path_addr(dt, w, addr, oi, leaf)
-                && is_slice_of(leaf) && addr) {
-                auto *hdr = b.CreateLoad(slice_ll_ty(), addr, "svh");
-                out.data = b.CreateExtractValue(hdr, 0, "svd");
-                out.len = b.CreateExtractValue(hdr, 1, "svn");
-                out.etype = leaf->sub;
-                return true;
+            if (field_path_addr(dt, w, addr, oi, leaf) && addr) {
+                if (is_slice_of(leaf)) {
+                    auto *hdr = b.CreateLoad(slice_ll_ty(), addr, "svh");
+                    out.data = b.CreateExtractValue(hdr, 0, "svd");
+                    out.len = b.CreateExtractValue(hdr, 1, "svn");
+                    out.etype = leaf->sub;
+                    return true;
+                }
+                if (is_growable(leaf)) {
+                    // A growable field: its header's base and count are the
+                    // view (read at print time, so a push is seen).
+                    out.data = b.CreateLoad(i8ptr(),
+                        b.CreateStructGEP(slice_ll_ty(), addr, 0, "gvd"));
+                    out.len = b.CreateLoad(i64(),
+                        b.CreateStructGEP(slice_ll_ty(), addr, 1, "gvn"));
+                    out.etype = leaf->arr->sub;
+                    return true;
+                }
             }
         }
         auto *se = Is<SliceExpr>(n);
@@ -3863,9 +3921,13 @@ struct CodeGenIR {
         // given fields build, the rest keep their zero. A plain implicit
         // one (no defaultall) stays refused.
         if ((sl->implicit && !sl->defaultall)
-            || (!sl->defaultall && sl->inits.size() != in->st->fields.size()))
+            || (!sl->defaultall && sl->inits.size() != in->st->fields.size())) {
+            fprintf(stderr, "[dbg-esd] imp=%d da=%d inits=%zu fields=%zu\n",
+                    (int)sl->implicit, (int)sl->defaultall,
+                    sl->inits.size(), in->st->fields.size());
             return Unsup(cat("a struct value of type ", def.type->struc->st->name,
                              " the walk does not build at line ", (long long)vd->line.line));
+        }
         std::vector<int> at;
         for (size_t k = 0; k < sl->inits.size(); ++k) {
             int f = field_of_init(in, sl->inits[k], k);
@@ -3879,6 +3941,27 @@ struct CodeGenIR {
         for (size_t k = 0; k < sl->inits.size(); ++k) {
             auto f = (unsigned)at[k];
             auto *p = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
+            if (is_growable(in->ftypes[f])) {
+                // A growable field: its own data-stack slot, whose top the
+                // header's base takes (the empty run the literal gives).
+                auto *gslot = new llvm::GlobalVariable(
+                    *mod, i8ptr(), /*isConstant=*/false,
+                    llvm::GlobalValue::InternalLinkage,
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    cat("gs_stk", stk_slots.size()), nullptr,
+                    llvm::GlobalValue::GeneralDynamicTLSModel);
+                stk_slots.push_back(gslot);
+                auto *top = b.CreateLoad(i8ptr(), gslot,
+                                         llvm::Twine(in->st->fields[f].name,
+                                                     ".top"));
+                auto *gp = b.CreateStructGEP(slot->getAllocatedType(), slot, f);
+                b.CreateStore(top, b.CreateStructGEP(
+                    slot->getAllocatedType(), gp, 0, "gf.base"));
+                b.CreateStore(llvm::ConstantInt::get(i64(), 0),
+                              b.CreateStructGEP(
+                                  slot->getAllocatedType(), gp, 1, "gf.len"));
+                continue;
+            }
             if (is_flat_struct(in->ftypes[f])) {
                 // A nested struct field: the value its literal builds
                 // (a defaulted nested one keeps the zero, so a refusal
@@ -4606,6 +4689,9 @@ struct CodeGenIR {
                 if (is_flat_struct(vddef->type)) {
                     emit_struct_decl(vd, i, *vddef, w);
                     continue;
+                }
+                if (vddef->type->kind == TY_STRUCT) {
+                    fprintf(stderr, "[dbg-sd] not flat\n");
                 }
                 if (is_slice_of_int(vddef->type)) {
                     emit_slice_decl(vd, i, *vddef, w);
