@@ -403,6 +403,13 @@ struct CodeGenIR {
             && (is_int_ty(t->arr->sub) || is_flt_ty(t->arr->sub));
     }
 
+    // The { data, len } pair type for a slice of a walkable element
+    // (ints, floats, or flat structs).
+    llvm::StructType *slice_of_ll_ty(TypeExpr *sub) {
+        return llvm::StructType::get(ctx, { llvm::PointerType::get(
+            ctx, 0), i64() });
+    }
+
     llvm::ArrayType *fixed_ll_ty(TypeExpr *t) {
         return llvm::ArrayType::get(elem_ll_ty(t->arr->sub),
                                     (uint64_t)t->arr->size);
@@ -731,13 +738,15 @@ struct CodeGenIR {
                 else if (t->kind == TY_REF && is_flat_struct(t->ref->sub))
                     argtys.push_back(i8ptr());
                 else if (is_fixed_val(t)) argtys.push_back(fixed_ll_ty(t));
-                else if (t->kind == TY_REF && is_growable_i64(t->ref->sub)) {
+                else if (t->kind == TY_REF && is_growable(t->ref->sub)) {
                     // A reference to a growable array: the C backend's
                     // (gs_rhdr *, gs_stack *) pair, two pointers.
                     argtys.push_back(i8ptr());
                     argtys.push_back(i8ptr());
                 }
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
+                else if (t->kind == TY_SLICE && is_flat_struct(t->sub))
+                    argtys.push_back(slice_of_ll_ty(t->sub));
                 else if (is_flat_struct(t)) argtys.push_back(struct_ty(t));
                 else supported = false;
             }
@@ -799,6 +808,8 @@ struct CodeGenIR {
                 if (is_flt_ty(t)) argtys.push_back(flt_ll_ty(t));
                 else if (is_int_ty(t) || is_bool_ty(t)) argtys.push_back(i64ty);
                 else if (is_slice_of_int(t)) argtys.push_back(slice_ll_ty());
+                else if (t->kind == TY_SLICE && is_flat_struct(t->sub))
+                    argtys.push_back(slice_of_ll_ty(t->sub));
                 else if (t && t->kind == TY_REF && t->ref && t->ref->sub
                          && (is_int_ty(t->ref->sub) || is_flt_ty(t->ref->sub)))
                     argtys.push_back(i8ptr());
@@ -851,6 +862,14 @@ struct CodeGenIR {
                     argidx += 2;
                 } else if (is_slice_of_int(pt)) {
                     auto *slot = b.CreateAlloca(slice_ll_ty(), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(argidx), slot);
+                    w.slices[sp->params[i]] = { slot, pt->sub };
+                    argidx += 1;
+                } else if (pt && pt->kind == TY_SLICE && is_flat_struct(pt->sub)) {
+                    // A slice-of-struct parameter: the { data, len } pair
+                    // copied into the body's own alloca.
+                    auto *slot = b.CreateAlloca(slice_of_ll_ty(pt->sub), nullptr,
                                                 llvm::Twine(sp->params[i]->name));
                     b.CreateStore(fn->getArg(argidx), slot);
                     w.slices[sp->params[i]] = { slot, pt->sub };
@@ -3125,7 +3144,8 @@ struct CodeGenIR {
         if (!se) return false;
         SliceVal base;
         if (!slice_value(se->obj, w, base)) return false;
-        if (!is_int_ty(base.etype) && !is_flt_ty(base.etype)) return false;
+        if (!is_int_ty(base.etype) && !is_flt_ty(base.etype)
+            && !is_flat_struct(base.etype)) return false;
         auto *lenv = base.len;
         auto bound = [&](Node *bn, bool fromend, llvm::Value *dflt) -> llvm::Value * {
             if (!bn) return dflt;
@@ -3374,9 +3394,15 @@ struct CodeGenIR {
             return Unsup(cat("a slice value of ", type_label(def.type),
                              " the walk does not build at line ",
                              (long long)vd->line.line));
-        auto *slot = entry_alloca(w, slice_ll_ty(), llvm::Twine(def.name));
-        auto *hdr = b.CreateInsertValue(llvm::UndefValue::get(slice_ll_ty()),
-                                        sv.data, 0);
+        bool sostruct = is_flat_struct(def.type->sub);
+        auto *slty = sostruct ? slice_of_ll_ty(def.type->sub) : slice_ll_ty();
+        auto *slot = entry_alloca(w, slty, llvm::Twine(def.name));
+        auto *data = sv.data;
+        if (sostruct)
+            data = b.CreatePointerCast(sv.data,
+                llvm::PointerType::getUnqual(struct_ll_ty(
+                    def.type->sub->struc->inst)), "pssd");
+        auto *hdr = b.CreateInsertValue(llvm::UndefValue::get(slty), data, 0);
         hdr = b.CreateInsertValue(hdr, sv.len, 1);
         b.CreateStore(hdr, slot);
         w.slices[&def] = { slot, sv.etype };
@@ -3852,6 +3878,14 @@ struct CodeGenIR {
                 base = b.CreateLoad(i8ptr(), gr->base, "svb");
                 ety = gr->etype;
                 lenv = b.CreateLoad(i64(), gr->len, "svn");
+            } else if (auto sit2 = w.slices.find(obj->vdef);
+                       sit2 != w.slices.end()) {
+                // A slice of structs: the view's data and length.
+                auto *hdr = b.CreateLoad(slice_of_ll_ty(ety), sit2->second.base,
+                                         "svh");
+                base = b.CreateExtractValue(hdr, 0, "svd");
+                lenv = b.CreateExtractValue(hdr, 1, "svn");
+                ety = sit2->second.etype;
             } else return false;
             if (!is_flat_struct(ety)) return false;
             auto *idxv = GenExpr(ix->idx, w);
@@ -4144,21 +4178,38 @@ struct CodeGenIR {
             } else if (auto *pix = Is<Index>(dt->obj); pix
                        && is_flat_struct(pix->exprtype)) {
                 // An element of an array of structs: the element's address
-                // is the path's base (pair[1].name, ps[1].y).
+                // is the path's base (pair[1].name, ps[1].y, sp[0].x).
                 auto *obj = Is<Ident>(pix->obj);
                 auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef)
                                             : w.fixeds.end();
                 auto *gr = obj && obj->vdef && fit == w.fixeds.end()
                     ? rz_head(w, obj->vdef) : nullptr;
-                if (!gr && (fit == w.fixeds.end() || !fit->second.base))
+                bool hasslit = false;
+                if (!gr && (fit == w.fixeds.end() || !fit->second.base)
+                    && obj && obj->vdef) {
+                    auto slit = w.slices.find(obj->vdef);
+                    if (slit != w.slices.end()) hasslit = true;
+                }
+                if (!gr && !hasslit
+                    && (fit == w.fixeds.end() || !fit->second.base))
                     return false;
                 auto *idxv = GenExpr(pix->idx, w);
                 if (!idxv) return false;
-                auto *ety = gr ? gr->etype : fit->second.etype;
-                auto *countv = gr
-                    ? (llvm::Value *)b.CreateLoad(i64(), gr->len, "gxcnt")
-                    : (llvm::Value *)llvm::ConstantInt::get(
-                          i64(), (uint64_t)fit->second.count);
+                auto *ety = gr ? gr->etype : hasslit
+                    ? w.slices[obj->vdef].etype : fit->second.etype;
+                llvm::Value *countv = nullptr;
+                llvm::Value *slbase = nullptr;
+                if (gr) {
+                    countv = b.CreateLoad(i64(), gr->len, "gxcnt");
+                } else if (hasslit) {
+                    auto *hdr = b.CreateLoad(slice_of_ll_ty(ety),
+                        w.slices[obj->vdef].base, "slh");
+                    slbase = b.CreateExtractValue(hdr, 0, "slbase");
+                    countv = b.CreateExtractValue(hdr, 1, "slcnt");
+                } else {
+                    countv = llvm::ConstantInt::get(
+                        i64(), (uint64_t)fit->second.count);
+                }
                 if (!pix->nobc) {
                     auto *okbb = llvm::BasicBlock::Create(ctx, "fxsok", w.fn);
                     auto *failbb = llvm::BasicBlock::Create(ctx, "fxsfail", w.fn);
@@ -4178,6 +4229,9 @@ struct CodeGenIR {
                     addr = b.CreateInBoundsGEP(
                         elem_ll_ty(ety),
                         b.CreateLoad(i8ptr(), gr->base, "gxbase"), idxv, "gxsp");
+                } else if (hasslit) {
+                    addr = b.CreateInBoundsGEP(struct_ll_ty(inst), slbase,
+                                               idxv, "slsp");
                 } else {
                     addr = b.CreateInBoundsGEP(fit->second.base->getAllocatedType(),
                         fit->second.base,
@@ -4497,9 +4551,10 @@ struct CodeGenIR {
         for (auto *t : sp->argtypes)
             if (!is_int_ty(t) && !is_bool_ty(t) && !is_slice_of_int(t)
                 && !is_flat_struct(t) && !is_fixed_val(t)
+                && !(t && t->kind == TY_SLICE && is_flat_struct(t->sub))
                 && !(t && t->kind == TY_REF
                      && (is_int_ty(t->ref->sub)
-                         || is_growable_i64(t->ref->sub)
+                         || is_growable(t->ref->sub)
                          || is_flat_struct(t->ref->sub)))) return nullptr;
         for (auto *rt : sp->rets)
             if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_slice_of_int(rt)
@@ -4528,7 +4583,7 @@ struct CodeGenIR {
         // A reference to a growable array crosses a call as two pointers;
         // a growable result takes the (dst, rl) pair.
         for (auto *t : sp->argtypes)
-            if (t && t->kind == TY_REF && is_growable_i64(t->ref->sub))
+            if (t && t->kind == TY_REF && is_growable(t->ref->sub))
                 expect += 1;
         if (growret_) expect += 2;
         if (cf->getFunctionType()->getNumParams() != expect) return nullptr;
@@ -4541,6 +4596,19 @@ struct CodeGenIR {
                 if (!slice_value(a, w, sv)) return nullptr;
                 auto *hdr = b.CreateInsertValue(
                     llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
+                continue;
+            }
+            if (pt && pt->kind == TY_SLICE && is_flat_struct(pt->sub)) {
+                // A slice of structs: the { data, len } the view names,
+                // with the element as a pointer to its record.
+                SliceVal sv;
+                if (!slice_value(a, w, sv)) return nullptr;
+                auto *sty = llvm::PointerType::getUnqual(
+                    struct_ll_ty(pt->sub->struc->inst));
+                auto *hdr = b.CreateInsertValue(
+                    llvm::UndefValue::get(slice_of_ll_ty(pt->sub)),
+                    b.CreatePointerCast(sv.data, sty, "pssd"), 0);
                 args.push_back(b.CreateInsertValue(hdr, sv.len, 1));
                 continue;
             }
@@ -4825,7 +4893,9 @@ struct CodeGenIR {
                 }
                 if (vddef->type->kind == TY_STRUCT) {
                 }
-                if (is_slice_of_int(vddef->type)) {
+                if (vddef->type->kind == TY_SLICE
+                    && (is_int_ty(vddef->type->sub)
+                        || is_flat_struct(vddef->type->sub))) {
                     emit_slice_decl(vd, i, *vddef, w);
                     continue;
                 }

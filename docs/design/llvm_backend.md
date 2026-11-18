@@ -294,12 +294,15 @@ expression value reads as the header pointer (so `== null`, `!= null`
 and a bare `if o` test it), and `.=` binds it like a plain reference.
 A push in a value position (`let r = a.push(v)`) yields the pushed
 element (a copy, as the C backend takes from the slot) for growable,
-limited and field receivers alike.
+limited and field receivers alike. A slice of structs (`P[:]`) crosses a
+call as the { record*, count } pair: a parameter copies it into its own
+alloca, `ps[0].x` walks to the field through the view, and a slice
+local's re-pointing stores the whole pair.
 `goose llc`
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 70 of the codegen output fixtures pass through
+in the output now refuse. 71 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
