@@ -221,7 +221,11 @@ array literal in a view position resolves as its bytes or elements
 whatever array type the optimizer folded it to. `move_from` on int-array
 views checks lengths match (aborting with the runtime's message when
 they do not) and memmoves the source over the destination, so
-overlapping slices like `a[1..].move_from(a[..4])` shift correctly.
+overlapping slices like `a[1..].move_from(a[..4])` shift correctly; the
+element's byte count comes from the LLVM type's allocated size (a
+struct element moves whole), and a slice range's data steps by its
+element. Runtime failures name the source file and line (one internal
+`gs_fileN` constant per file), as the C backend's LocArgs do.
 `clear()` on a growable array drops its count to zero and its stack top
 back to the element region's base; on a static-capacity limited array it
 zeroes only the count. An optional reference (`T&?`, int or flat struct)
@@ -302,7 +306,7 @@ local's re-pointing stores the whole pair.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 71 of the codegen output fixtures pass through
+in the output now refuse. 73 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays

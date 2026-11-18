@@ -593,6 +593,37 @@ struct CodeGenIR {
         return gv;
     }
 
+    // A runtime failure's location arguments: the source file's name
+    // (one internal constant per file, NUL-terminated, as the C backend's
+    // gs_fileN) and the line.
+    std::unordered_map<int, llvm::GlobalVariable *> filerefs;
+    llvm::Value *loc_file(Line l) {
+        auto f = l.fileidx >= 0 && l.fileidx < (int)ast.sources.size()
+                     ? ast.sources[l.fileidx].first : string("?");
+        for (auto &c : f) if (c == '\\') c = '/';
+        auto it = filerefs.find(l.fileidx);
+        if (it != filerefs.end()) return it->second;
+        // A distinct global with a terminator: strlit_glob's bytes carry
+        // none, and the runtime prints the name as a C string.
+        auto *arr = llvm::ConstantDataArray::getString(
+            ctx, f, /*AddNull=*/true);
+        auto *gv = new llvm::GlobalVariable(
+            *mod, arr->getType(), /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, arr,
+            cat("gs_file", filerefs.size()));
+        filerefs.emplace(l.fileidx, gv);
+        return b.CreateInBoundsGEP(gv->getValueType(), gv,
+            { llvm::ConstantInt::get(i64(), 0),
+              llvm::ConstantInt::get(i64(), 0) }, "gs_file");
+    }
+    // The (file, line) pair a runtime failure call takes, at the node's
+    // line.
+    std::pair<llvm::Value *, llvm::Value *> loc_args(Node *n) {
+        return { loc_file(n->line), llvm::ConstantInt::get(
+                     llvm::Type::getInt32Ty(ctx),
+                     (uint64_t)(n->line.line > 0 ? n->line.line : 0)) };
+    }
+
     // A growable array's header by name holder: a local of this walk, a
     // program global, or a reference (whose view is materialized here, the
     // pair loaded fresh so a rebind is seen). Null where the name is none.
@@ -1167,9 +1198,9 @@ struct CodeGenIR {
                 b.SetInsertPoint(failbb);
                 b.CreateCall(f_gs_idxfail, {
                     c, lenv,
-                    llvm::ConstantPointerNull::get(i8ptr()),
-                    llvm::ConstantInt::get(
-                        llvm::Type::getInt32Ty(ctx), 0) });
+                    loc_file(ac->line),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                        (uint64_t)(ac->line.line > 0 ? ac->line.line : 0)) });
                 b.CreateUnreachable();
                 b.SetInsertPoint(okbb);
             }
@@ -1954,9 +1985,9 @@ struct CodeGenIR {
                         b.SetInsertPoint(failbb);
                         b.CreateCall(f_gs_idxfail, {
                             idxv, lenv,
-                            llvm::ConstantPointerNull::get(i8ptr()),
-                            llvm::ConstantInt::get(
-                                llvm::Type::getInt32Ty(ctx), 0) });
+                            loc_file(ix->line),
+                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                (uint64_t)(ix->line.line > 0 ? ix->line.line : 0)) });
                         b.CreateUnreachable();
                         b.SetInsertPoint(okbb);
                     }
@@ -1984,9 +2015,9 @@ struct CodeGenIR {
                         b.CreateCall(f_gs_idxfail, {
                             idxv,
                             llvm::ConstantInt::get(i64(), (uint64_t)gf.count),
-                            llvm::ConstantPointerNull::get(i8ptr()),
-                            llvm::ConstantInt::get(
-                                llvm::Type::getInt32Ty(ctx), 0) });
+                            loc_file(ix->line),
+                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                (uint64_t)(ix->line.line > 0 ? ix->line.line : 0)) });
                         b.CreateUnreachable();
                         b.SetInsertPoint(okbb);
                     }
@@ -2013,9 +2044,9 @@ struct CodeGenIR {
                         b.SetInsertPoint(failbb);
                         b.CreateCall(f_gs_idxfail, {
                             idxv, lenv,
-                            llvm::ConstantPointerNull::get(i8ptr()),
-                            llvm::ConstantInt::get(
-                                llvm::Type::getInt32Ty(ctx), 0) });
+                            loc_file(ix->line),
+                            llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                                (uint64_t)(ix->line.line > 0 ? ix->line.line : 0)) });
                         b.CreateUnreachable();
                         b.SetInsertPoint(okbb);
                     }
@@ -2036,9 +2067,9 @@ struct CodeGenIR {
                     b.SetInsertPoint(failbb);
                     b.CreateCall(f_gs_idxfail, {
                         idxv, sv.len,
-                        llvm::ConstantPointerNull::get(i8ptr()),
-                        llvm::ConstantInt::get(
-                            llvm::Type::getInt32Ty(ctx), 0) });
+                        loc_file(ix->line),
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                            (uint64_t)(ix->line.line > 0 ? ix->line.line : 0)) });
                     b.CreateUnreachable();
                     b.SetInsertPoint(okbb);
                 }
@@ -2267,8 +2298,12 @@ struct CodeGenIR {
                                            (uint64_t)c->line.line) });
                 b.CreateUnreachable();
                 b.SetInsertPoint(okbb);
-                auto *et = int_ll_ty(dst.etype);
-                auto esz = et->getPrimitiveSizeInBits() / 8;
+                auto *et = elem_ll_ty(dst.etype);
+                // A struct element has no primitive size: the byte count
+                // comes from the type's allocated size.
+                auto esz = et->isStructTy()
+                    ? mod->getDataLayout().getTypeAllocSize(et)
+                    : (uint64_t)(et->getPrimitiveSizeInBits() / 8);
                 if (esz) {
                     // The C backend moves with memmove: the destination
                     // and source may overlap (a[1..].move_from(a[..4])).
@@ -3157,7 +3192,8 @@ struct CodeGenIR {
         auto *hi = bound(se->hi, se->hi_from_end, lenv);
         if (!lo || !hi) return false;
         if (!se->nobc) slice_check(lo, hi, lenv, w);
-        out.data = b.CreateInBoundsGEP(int_ll_ty(base.etype), base.data, lo, "svd");
+        out.data = b.CreateInBoundsGEP(elem_ll_ty(base.etype), base.data, lo,
+                                       "svd");
         out.len = b.CreateSub(hi, lo, "svn");
         out.etype = base.etype;
         return true;
@@ -3898,9 +3934,9 @@ struct CodeGenIR {
                 b.SetInsertPoint(failbb);
                 b.CreateCall(f_gs_idxfail, {
                     idxv, lenv,
-                    llvm::ConstantPointerNull::get(i8ptr()),
-                    llvm::ConstantInt::get(
-                        llvm::Type::getInt32Ty(ctx), 0) });
+                    loc_file(ix->line),
+                    llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                        (uint64_t)(ix->line.line > 0 ? ix->line.line : 0)) });
                 b.CreateUnreachable();
                 b.SetInsertPoint(okbb);
             }
@@ -4218,9 +4254,9 @@ struct CodeGenIR {
                     b.SetInsertPoint(failbb);
                     b.CreateCall(f_gs_idxfail, {
                         idxv, countv,
-                        llvm::ConstantPointerNull::get(i8ptr()),
-                        llvm::ConstantInt::get(
-                            llvm::Type::getInt32Ty(ctx), 0) });
+                        loc_file(pix->line),
+                        llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx),
+                            (uint64_t)(pix->line.line > 0 ? pix->line.line : 0)) });
                     b.CreateUnreachable();
                     b.SetInsertPoint(okbb);
                 }
@@ -4421,8 +4457,8 @@ struct CodeGenIR {
             auto *failbb = llvm::BasicBlock::Create(ctx, "stfail", w.fn);
             b.CreateCondBr(b.CreateICmpULT(idx, limit, "stin"), okbb, failbb);
             b.SetInsertPoint(failbb);
-            b.CreateCall(f_gs_idxfail, { idx, limit, llvm::ConstantPointerNull::get(i8ptr()),
-                                         llvm::ConstantInt::get(llvm::Type::getInt32Ty(ctx), 0) });
+            auto [lf, ll] = loc_args(ix);
+            b.CreateCall(f_gs_idxfail, { idx, limit, lf, ll });
             b.CreateUnreachable();
             b.SetInsertPoint(okbb);
         };
