@@ -292,6 +292,9 @@ operands' float type. An optional reference to a growable array
 (`u8[>..]?`) holds the pair of two null pointers when null, its
 expression value reads as the header pointer (so `== null`, `!= null`
 and a bare `if o` test it), and `.=` binds it like a plain reference.
+A push in a value position (`let r = a.push(v)`) yields the pushed
+element (a copy, as the C backend takes from the slot) for growable,
+limited and field receivers alike.
 `goose llc`
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures

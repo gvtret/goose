@@ -2088,6 +2088,11 @@ struct CodeGenIR {
                             lenv, llvm::ConstantInt::get(i64(), 1), "rzlen+1");
                         b.CreateStore(nlen, r->len);
                         rz_sync_slot(*r, basev, nlen);
+                        // In a value position the push yields the pushed
+                        // element (a copy, as the C backend takes from the
+                        // slot); in a statement position it yields none.
+                        if (n->exprtype && n->exprtype->kind != TY_VOID)
+                            return rz_load_elem(*r, basev, lenv, "pv.val");
                         return nullptr;
                     }
                     // A static-capacity limited receiver: the same shape,
@@ -2123,6 +2128,10 @@ struct CodeGenIR {
                         b.CreateStore(b.CreateAdd(
                             nl, llvm::ConstantInt::get(i64(), 1), "limlen+1"),
                             lm.len);
+                        // A value position yields the element (the runtime
+                        // slot's top was the element's storage).
+                        if (n->exprtype && n->exprtype->kind != TY_VOID)
+                            return b.CreateLoad(et, p, "pv.val");
                         return nullptr;
                     }
                 }
@@ -3143,6 +3152,27 @@ struct CodeGenIR {
             && c->rettypes[0]->ref->optional;
     }
 
+    // A push in a value position (`let r = a.push(v)`, an argument, a
+    // render): the element lands at the array's top (the C backend copies
+    // it from the slot) and the value is that element.
+    llvm::Value *emit_push_value(Call *c, FnWalk &w) {
+        auto *rd = Is<Dot>(c->callee);
+        auto *recv = rd ? Is<Ident>(rd->obj) : nullptr;
+        auto *rfld = rd ? rz_head_field(w, rd) : nullptr;
+        auto *r = recv && recv->vdef ? rz_head(w, recv->vdef) : rfld;
+        if (!r) return nullptr;
+        auto *v = GenExpr(c->args[0], w);
+        if (!v) return nullptr;
+        auto *basev = b.CreateLoad(i8ptr(), r->base, "pv.base");
+        auto *lenv = b.CreateLoad(i64(), r->len, "pv.len");
+        rz_store_elem(*r, basev, lenv, v);
+        auto *nlen = b.CreateAdd(lenv, llvm::ConstantInt::get(i64(), 1),
+                                 "pv.len+");
+        b.CreateStore(nlen, r->len);
+        if (r->slot) rz_sync_slot(*r, basev, nlen);
+        return rz_load_elem(*r, basev, lenv, "pv.val");
+    }
+
     // A reference binding (`let px .= n`, `var r .= n`): one pointer
     // holder whose store is the variable the initializer names. The
     // initializer must be a variable this slice holds for now; an
@@ -4011,9 +4041,6 @@ struct CodeGenIR {
         // one (no defaultall) stays refused.
         if ((sl->implicit && !sl->defaultall)
             || (!sl->defaultall && sl->inits.size() != in->st->fields.size())) {
-            fprintf(stderr, "[dbg-esd] imp=%d da=%d inits=%zu fields=%zu\n",
-                    (int)sl->implicit, (int)sl->defaultall,
-                    sl->inits.size(), in->st->fields.size());
             return Unsup(cat("a struct value of type ", def.type->struc->st->name,
                              " the walk does not build at line ", (long long)vd->line.line));
         }
@@ -4797,7 +4824,6 @@ struct CodeGenIR {
                     continue;
                 }
                 if (vddef->type->kind == TY_STRUCT) {
-                    fprintf(stderr, "[dbg-sd] not flat\n");
                 }
                 if (is_slice_of_int(vddef->type)) {
                     emit_slice_decl(vd, i, *vddef, w);
