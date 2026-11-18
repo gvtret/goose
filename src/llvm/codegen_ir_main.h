@@ -381,15 +381,19 @@ struct CodeGenIR {
             && is_int_ty(t->arr->sub);
     }
 
-    // A growable array of a walkable element (int or float).
+    // A growable array of a walkable element (int, float, or a flat
+    // struct).
     static bool is_growable(TypeExpr *t) {
         return t && t->kind == TY_ARRAY && t->arr->akind == A_GROW
-            && (is_int_ty(t->arr->sub) || is_flt_ty(t->arr->sub));
+            && (is_int_ty(t->arr->sub) || is_flt_ty(t->arr->sub)
+                || is_flat_struct(t->arr->sub));
     }
 
     // The element storage type of a growable array's element type.
     llvm::Type *elem_ll_ty(TypeExpr *et) {
-        return is_flt_ty(et) ? flt_ll_ty(et) : int_ll_ty(et);
+        if (is_flt_ty(et)) return flt_ll_ty(et);
+        if (is_flat_struct(et)) return struct_ll_ty(et->struc->inst);
+        return int_ll_ty(et);
     }
 
     // A fixed array of walkable elements as a first-class value (the C
@@ -1059,6 +1063,8 @@ struct CodeGenIR {
                 ev = r.etype->fltstorage == FS_F32
                     ? b.CreateFPTrunc(v, et, "fxnarrow")
                     : b.CreateFPExt(v, et, "fwiden");
+        } else if (is_flat_struct(r.etype)) {
+            // A struct element stores whole.
         } else {
             ev = b.CreateTrunc(as_i64(v), et);
         }
@@ -1072,7 +1078,8 @@ struct CodeGenIR {
                               llvm::Value *idx, const llvm::Twine &name) {
         auto *et = elem_ll_ty(r.etype);
         auto *v = b.CreateLoad(et, b.CreateInBoundsGEP(et, basev, idx), name);
-        if (et == i64() || is_flt_ty(r.etype)) return v;
+        if (et == i64() || is_flt_ty(r.etype) || is_flat_struct(r.etype))
+            return v;
         return is_uint_ty(r.etype) ? b.CreateZExt(v, i64()) : b.CreateSExt(v, i64());
     }
 
@@ -3799,6 +3806,46 @@ struct CodeGenIR {
             out = b.CreateLoad(struct_ll_ty(inst), addr, "stv");
             return true;
         }
+        if (auto *ix = Is<Index>(n)) {
+            // An element of an array of structs: the value at its place.
+            auto *obj = Is<Ident>(ix->obj);
+            if (!obj || !obj->vdef) return false;
+            llvm::Value *base = nullptr;
+            TypeExpr *ety = nullptr;
+            llvm::Value *lenv = nullptr;
+            if (auto fit = w.fixeds.find(obj->vdef);
+                fit != w.fixeds.end() && fit->second.base) {
+                base = fit->second.base;
+                ety = fit->second.etype;
+                lenv = llvm::ConstantInt::get(i64(), (uint64_t)fit->second.count);
+            } else if (auto *gr = rz_head(w, obj->vdef)) {
+                base = b.CreateLoad(i8ptr(), gr->base, "svb");
+                ety = gr->etype;
+                lenv = b.CreateLoad(i64(), gr->len, "svn");
+            } else return false;
+            if (!is_flat_struct(ety)) return false;
+            auto *idxv = GenExpr(ix->idx, w);
+            if (!idxv) return false;
+            if (!ix->nobc) {
+                auto *okbb = llvm::BasicBlock::Create(ctx, "svixok", w.fn);
+                auto *failbb = llvm::BasicBlock::Create(ctx, "svixfail", w.fn);
+                b.CreateCondBr(b.CreateICmpULT(idxv, lenv, "svixin"),
+                               okbb, failbb);
+                b.SetInsertPoint(failbb);
+                b.CreateCall(f_gs_idxfail, {
+                    idxv, lenv,
+                    llvm::ConstantPointerNull::get(i8ptr()),
+                    llvm::ConstantInt::get(
+                        llvm::Type::getInt32Ty(ctx), 0) });
+                b.CreateUnreachable();
+                b.SetInsertPoint(okbb);
+            }
+            inst = ety->struc->inst;
+            out = b.CreateLoad(struct_ll_ty(inst),
+                               b.CreateInBoundsGEP(elem_ll_ty(ety), base, idxv,
+                                                   "svixp"), "svix");
+            return true;
+        }
         if (auto *sl = Is<StructLit>(n)) {
             if (!sl->exprtype || !is_flat_struct(sl->exprtype)) return false;
             inst = sl->exprtype->struc->inst;
@@ -4069,38 +4116,46 @@ struct CodeGenIR {
                     "refcast");
             } else if (auto *pix = Is<Index>(dt->obj); pix
                        && is_flat_struct(pix->exprtype)) {
-                // An element of a fixed array of structs: the element's
-                // address is the path's base (pair[1].name).
+                // An element of an array of structs: the element's address
+                // is the path's base (pair[1].name, ps[1].y).
                 auto *obj = Is<Ident>(pix->obj);
                 auto fit = obj && obj->vdef ? w.fixeds.find(obj->vdef)
                                             : w.fixeds.end();
-                if (fit == w.fixeds.end() || !fit->second.base) return false;
+                auto *gr = obj && obj->vdef && fit == w.fixeds.end()
+                    ? rz_head(w, obj->vdef) : nullptr;
+                if (!gr && (fit == w.fixeds.end() || !fit->second.base))
+                    return false;
                 auto *idxv = GenExpr(pix->idx, w);
                 if (!idxv) return false;
+                auto *ety = gr ? gr->etype : fit->second.etype;
+                auto *countv = gr
+                    ? (llvm::Value *)b.CreateLoad(i64(), gr->len, "gxcnt")
+                    : (llvm::Value *)llvm::ConstantInt::get(
+                          i64(), (uint64_t)fit->second.count);
                 if (!pix->nobc) {
                     auto *okbb = llvm::BasicBlock::Create(ctx, "fxsok", w.fn);
                     auto *failbb = llvm::BasicBlock::Create(ctx, "fxsfail", w.fn);
-                    b.CreateCondBr(b.CreateICmpULT(idxv,
-                        llvm::ConstantInt::get(i64(),
-                            (uint64_t)fit->second.count), "fxsok"),
+                    b.CreateCondBr(b.CreateICmpULT(idxv, countv, "fxsok"),
                         okbb, failbb);
                     b.SetInsertPoint(failbb);
                     b.CreateCall(f_gs_idxfail, {
-                        idxv,
-                        llvm::ConstantInt::get(i64(),
-                            (uint64_t)fit->second.count),
+                        idxv, countv,
                         llvm::ConstantPointerNull::get(i8ptr()),
                         llvm::ConstantInt::get(
                             llvm::Type::getInt32Ty(ctx), 0) });
                     b.CreateUnreachable();
                     b.SetInsertPoint(okbb);
                 }
-                auto *ety = fit->second.etype;
-                auto *esty = struct_ll_ty(ety->struc->inst);
                 inst = ety->struc->inst;
-                addr = b.CreateInBoundsGEP(fit->second.base->getAllocatedType(),
-                    fit->second.base,
-                    { llvm::ConstantInt::get(i64(), 0), idxv }, "fxsp");
+                if (gr) {
+                    addr = b.CreateInBoundsGEP(
+                        elem_ll_ty(ety),
+                        b.CreateLoad(i8ptr(), gr->base, "gxbase"), idxv, "gxsp");
+                } else {
+                    addr = b.CreateInBoundsGEP(fit->second.base->getAllocatedType(),
+                        fit->second.base,
+                        { llvm::ConstantInt::get(i64(), 0), idxv }, "fxsp");
+                }
             } else if (sit != w.structs.end()) {
                 inst = sit->second.inst;
                 addr = sit->second.base;
@@ -5071,7 +5126,8 @@ struct CodeGenIR {
                 bool reload = iid && iid->vdef && w.slices.count(iid->vdef);
                 TypeExpr *etype = gr ? gr->etype
                     : fa ? fa->etype : la ? la->etype : sv.etype;
-                llvm::Type *et = int_ll_ty(etype);
+                llvm::Type *et = is_flat_struct(etype)
+                    ? struct_ll_ty(etype->struc->inst) : int_ll_ty(etype);
                 auto *fn = w.fn;
                 auto *condbb = llvm::BasicBlock::Create(ctx, "for_cond", fn);
                 auto *bodybb = llvm::BasicBlock::Create(ctx, "for_body", fn);
@@ -5123,8 +5179,8 @@ struct CodeGenIR {
                     // A struct-element binder: its slot is the element's
                     // address cast into the struct's own storage, and the
                     // walk reads it as a struct local.
-                    llvm::Value *ep = fa
-                        ? (fa->base
+                    llvm::Value *ep =
+                        fa ? (fa->base
                             ? (llvm::Value *)b.CreateInBoundsGEP(
                                 fa->base->getAllocatedType(), fa->base,
                                 { llvm::ConstantInt::get(i64(), 0), iv },
@@ -5134,6 +5190,10 @@ struct CodeGenIR {
                         : la ? (llvm::Value *)b.CreateInBoundsGEP(
                             la->base->getAllocatedType(), la->base,
                             { llvm::ConstantInt::get(i64(), 0), iv }, "for_sp")
+                        : gr ? (llvm::Value *)b.CreateInBoundsGEP(
+                            elem_ll_ty(etype),
+                            b.CreateLoad(i8ptr(), gr->base, "for_gb"), iv,
+                            "for_sp")
                              : (llvm::Value *)b.CreateInBoundsGEP(et, sv.data,
                                                                   iv, "for_sp");
                     auto *slot = entry_alloca(

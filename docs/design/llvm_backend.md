@@ -268,7 +268,11 @@ it crosses a call and reads its `.len` as zero. A flat struct may hold a
 growable field (the C.2 resizable tail laid last): its `{ base, count }`
 header lives in the struct body, push, pop, append, `.len`, index and
 print reach it through a field path, and it binds as a fat-reference
-argument (`b.items`). A growable field of a flat-struct global stays a
+argument (`b.items`). A growable array of flat structs (`P[>..]`) works
+like one of ints: push stores the whole element, print renders each
+through the struct renderer, a `for` binds each element as a struct, and
+`ps[1].y` and `ps[0].x = 10` reach an element's fields (a pop reads the
+element back). A growable field of a flat-struct global stays a
 later cut: its stack is shared with every alias of the struct (the root
 classes), which the walk does not track yet.
 An append's source may be a run built at
@@ -292,7 +296,7 @@ and a bare `if o` test it), and `.=` binds it like a plain reference.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 69 of the codegen output fixtures pass through
+in the output now refuse. 70 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
