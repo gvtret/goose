@@ -294,6 +294,20 @@ struct CodeGenIR {
             TypeExpr *etype = nullptr;
         };
         std::unordered_map<VarDef *, SliceLoc> slices;
+        // Fixed-mode enum locals: a { tag, payload } alloca and the enum
+        // type (for the payload's layout and the variants' tags).
+        struct EnumLoc {
+            llvm::AllocaInst *base = nullptr;
+            TypeExpr *etype = nullptr;
+        };
+        std::unordered_map<VarDef *, EnumLoc> enums;
+        // Variant payload parameters (a case function's `s` in
+        // `fn area(s: Shape.Circle)`): the payload struct's own alloca.
+        struct PayloadLoc {
+            llvm::AllocaInst *base = nullptr;
+            TypeExpr *vtype = nullptr;
+        };
+        std::unordered_map<VarDef *, PayloadLoc> payloads;
         std::vector<Loop> loops;
     };
 
@@ -408,6 +422,84 @@ struct CodeGenIR {
     llvm::StructType *slice_of_ll_ty(TypeExpr *sub) {
         return llvm::StructType::get(ctx, { llvm::PointerType::get(
             ctx, 0), i64() });
+    }
+
+    // A fixed-mode enum as the C backend lays it out: the tag byte (a
+    // variant count over 256 takes two) followed by the largest payload's
+    // storage; no payload members means the tag alone.
+    std::unordered_map<EnumInst *, llvm::StructType *> enumtys;
+    llvm::Type *enum_ll_ty(TypeExpr *t) {
+        auto *ei = t->enu->inst;
+        if (auto it = enumtys.find(ei); it != enumtys.end())
+            return it->second;
+        auto *en = t->enu->en;
+        llvm::Type *tagty = en->variants.size() <= 256
+            ? (llvm::Type *)llvm::Type::getInt8Ty(ctx)
+            : (llvm::Type *)llvm::Type::getInt16Ty(ctx);
+        uint64_t paysz = 0, payalign = 1;
+        auto &dl = mod->getDataLayout();
+        for (auto &v : en->variants) {
+            // A variant's size and alignment sum over its fields the way
+            // the C backend's packed layout does; a field kind the walk
+            // does not hold refuses the whole enum.
+            uint64_t vsz = 0, valign = 1;
+            for (auto &f : v.fields) {
+                auto *ft = ftype_ll(f);
+                if (!ft) return nullptr;
+                vsz += dl.getTypeAllocSize(ft);
+                valign = std::max(valign,
+                    (uint64_t)dl.getABITypeAlign(ft).value());
+            }
+            paysz = std::max(paysz, vsz);
+            payalign = std::max(payalign, valign);
+        }
+        // The payload area: the widest payload rounded to its alignment,
+        // addressed through an i8 array (byte offset tag_size past the
+        // value's start, as the C union sits right after the tag).
+        uint64_t tagsz = tagty->getPrimitiveSizeInBits() / 8;
+        llvm::SmallVector<llvm::Type *, 2> elems = { tagty };
+        if (paysz) {
+            uint64_t area = (paysz + payalign - 1) / payalign * payalign;
+            uint64_t pad = (payalign - tagsz % payalign) % payalign;
+            elems.push_back(llvm::ArrayType::get(llvm::Type::getInt8Ty(ctx),
+                                                 pad + area));
+        }
+        auto *r = llvm::StructType::get(ctx, elems);
+        enumtys.emplace(ei, r);
+        return r;
+    }
+
+    // A field's LLVM type for enum payload layout purposes: the walkable
+    // kinds only (ints, floats, bools, slices, references, nested flat
+    // structs).
+    llvm::Type *ftype_ll(const Field &f) {
+        auto *t = f.type;
+        if (is_int_ty(t)) return int_ll_ty(t);
+        if (is_flt_ty(t)) return flt_ll_ty(t);
+        if (is_bool_ty(t)) return llvm::Type::getInt8Ty(ctx);
+        if (t->kind == TY_SLICE) return slice_ll_ty();
+        if (t->kind == TY_REF) return i8ptr();
+        if (t->kind == TY_STRUCT && t->struc->inst)
+            return struct_ll_ty(t->struc->inst);
+        return nullptr;
+    }
+
+    // A variant payload as a first-class value (the case function's
+    // parameter): the fields in order, or the one-byte placeholder the
+    // C backend's gs_empty gives an empty payload.
+    llvm::Type *enum_variant_ll_ty(TypeExpr *vt) {
+        auto *var = vt->var->variant;
+        if (!var) return nullptr;
+        if (var->fields.empty())
+            return llvm::StructType::get(ctx,
+                                         { llvm::Type::getInt8Ty(ctx) });
+        llvm::SmallVector<llvm::Type *, 4> elems;
+        for (auto &f : var->fields) {
+            auto *ft = ftype_ll(f);
+            if (!ft) return nullptr;
+            elems.push_back(ft);
+        }
+        return llvm::StructType::get(ctx, elems);
     }
 
     llvm::ArrayType *fixed_ll_ty(TypeExpr *t) {
@@ -779,7 +871,16 @@ struct CodeGenIR {
                 else if (t->kind == TY_SLICE && is_flat_struct(t->sub))
                     argtys.push_back(slice_of_ll_ty(t->sub));
                 else if (is_flat_struct(t)) argtys.push_back(struct_ty(t));
-                else supported = false;
+                else if (t->kind == TY_VARIANT && t->var->adt
+                         && t->var->adt->enu->inst
+                         && enum_variant_ll_ty(t))
+                    argtys.push_back(enum_variant_ll_ty(t));
+                else if (t->kind == TY_ENUM && t->enu->inst
+                         && enum_ll_ty(t))
+                    argtys.push_back(enum_ll_ty(t));
+                else {
+                    supported = false;
+                }
             }
             // Return protocol: ret0 is the call's value, every other
             // result an out-pointer parameter the callee writes; a single
@@ -789,7 +890,8 @@ struct CodeGenIR {
             bool allretint = true;
             bool growret = sp->rets.size() == 1 && is_growable_i64(sp->rets[0]);
             for (auto *rt : sp->rets)
-                if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_flat_struct(rt))
+                if (!is_int_ty(rt) && !is_bool_ty(rt) && !is_flat_struct(rt)
+                    && !is_flt_ty(rt))
                     allretint = false;
             llvm::Type *retty = voidty();
             if (growret) {
@@ -807,6 +909,8 @@ struct CodeGenIR {
                     retty = fixed_ll_ty(sp->rets[0]);
                 else if (sp->rets.size() == 1 && is_flat_ref(sp->rets[0]))
                     retty = i8ptr();
+                else if (sp->rets.size() == 1 && is_flt_ty(sp->rets[0]))
+                    retty = flt_ll_ty(sp->rets[0]);
                 else if ((is_int_ty(sp->rets[0]) || is_bool_ty(sp->rets[0]))
                          && allretint)
                     retty = i64ty;
@@ -932,6 +1036,23 @@ struct CodeGenIR {
                     w.fixeds[sp->params[i]] = { slot, pt->arr->size,
                                                 pt->arr->sub };
                     argidx += 1;
+                } else if (pt && pt->kind == TY_ENUM && enum_ll_ty(pt)) {
+                    // A fixed-mode enum parameter: the whole { tag,
+                    // payload } value copied into the body's alloca.
+                    auto *slot = b.CreateAlloca(enum_ll_ty(pt), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(argidx), slot);
+                    w.enums[sp->params[i]] = { slot, pt };
+                    argidx += 1;
+                } else if (pt && pt->kind == TY_VARIANT
+                           && enum_variant_ll_ty(pt)) {
+                    // A variant payload parameter (a case function's): the
+                    // payload struct copied into the body's alloca.
+                    auto *slot = b.CreateAlloca(enum_variant_ll_ty(pt), nullptr,
+                                                llvm::Twine(sp->params[i]->name));
+                    b.CreateStore(fn->getArg(argidx), slot);
+                    w.payloads[sp->params[i]] = { slot, pt };
+                    argidx += 1;
                 } else if (!pt || is_int_ty(pt) || is_bool_ty(pt)) {
                     // An int parameter lives in a slot of the body's own from
                     // the start: a loop that reassigns it each round (the
@@ -1010,6 +1131,15 @@ struct CodeGenIR {
         if (auto *id = Is<Ident>(val)) {
             auto *r = id->vdef ? rz_head(w, id->vdef) : nullptr;
             if (r) { emit_growable_into(r, dst, rl, w); return true; }
+        }
+        // A dispatch call as the run source: the tag picks the arm, and the
+        // arm's case builds into this scratch destination (the run form).
+        if (auto *dc = Is<Call>(val); dc && !dc->dispatch.empty()
+            && dc->rettypes.size() == 1 && is_growable_i64(dc->rettypes[0])) {
+            FnWalk::RzArr scratch { dst, rl, nullptr, nullptr,
+                                    dc->rettypes[0]->arr->sub };
+            emit_dispatch_call(dc, w, &scratch);
+            return true;
         }
         if (auto *ifx = Is<IfExpr>(val)) {
             // `if c { f() } else { g() }` as a run source: the condition
@@ -1475,6 +1605,14 @@ struct CodeGenIR {
             }
             if (!rc->spec || rc->spec->rets.size() != 1
                 || !is_growable_i64(rc->spec->rets[0])) {
+                if (!rc->dispatch.empty()
+                    && rc->rettypes.size() == 1
+                    && is_growable_i64(rc->rettypes[0])) {
+                    // A dispatch call's growable result: every arm writes
+                    // this local's (dst, rl) pair (the run form).
+                    emit_dispatch_call(rc, w, &r);
+                    return;
+                }
                 w.rzarrs.erase(&def);
                 return Unsup(cat("a growable initializer that is not a "
                                  "literal or a call at line ",
@@ -1775,6 +1913,14 @@ struct CodeGenIR {
                 if (fit2 != w.floats.end())
                     return b.CreateLoad(flt_ll_ty(id->vdef->type),
                                         fit2->second.base,
+                                        llvm::Twine(id->vdef->name));
+                // A fixed-mode enum local reads as its whole value (the
+                // { tag, payload } the dispatch switch and an assignment
+                // take).
+                auto enit = w.enums.find(id->vdef);
+                if (enit != w.enums.end())
+                    return b.CreateLoad(enum_ll_ty(id->vdef->type),
+                                        enit->second.base,
                                         llvm::Twine(id->vdef->name));
                 // An optional reference to a growable array reads as its
                 // header pointer: null when unset, else the array's hdr
@@ -2083,6 +2229,18 @@ struct CodeGenIR {
             return nullptr;
         }
         if (auto *c = Is<Call>(n)) {
+            // A variant dispatch call in a value position: the tag picks
+            // the case, the case's value is the call's.
+            if (!c->dispatch.empty() && c->rettypes.size() == 1
+                && (is_int_ty(c->rettypes[0]) || is_bool_ty(c->rettypes[0])
+                    || is_flt_ty(c->rettypes[0])
+                    || is_flat_struct(c->rettypes[0]))) {
+                auto *v = emit_dispatch_call(c, w);
+                if (!v) return nullptr;
+                return is_flt_ty(c->rettypes[0])
+                    ? b.CreateSIToFP(v, flt_ll_ty(c->rettypes[0]), "dcf")
+                    : v;
+            }
             // push (memberof a.f spelling: the receiver is the callee's
             // Dot obj, args holds only the value) on a growable i64 array
             // local: store the element at base+len, bump len, and keep the
@@ -2671,9 +2829,15 @@ struct CodeGenIR {
             // call's value, rets 1.. through out-pointer params the
             // multi-return callee writes; a value context needs exactly
             // one result.
-            if (!c->dispatch.empty())
-                return Unsup(cat("a variant dispatch call at line ",
-                                 (long long)c->line.line)), nullptr;
+            if (!c->dispatch.empty()) {
+                auto *v = emit_dispatch_call(c, w);
+                if (!v && !c->rettypes.empty()
+                    && (is_int_ty(c->rettypes[0])
+                        || is_bool_ty(c->rettypes[0])))
+                    return Unsup(cat("a variant dispatch call at line ",
+                                     (long long)c->line.line)), nullptr;
+                return v;
+            }
             if (c->spec) {
                 auto *v = EmitDirectCall(c, w, nullptr);
                 if (!v) return nullptr;
@@ -3208,7 +3372,147 @@ struct CodeGenIR {
             && c->rettypes[0]->ref->optional;
     }
 
-    // A push in a value position (`let r = a.push(v)`, an argument, a
+    // A variant dispatch call (section 8.2): the arguments run once in order
+    // (the dispatched one materializes into a fixed-mode local), the tag
+    // picks the arm, and each arm calls its case specialization with the
+    // matching variant's payload. All arms' results land in the same
+    // channels, as the C backend's EmitDispatch builds them: a single
+    // int/bool result becomes the call's value here; everything else is a
+    // later cut.
+    llvm::Value *emit_dispatch_call(Call *c, FnWalk &w,
+                                    FnWalk::RzArr *growdst = nullptr) {
+        auto pos = c->dispatcharg;
+        auto *sp0 = c->dispatch[0];
+        if (!sp0 || pos < 0 || pos >= (int)sp0->argtypes.size())
+            return nullptr;
+        // A single int/bool result, or a single growable one (the run
+        // form: every arm writes the caller's (dst, rl) pair). Multi-result
+        // and slice results are a later cut.
+        bool growret = growdst && c->rettypes.size() == 1
+            && is_growable_i64(c->rettypes[0]);
+        if (!growret)
+            for (size_t r = 0; r < c->rettypes.size(); ++r)
+                if (!is_int_ty(c->rettypes[r]) && !is_bool_ty(c->rettypes[r])
+                    && !is_flt_ty(c->rettypes[r])
+                    && !is_flat_struct(c->rettypes[r]))
+                    return nullptr;
+        // Case functions agree on their returns, so every arm stores the
+        // same LLVM type (an int result is i64, a float its width, a flat
+        // struct its record).
+        llvm::Type *retty2 = growret
+            ? nullptr
+            : is_flt_ty(c->rettypes[0])
+                ? (llvm::Type *)flt_ll_ty(c->rettypes[0])
+            : is_flat_struct(c->rettypes[0])
+                ? (llvm::Type *)struct_ll_ty(c->rettypes[0]->struc->inst)
+                : (llvm::Type *)i64();
+        // Non-dispatch parameters must take plain int/bool/float values.
+        for (size_t i = 0; i < c->args.size(); ++i) {
+            if ((int)i == pos) continue;
+            auto *pt = i < sp0->argtypes.size() ? sp0->argtypes[i] : nullptr;
+            if (!is_int_ty(pt) && !is_bool_ty(pt) && !is_flt_ty(pt))
+                return nullptr;
+        }
+        // The scrutinee's enum type: a plain value only (by-reference
+        // dispatch is a later cut).
+        auto *sn = c->args[pos];
+        auto *et = sn ? sn->exprtype : nullptr;
+        if (!et || et->kind != TY_ENUM || et->enu->varmode) return nullptr;
+        auto *en = et->enu->en;
+        auto nvar = en->variants.size();
+        if (c->dispatch.size() != nvar) return nullptr;
+        // The enum local the scrutinee lands in (the tag reads twice: the
+        // switch and each arm's payload copy).
+        auto *ety = enum_ll_ty(et);
+        auto *slot = entry_alloca(w, ety, "disp");
+        auto *sv = GenExpr(sn, w);
+        if (!sv) return nullptr;
+        // The scrutinee's value: an enum expression builds { tag, ... }
+        // (a variant literal) or loads a local's storage.
+        if (sv->getType() != ety) return nullptr;
+        b.CreateStore(sv, slot);
+        // The other arguments, evaluated once before the tag picks.
+        std::vector<llvm::Value *> shared;
+        for (size_t i = 0; i < c->args.size(); ++i) {
+            if ((int)i == pos) { shared.push_back(nullptr); continue; }
+            auto *v = GenExpr(c->args[i], w);
+            if (!v) return nullptr;
+            shared.push_back(v);
+        }
+        // The result channels: one i64 slot the arms store into (or none
+        // for void).
+        llvm::AllocaInst *retslot = nullptr;
+        if (!c->rettypes.empty() && !growret)
+            retslot = entry_alloca(w, retty2, "dispret");
+        // switch (slot.tag)
+        auto *sw = b.CreateSwitch(b.CreateLoad(
+            ety->getStructElementType(0), slot, "disp.tag"),
+            llvm::BasicBlock::Create(ctx, "disp.def", w.fn),
+            (unsigned)nvar);
+        auto *merge = llvm::BasicBlock::Create(ctx, "disp.done", w.fn);
+        for (size_t vi = 0; vi < nvar; ++vi) {
+            auto *sp = c->dispatch[vi];
+            auto *arm = llvm::BasicBlock::Create(ctx, "disp.arm", w.fn);
+            b.SetInsertPoint(arm);
+            // The case's own argument list: the payload copy first, the
+            // shared ones in their places.
+            std::vector<llvm::Value *> args;
+            string cname = sp->sf->cname.empty()
+                ? string(sp->sf->name) : sp->sf->cname;
+            if (name_counts[sp->sf->qname] > 1)
+                cname += cat("_", sp->id);
+            auto callee = mod->getFunction(cname);
+            if (!callee
+                || callee->getFunctionType()->getNumParams()
+                       != sp->argtypes.size())
+                return nullptr;
+            bool ok = true;
+            for (size_t i = 0; i < sp->argtypes.size() && ok; ++i) {
+                if ((int)i == pos) {
+                    // The payload: an empty variant's one-byte zero (the
+                    // C backend's gs_empty placeholder), a payload's
+                    // fields copied from the byte area past the tag.
+                    auto &var2 = en->variants[vi];
+                    if (var2.fields.empty()) {
+                        args.push_back(llvm::Constant::getNullValue(
+                            enum_variant_ll_ty(
+                                sp->argtypes[i])));
+                    } else {
+                        auto *pyty = enum_variant_ll_ty(sp->argtypes[i]);
+                        if (!pyty) { ok = false; break; }
+                        auto *payp = ety->getStructNumElements() > 1
+                            ? (llvm::Value *)b.CreateStructGEP(ety, slot, 1,
+                                                               "disp.p")
+                            : (llvm::Value *)llvm::ConstantPointerNull::get(
+                                  i8ptr());
+                        auto *pv = b.CreateLoad(pyty, payp, "disp.v");
+                        args.push_back(pv);
+                    }
+                    continue;
+                }
+                args.push_back(shared[i]);
+            }
+            if (!ok) return nullptr;
+            if (growret) {
+                args.push_back(growdst->base);
+                args.push_back(growdst->len);
+            }
+            auto *cv = b.CreateCall(callee, args);
+            if (retslot) b.CreateStore(cv, retslot);
+            b.CreateBr(merge);
+                auto *k = llvm::ConstantInt::get(
+                llvm::cast<llvm::IntegerType>(
+                    ety->getStructElementType(0)), (uint64_t)vi);
+            sw->addCase(k, arm);
+        }
+        b.SetInsertPoint(sw->getDefaultDest());
+        // A tag the walk never built is unreachable (the checker proved
+        // exhaustiveness).
+        b.CreateUnreachable();
+        b.SetInsertPoint(merge);
+        return retslot ? b.CreateLoad(retty2, retslot, "disp.ret") : nullptr;
+    }
+
     // render): the element lands at the array's top (the C backend copies
     // it from the slot) and the value is that element.
     llvm::Value *emit_push_value(Call *c, FnWalk &w) {
@@ -3678,8 +3982,9 @@ struct CodeGenIR {
                 continue;
             }
             if (!an->exprtype
-                || (!is_int_ty(an->exprtype) && !is_bool_ty(an->exprtype)))
+                || (!is_int_ty(an->exprtype) && !is_bool_ty(an->exprtype))) {
                 return false;
+            }
             auto *x = GenExpr(an, w);
             if (!x) return false;
             auto *cur = b.CreateLoad(i8ptr(), cura);
@@ -3864,6 +4169,57 @@ struct CodeGenIR {
     // temporary, a call whose one result is the struct, or an inlined
     // body's PHI. False when the walk does not hold the value.
     bool struct_value(Node *n, FnWalk &w, llvm::Value *&out, StructInst *&inst) {
+        // A variant literal (`Choice.One {}`, `Shape.Circle { r: 1.0 }`)
+        // builds the fixed-mode enum value: the tag, then the payload's
+        // fields into the byte area past the tag.
+        // A payload-less variant constant (`Shape.Dot`): a Dot naming the
+        // variant builds the enum value's tag, the payload area zero.
+        if (auto *dt = Is<Dot>(n); dt && dt->variantconst && n->exprtype
+            && n->exprtype->kind == TY_ENUM && n->exprtype->enu->inst
+            && !n->exprtype->enu->varmode) {
+            auto *et = n->exprtype;
+            auto *var = dt->variantconst;
+            auto vi = (size_t)et->enu->en->VariantIndex(var);
+            auto *ety = enum_ll_ty(et);
+            if (!ety) return false;
+            auto *slot = entry_alloca(w, ety, "vltmp");
+            b.CreateStore(llvm::ConstantInt::get(
+                              llvm::cast<llvm::IntegerType>(
+                                  ety->getStructElementType(0)),
+                              (uint64_t)vi),
+                          b.CreateStructGEP(ety, slot, 0, "vlt.tag"));
+            out = b.CreateLoad(ety, slot, "vlv");
+            return true;
+        }
+        // A variant literal (`Choice.One {}`, `Shape.Circle { r: 1.0 }`)
+        // builds the fixed-mode enum value: the tag, then the payload's
+        // fields into the byte area past the tag. The checker types it
+        // TY_ENUM where the receiver is that enum, or TY_VARIANT standing
+        // alone; both name the variant through sl->variant.
+        if (auto *sl = Is<StructLit>(n); sl && sl->variant) {
+            auto *adt = sl->einst ? sl->einst->en : nullptr;
+            if (!adt) return false;
+            auto *var = sl->variant;
+            auto vi = (size_t)adt->VariantIndex(var);
+            TypeExpr *et = n->exprtype && n->exprtype->kind == TY_ENUM
+                ? n->exprtype : nullptr;
+            if (!et) return false;
+            auto *ety = enum_ll_ty(et);
+            if (!ety) return false;
+            auto *slot = entry_alloca(w, ety, "vltmp");
+            auto *tagp = b.CreateStructGEP(ety, slot, 0, "vlt.tag");
+            auto *tagty2 = ety->getStructElementType(0);
+            auto *ci = llvm::ConstantInt::get(
+                llvm::cast<llvm::IntegerType>(tagty2), (uint64_t)vi);
+            b.CreateStore(ci, tagp);
+            // The payload's fields, positional or named; a payload-less
+            // variant stays all zero.
+            if (!var->fields.empty()) {
+                if (!sl_payload_into(sl, w, et, vi, slot)) return false;
+            }
+            out = b.CreateLoad(ety, slot, "vlv");
+            return true;
+        }
         if (auto *bk = Is<Block>(n)) {
             if (!n->exprtype || !is_flat_struct(n->exprtype)) return false;
             auto *v = GenExpr(n, w);
@@ -3947,7 +4303,9 @@ struct CodeGenIR {
             return true;
         }
         if (auto *sl = Is<StructLit>(n)) {
-            if (!sl->exprtype || !is_flat_struct(sl->exprtype)) return false;
+            if (!sl->exprtype || sl->exprtype->kind != TY_STRUCT
+                || !is_flat_struct(sl->exprtype))
+                return false;
             inst = sl->exprtype->struc->inst;
             // A folded `default<T>()` is an implicit literal with `..`:
             // the given fields build, the rest stay the zero.
@@ -4019,6 +4377,16 @@ struct CodeGenIR {
             return true;
         }
         if (auto *c = Is<Call>(n)) {
+            // A dispatch call whose one result is a flat struct: the
+            // tag picks the arm, the result value the arm's case built.
+            if (!c->dispatch.empty() && c->rettypes.size() == 1
+                && is_flat_struct(c->rettypes[0])) {
+                auto *v = emit_dispatch_call(c, w);
+                if (!v) return false;
+                out = v;
+                inst = c->rettypes[0]->struc->inst;
+                return true;
+            }
             // `default<T>()` for a flat struct: a zeroed value (slices
             // become null pairs, floats +0, ints 0).
             if (c->builtin == B_DEFAULT && !c->rettypes.empty()
@@ -4073,12 +4441,151 @@ struct CodeGenIR {
 
     // The field a literal's init names: by name, or by position for a
     // positional init. -1 when the struct has no such field.
+    // Writes a variant literal's payload fields into the enum value's byte
+    // area at the (aligned) offset past the tag. The C backend packs the
+    // fields densely from the area's start; here each field lands at the
+    // running offset, at its own alignment.
+    bool sl_payload_into(StructLit *sl, FnWalk &w, TypeExpr *et, size_t vi,
+                         llvm::AllocaInst *slot) {
+        auto *en = et->enu->en;
+        auto &var = en->variants[vi];
+        auto *ei = et->enu->inst;
+        if (!ei || ei->vftypes.size() <= vi) return false;
+        auto *ety = enum_ll_ty(et);
+        if (!ety || ety->getStructNumElements() < 2) return false;
+        uint64_t tagsz = ety->getStructElementType(0)
+                             ->getPrimitiveSizeInBits() / 8;
+        auto *payp = b.CreateStructGEP(ety, slot, 1, "vlt.p");
+        auto &dl = mod->getDataLayout();
+        // Field offsets in the packed layout: running, aligned per field.
+        // The area itself starts at a byte the struct's layout padded to
+        // the payload's alignment, so offsets run from zero.
+        uint64_t off = 0;
+        auto &fts = ei->vftypes[vi];
+        if (sl->inits.size() != var.fields.size()) return false;
+        for (size_t k = 0; k < sl->inits.size(); ++k) {
+            if (sl->inits[k].name.empty()
+                || sl->inits[k].name == var.fields[k].name) {
+            } else {
+                // A named init: find its field and its packed offset.
+                size_t fi = 0;
+                for (; fi < var.fields.size(); ++fi)
+                    if (var.fields[fi].name == sl->inits[k].name) break;
+                if (fi == var.fields.size()) return false;
+                return false;   // Named-out-of-order inits: a later cut.
+            }
+            auto *ft = fts[k];
+            auto *fty = enum_field_ll(ft);
+            if (!fty) return false;
+            uint64_t align = (uint64_t)dl.getABITypeAlign(fty).value();
+            off = (off + align - 1) / align * align;
+            auto *fp = b.CreateInBoundsGEP(
+                llvm::Type::getInt8Ty(ctx), payp,
+                { llvm::ConstantInt::get(i64(), off) }, "vlt.f");
+            store_enum_field(ft, fty, sl->inits[k].val, w, fp);
+            off += dl.getTypeAllocSize(fty);
+        }
+        return true;
+    }
+
+    // A field's LLVM type for enum payload layout purposes: the walkable
+    // kinds only (ints, floats, bools, slices, references, nested flat
+    // structs).
+    llvm::Type *enum_field_ll(TypeExpr *t) {
+        if (is_int_ty(t)) return int_ll_ty(t);
+        if (is_flt_ty(t)) return flt_ll_ty(t);
+        if (is_bool_ty(t)) return llvm::Type::getInt8Ty(ctx);
+        if (t->kind == TY_SLICE) return slice_ll_ty();
+        if (t->kind == TY_REF) return i8ptr();
+        if (t->kind == TY_STRUCT && t->struc->inst)
+            return struct_ll_ty(t->struc->inst);
+        return nullptr;
+    }
+
+    // Stores a variant payload field's value at the byte pointer, at the
+    // field's width.
+    void store_enum_field(TypeExpr *ft, llvm::Type *fty, Node *val, FnWalk &w,
+                          llvm::Value *fp) {
+        if (is_flat_struct(ft)) {
+            llvm::Value *fv = nullptr;
+            StructInst *fi = nullptr;
+            if (struct_value(val, w, fv, fi))
+                b.CreateStore(fv, fp);
+            return;
+        }
+        if (ft->kind == TY_SLICE) {
+            SliceVal sv;
+            if (slice_value(val, w, sv)) {
+                auto *hdr = b.CreateInsertValue(
+                    llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                b.CreateStore(b.CreateInsertValue(hdr, sv.len, 1), fp);
+            }
+            return;
+        }
+        if (auto *v = GenExpr(val, w))
+            b.CreateStore(is_int_ty(ft) && int_ll_ty(ft) != i64()
+                              ? field_store_value(ft, v) : v, fp);
+    }
+
     static int field_of_init(StructInst *in, const FieldInit &fi, size_t pos) {
         if (fi.name.empty())
             return pos < in->st->fields.size() ? (int)pos : -1;
         for (size_t i = 0; i < in->st->fields.size(); ++i)
             if (in->st->fields[i].name == fi.name) return (int)i;
         return -1;
+    }
+
+    // Whether a struct literal gives every field once (the shape the
+    // field-writer below takes).
+    static bool sl_inits_ok(Node *n, StructInst *in) {
+        auto *sl = Is<StructLit>(n);
+        if (!sl || sl->implicit) return false;
+        if (!sl->defaultall && sl->inits.size() != in->st->fields.size())
+            return false;
+        std::vector<int> at;
+        for (size_t k = 0; k < sl->inits.size(); ++k) {
+            int f = field_of_init(in, sl->inits[k], k);
+            if (f < 0 || std::find(at.begin(), at.end(), f) != at.end()
+                || !sl->inits[k].val)
+                return false;
+            at.push_back(f);
+        }
+        return true;
+    }
+
+    // Writes a struct literal's fields into the record at p (already
+    // zeroed by the caller where defaults matter). Only the field kinds
+    // the walk holds: ints/floats/slices by value, nested flat structs by
+    // whole value.
+    bool struct_fields_into(Node *n, FnWalk &w, StructInst *in,
+                            llvm::Value *p) {
+        auto *sl = Is<StructLit>(n);
+        if (!sl) return false;
+        for (size_t k = 0; k < sl->inits.size(); ++k) {
+            int f = field_of_init(in, sl->inits[k], k);
+            if (f < 0) return false;
+            auto *ft = in->ftypes[f];
+            auto *fp = b.CreateStructGEP(struct_ll_ty(in), p, f);
+            if (is_flat_struct(ft)) {
+                llvm::Value *fv = nullptr;
+                StructInst *fi = nullptr;
+                if (!struct_value(sl->inits[k].val, w, fv, fi)) return false;
+                b.CreateStore(fv, fp);
+                continue;
+            }
+            if (is_slice_of(ft)) {
+                SliceVal sv;
+                if (!slice_value(sl->inits[k].val, w, sv)) return false;
+                auto *hdr = b.CreateInsertValue(
+                    llvm::UndefValue::get(slice_ll_ty()), sv.data, 0);
+                b.CreateStore(b.CreateInsertValue(hdr, sv.len, 1), fp);
+                continue;
+            }
+            auto *v = GenExpr(sl->inits[k].val, w);
+            if (!v) return false;
+            b.CreateStore(field_store_value(ft, v), fp);
+        }
+        return true;
     }
 
     // `var p = T { ... }` for a flat int struct: every field given once, in
@@ -4202,6 +4709,37 @@ struct CodeGenIR {
                                         : w.structs.end();
             auto rit = obj && obj->vdef ? w.refs.find(obj->vdef)
                                         : w.refs.end();
+            // A variant payload parameter: its fields address like a flat
+            // struct's, off the payload's own alloca.
+            auto pvit = obj && obj->vdef ? w.payloads.find(obj->vdef)
+                                         : w.payloads.end();
+            if (pvit != w.payloads.end()) {
+                auto *var = pvit->second.vtype->var->variant;
+                auto *ei = pvit->second.vtype->var->adt
+                               ? pvit->second.vtype->var->adt->enu->inst
+                               : nullptr;
+                if (!var || !ei) return false;
+                auto vi = (size_t)ei->en->VariantIndex(var);
+                if (vi >= ei->vftypes.size()) return false;
+                // The payload's LLVM struct: its fields in order. A path
+                // into a nested struct's field is a later cut; a flat field
+                // is at its own index.
+                auto *pyty = enum_variant_ll_ty(pvit->second.vtype);
+                auto pit = w.structs.find(obj->vdef);
+                (void)pit;
+                // A variant's fields are not a StructInst: walk the field
+                // list by name to the index, then GEP the alloca.
+                int fi = -1;
+                for (size_t k = 0; k < var->fields.size(); ++k)
+                    if (var->fields[k].name == dt->name)
+                        fi = (int)k;
+                if (fi < 0) return false;
+                inst = nullptr;
+                leaf = ei->vftypes[vi][fi];
+                addr = b.CreateStructGEP(pyty, pvit->second.base, (unsigned)fi,
+                                         llvm::Twine(obj->vdef->name, ".f"));
+                return true;
+            }
             if (rit != w.refs.end() && is_flat_struct(rit->second.ptee)) {
                 // A reference to a struct: the path starts at the pointee
                 // the holder names. The holder stores an i8*, so we cast it
@@ -4873,7 +5411,13 @@ struct CodeGenIR {
             // out-pointers the callee writes.
             if (vd->defs.size() > 1 && vd->inits.size() == 1 && !vd->isglobal) {
                 auto *c = Is<Call>(vd->inits[0]);
-                if (!c || !c->spec || c->spec->rets.size() != vd->defs.size()) return;
+                if (!c || !c->spec || c->spec->rets.size() != vd->defs.size()) {
+                    if (c && !c->dispatch.empty() && vd->defs.size() > 1)
+                        return Unsup(cat("a multi-result variant dispatch "
+                                         "call at line ",
+                                         (long long)c->line.line));
+                    return;
+                }
                 std::vector<llvm::Value *> outs(vd->defs.size(), nullptr);
                 std::vector<llvm::AllocaInst *> slots(vd->defs.size(), nullptr);
                 for (size_t i = 0; i < vd->defs.size(); ++i) {
@@ -4955,6 +5499,29 @@ struct CodeGenIR {
                                         vddef->type->fltstorage == FS_F32 };
                     continue;
                 }
+                if (vddef->type->kind == TY_ENUM && !vddef->type->enu->varmode) {
+                    // A fixed-mode enum local: a { tag, payload } alloca,
+                    // the literal (a variant literal's value) stored whole.
+                    auto *ety = enum_ll_ty(vddef->type);
+                    if (!ety)
+                        return Unsup(cat("a local of ", type_label(vddef->type),
+                                         " the walk does not lay out at line ",
+                                         (long long)vd->line.line));
+                    auto *alloca = entry_alloca(w, ety,
+                                                llvm::Twine(vddef->name));
+                    if (i < vd->inits.size() && vd->inits[i]) {
+                        llvm::Value *ev = nullptr;
+                        StructInst *si = nullptr;
+                        if (!struct_value(vd->inits[i], w, ev, si)
+                            || ev->getType() != ety)
+                            return Unsup(cat("an enum value the walk does "
+                                             "not build at line ",
+                                         (long long)vd->line.line));
+                        b.CreateStore(ev, alloca);
+                    }
+                    w.enums[vddef] = { alloca, vddef->type };
+                    continue;
+                }
                 if (!is_int_ty(vddef->type) && !is_bool_ty(vddef->type))
                     return Unsup(cat("a local of ", type_label(vddef->type),
                                      " at line ", (long long)vd->line.line));
@@ -5012,6 +5579,20 @@ struct CodeGenIR {
                 if (!struct_value(as->rhs, w, sv, si))
                     return Unsup("a struct value the walk does not build");
                 b.CreateStore(sv, stit->second.base);
+                return;
+            }
+            // Overwriting a fixed-mode enum local: the whole value (a
+            // different variant replaces tag and payload in place).
+            if (auto enit = w.enums.find(lv->vdef); enit != w.enums.end()) {
+                if (as->op != T_ASSIGN)
+                    return Unsup("a compound assignment to an enum");
+                auto *ety = enum_ll_ty(lv->vdef->type);
+                llvm::Value *sv = nullptr;
+                StructInst *si = nullptr;
+                if (!struct_value(as->rhs, w, sv, si)
+                    || sv->getType() != ety)
+                    return Unsup("an enum value the walk does not build");
+                b.CreateStore(sv, enit->second.base);
                 return;
             }
             // Re-pointing a slice local: the whole { data, len } view.

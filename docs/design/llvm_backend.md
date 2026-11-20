@@ -225,7 +225,19 @@ overlapping slices like `a[1..].move_from(a[..4])` shift correctly; the
 element's byte count comes from the LLVM type's allocated size (a
 struct element moves whole), and a slice range's data steps by its
 element. Runtime failures name the source file and line (one internal
-`gs_fileN` constant per file), as the C backend's LocArgs do.
+`gs_fileN` constant per file), as the C backend's LocArgs do. A
+fixed-mode enum is the C layout: the tag byte (u8 or u16 past 256
+variants) plus the widest payload's byte area. A variant literal or a
+payload-less variant constant builds that value (tag store, then the
+payload's fields at their packed offsets), an enum local and parameter
+copy the whole value, a case function's payload parameter keeps its own
+struct alloca (`s.r` walks to the field), and a tag-dispatch call
+(section 8.2) switches on the tag: the arguments run once, each arm calls its
+case specialization with the payload copy and stores into the shared
+result channel: an int/bool/float/flat-struct single result, or one
+growable (every arm builds into the caller's (dst, rl) pair). A
+multi-result dispatch and a reference-scrutinee dispatch refuse for
+now.
 `clear()` on a growable array drops its count to zero and its stack top
 back to the element region's base; on a static-capacity limited array it
 zeroes only the count. An optional reference (`T&?`, int or flat struct)
@@ -306,7 +318,7 @@ local's re-pointing stores the whole pair.
 passes `-relocation-model=pic`, so a
 private constant's address links into the host's PIE executable. Fixtures
 that passed only because their unemitted statements or locals did not show
-in the output now refuse. 73 of the codegen output fixtures pass through
+in the output now refuse. 74 of the codegen output fixtures pass through
 `--emit-ir`; the largest remaining gaps are references to other
 aggregates (fixed arrays, structs, enums),
 limited arrays
